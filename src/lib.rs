@@ -656,7 +656,7 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     wallet::utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, KeychainLayout, LOG_FILE, PURPOSE,
         RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, from_str_or_number_mandatory,
         from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
         get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
