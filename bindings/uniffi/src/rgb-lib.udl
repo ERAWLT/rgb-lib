@@ -74,6 +74,7 @@ interface RgbLibError {
   InvalidAssignment();
   InvalidAttachments(string details);
   InvalidBitcoinKeys();
+  InvalidKeychainLayout(string details);
   InvalidBitcoinNetwork(string network);
   InvalidBurnRecipient(u64 len);
   InvalidColoringInfo(string details);
@@ -732,6 +733,9 @@ dictionary SinglesigKeys {
   string account_xpub_vanilla;
   string account_xpub_colored;
   u8? vanilla_keychain;
+  u8? colored_keychain;
+  u32? colored_coin_type;
+  u32? vanilla_coin_type;
   string master_fingerprint;
   string? mnemonic;
   WitnessVersion witness_version;

@@ -470,6 +470,13 @@ pub enum Error {
     #[error("Invalid vanilla keychain")]
     InvalidVanillaKeychain,
 
+    /// The requested keychain layout (coin types and keychain indexes) is invalid
+    #[error("Invalid keychain layout: {details}")]
+    InvalidKeychainLayout {
+        /// Error details
+        details: String,
+    },
+
     /// Invalid witness version
     #[error("Invalid witness version: {witness_version}")]
     InvalidWitnessVersion {

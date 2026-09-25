@@ -15,6 +15,19 @@ pub struct SinglesigKeys {
     /// Keychain index for the vanilla-side of the wallet (default: 0)
     #[serde(deserialize_with = "from_str_or_number_optional")]
     pub vanilla_keychain: Option<u8>,
+    /// Keychain index for the colored side of the wallet (default: 0)
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub colored_keychain: Option<u8>,
+    /// Coin type of the colored-side account (default: 827166 on mainnet, 827167 otherwise).
+    ///
+    /// A host whose signer only exports the standard BIP-86 account can set this to the vanilla
+    /// coin type and give the two sides distinct keychains (`colored_keychain` and
+    /// `vanilla_keychain`); both account xPubs are then the same key.
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub colored_coin_type: Option<u32>,
+    /// Coin type of the vanilla-side account (default: 0 on mainnet, 1 otherwise)
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub vanilla_coin_type: Option<u32>,
     /// Wallet master fingerprint
     pub master_fingerprint: String,
     /// Wallet mnemonic phrase
@@ -25,10 +38,24 @@ pub struct SinglesigKeys {
 }
 
 impl SinglesigKeys {
+    pub(crate) fn keychain_layout(
+        &self,
+        bitcoin_network: &BitcoinNetwork,
+    ) -> Result<KeychainLayout, Error> {
+        KeychainLayout::resolve(
+            bitcoin_network,
+            self.colored_coin_type,
+            self.vanilla_coin_type,
+            self.colored_keychain,
+            self.vanilla_keychain,
+        )
+    }
+
     pub(crate) fn build_descriptors(
         &self,
         bitcoin_network: &BitcoinNetwork,
     ) -> Result<(WalletDescriptors, bool), Error> {
+        let layout = self.keychain_layout(bitcoin_network)?;
         let network_kind = bitcoin_network.network_kind();
         let xpub_rgb = str_to_xpub(&self.account_xpub_colored, &network_kind)?;
         let xpub_btc = str_to_xpub(&self.account_xpub_vanilla, &network_kind)?;
@@ -36,7 +63,7 @@ impl SinglesigKeys {
             let descs = get_descriptors(
                 bitcoin_network,
                 mnemonic,
-                self.vanilla_keychain,
+                &layout,
                 &xpub_btc,
                 &xpub_rgb,
                 self.witness_version,
@@ -55,11 +82,10 @@ impl SinglesigKeys {
             (descs, false)
         } else {
             let descs = get_descriptors_from_xpubs(
-                bitcoin_network,
                 &self.master_fingerprint,
                 &xpub_rgb,
                 &xpub_btc,
-                self.vanilla_keychain,
+                &layout,
                 self.witness_version,
             )?;
             (descs, true)
@@ -72,6 +98,9 @@ impl SinglesigKeys {
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain,
+            colored_keychain: None,
+            colored_coin_type: None,
+            vanilla_coin_type: None,
             master_fingerprint: keys.master_fingerprint.clone(),
             mnemonic: Some(keys.mnemonic.clone()),
             witness_version: keys.witness_version,
@@ -84,10 +113,30 @@ impl SinglesigKeys {
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain,
+            colored_keychain: None,
+            colored_coin_type: None,
+            vanilla_coin_type: None,
             master_fingerprint: keys.master_fingerprint.clone(),
             mnemonic: None,
             witness_version: keys.witness_version,
         }
+    }
+}
+
+impl SinglesigKeys {
+    /// Return a copy of these keys with a non-default keychain layout.
+    ///
+    /// `None` keeps rgb-lib's default for that setting. See [`SinglesigKeys::colored_coin_type`].
+    pub fn with_keychain_layout(
+        mut self,
+        colored_keychain: Option<u8>,
+        colored_coin_type: Option<u32>,
+        vanilla_coin_type: Option<u32>,
+    ) -> Self {
+        self.colored_keychain = colored_keychain;
+        self.colored_coin_type = colored_coin_type;
+        self.vanilla_coin_type = vanilla_coin_type;
+        self
     }
 }
 

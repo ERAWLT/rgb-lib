@@ -148,6 +148,9 @@ fn open_wallet(state: &PeerState) -> Wallet {
         mnemonic: state.mnemonic.clone(),
         master_fingerprint: state.fingerprint.clone().expect("no fingerprint in state"),
         vanilla_keychain: None,
+        colored_keychain: None,
+        colored_coin_type: None,
+        vanilla_coin_type: None,
         witness_version: rgb_lib::keys::WitnessVersion::Taproot,
     };
     Wallet::new(wallet_data, keys).expect("failed to create BDK wallet")
