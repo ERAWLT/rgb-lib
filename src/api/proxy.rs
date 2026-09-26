@@ -392,7 +392,7 @@ pub(crate) fn map_proxy_error(err: JsonRpcError) -> Error {
 
 impl ProxyClient {
     pub(crate) fn new(base_url: &str) -> Result<Self, Error> {
-        let client = RestClient::builder()
+        let client = rest_client_builder()?
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
             .build()?;

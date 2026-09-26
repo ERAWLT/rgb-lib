@@ -25,7 +25,7 @@ impl RejectListClient {
                 url.scheme()
             )));
         }
-        let client = RestClient::builder()
+        let client = rest_client_builder()?
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
             .redirect(reqwest::redirect::Policy::none())

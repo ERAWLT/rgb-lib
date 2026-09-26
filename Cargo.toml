@@ -48,26 +48,48 @@ x25519-dalek = { version = "3", optional = true, default-features = false, featu
 hkdf = { version = "0.13", optional = true, default-features = false }
 hmac = { version = "0.13", optional = true, default-features = false }
 sha2 = { version = "0.11", optional = true, default-features = false }
-tokio = { version = "1", optional = true, default-features = false }
+# ERA fork: Runtime::new and the VSS client need "rt-multi-thread", which used to arrive only
+# through sea-orm-cli (the migration CLI)
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+] }
+# ERA fork: "std" was only ever enabled by sqlx-postgres, which the library no longer pulls in
 hex = { version = "0.4.3", default-features = false, features = [
     "alloc",
+    "std",
 ] }
 rand = { version = "0.10.3", optional = true, default-features = false, features = [
     "thread_rng",
 ] }
+# ERA fork: one TLS stack on every target. reqwest's own "rustls" feature would bring aws-lc
+# and rustls-platform-verifier (JNI setup on Android), and the Android build used to add a
+# vendored OpenSSL through native-tls on top. "rustls-no-provider" plus the ring-based config
+# built in api::rest_client_builder leaves rustls on ring, the stack minreq (esplora) and bitreq
+# (vss) already use. The other reqwest defaults are kept as they were.
 reqwest = { version = "0.13", optional = true, default-features = false, features = [
     "blocking",
+    "charset",
+    "http2",
     "json",
     "multipart",
+    "rustls-no-provider",
+    "system-proxy",
 ] }
-rgb-lib-migration = { path = "migration", version = "0.3.0-beta.6", optional = true }
-rustls = { version = "0.23.46", optional = true, default-features = false }
+# ERA fork: default features off drops the migration CLI (clap, sea-orm-cli) and sqlx-postgres,
+# which only the migration authoring binary uses.
+rgb-lib-migration = { path = "migration", version = "0.3.0-beta.6", optional = true, default-features = false }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 scrypt = { version = "0.12.0", optional = true, default-features = false, features = [
     "phc",
 ] }
 sea-orm = { version = "2.0.4", optional = true, default-features = false, features = [
     "macros",
-    "runtime-tokio-rustls",
+    "runtime-tokio",
     "sqlx-sqlite",
     "with-json",
 ] }
@@ -89,6 +111,7 @@ file-format = { version = "0.29.0", optional = true, default-features = false, f
 ] }
 url = { version = "2.5", optional = true, default-features = false }
 walkdir = { version = "2.5.0", optional = true, default-features = false }
+webpki-roots = { version = "1", optional = true, default-features = false }
 zip = { version = "9.4.1", optional = true, default-features = false, features = [
     "zstd",
 ] }
@@ -131,17 +154,6 @@ tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
 ] }
 tempfile = { version = "3.27.0", default-features = false }
-
-# OS-specific reqwest features
-[target.'cfg(target_os = "android")'.dependencies.reqwest]
-version = "0.13"
-optional = true
-features = ["native-tls-vendored"]
-
-[target.'cfg(not(target_os = "android"))'.dependencies.reqwest]
-version = "0.13"
-optional = true
-features = ["rustls"]
 
 [features]
 default = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
@@ -190,7 +202,8 @@ _online = ["wallet", "dep:x25519-dalek"]
 # implied by each indexer validation feature, marking a build that can validate consignments
 # reaching the network; it exists only to avoid repeating the list of indexer validation features
 # in cfgs and must not be enabled on its own
-_validation = ["reqwest"]
+# ERA fork: every HTTP client is built by api::rest_client_builder (rustls on ring, webpki roots)
+_validation = ["reqwest", "dep:rustls", "dep:webpki-roots"]
 # support for an indexer, to use it with an online wallet (enabling the wallet functionality)
 bitcoind = [
     "_online",

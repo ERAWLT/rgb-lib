@@ -36,7 +36,7 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 #[cfg(feature = "_online")]
 const PROXY_PROTOCOL_VERSION: &str = "1.0";
 
-// sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
+// sea-orm with runtime-tokio needs a tokio runtime for connection pool management
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
 
