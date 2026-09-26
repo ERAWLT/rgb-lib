@@ -273,7 +273,7 @@ struct BlockHeader {
 
 impl EvmClient {
     pub(crate) fn new(rpc_url: &str) -> Result<Self, Error> {
-        let client = RestClient::builder()
+        let client = rest_client_builder()?
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
             .build()?;

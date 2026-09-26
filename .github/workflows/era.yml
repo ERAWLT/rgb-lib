@@ -8,7 +8,9 @@ name: ERA fork checks
 #   - the keychain-layout patch (unit tests, no network);
 #   - the crate still builds with the exact feature set the ERA app uses
 #     (packages/era_rgb: no default features, esplora + vss) and with the
-#     upstream default (electrum) on top.
+#     upstream default (electrum) on top;
+#   - the dependency diet holds: no OpenSSL, aws-lc, Postgres or CLI crates
+#     on the app's mobile targets, and the one TLS stack left works.
 # See ERA.md for what the fork changes and why.
 
 on:
@@ -54,5 +56,43 @@ jobs:
       - name: Check with default features + esplora + vss
         run: cargo check --locked --features esplora,vss
 
-      - name: Unit tests of the keychain layout
-        run: cargo test --locked --lib --features esplora,vss -- tests_keychain_layout
+      # cargo tree resolves for any target without its toolchain, so the
+      # mobile graphs are checked here without an NDK or Xcode
+      - name: Dependency diet guard (app feature set, mobile targets)
+        run: |
+          banned='^(openssl-sys|openssl-src|native-tls|aws-lc-rs|aws-lc-sys|sqlx-postgres|clap|sea-orm-cli) v'
+          status=0
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android aarch64-apple-ios; do
+            # a failing cargo tree fails the step here instead of passing an
+            # empty graph through the grep below
+            tree=$(cargo tree --locked --target "$target" -p rgb-lib \
+              --no-default-features --features esplora,vss -e normal,build \
+              --prefix none -f '{p}')
+            if ! printf '%s\n' "$tree" | grep -q '^ring v'; then
+              echo "::error::$target: no ring in the graph, the guard is not looking at the app's TLS stack"
+              status=1
+            fi
+            found=$(printf '%s\n' "$tree" | sed 's/ (\*)$//' | grep -E "$banned" | sort -u || true)
+            if [ -n "$found" ]; then
+              echo "::error::$target pulls crates the fork dropped: $(echo $found)"
+              status=1
+            else
+              echo "$target: ok"
+            fi
+          done
+          exit $status
+
+      # SKIP_INIT: these tests are offline and must not try to start the
+      # regtest services. The wallet ones create SQLite wallets (migrations on
+      # the TLS-less tokio runtime) and exercise the manifest checks the
+      # keychain-layout patch extends.
+      - name: Unit tests (keychain layout, REST client TLS, offline wallets)
+        env:
+          SKIP_INIT: "1"
+        run: >
+          cargo test --locked --lib --features esplora,vss --
+          tests_keychain_layout tests_rest_client_tls
+          wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
+
+      - name: Migration crate with its CLI (the authoring binary still builds)
+        run: cargo test --locked -p rgb-lib-migration
