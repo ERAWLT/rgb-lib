@@ -14,14 +14,16 @@ on:
 
 jobs:
   claude-review:
+    # ERA fork: UTEXO's bot, UTEXO's secrets; never run it outside UTEXO-Protocol
     if: >
+      github.repository_owner == 'UTEXO-Protocol' && (
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
        (github.event.label.name == 'ai-review/claude' || github.event.label.name == 'claude-review')) ||
       (github.event_name == 'pull_request' && github.event.action == 'synchronize' &&
        (contains(github.event.pull_request.labels.*.name, 'ai-review/claude') || contains(github.event.pull_request.labels.*.name, 'claude-review'))) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, '@claude'))
+       contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
     concurrency:
       group: ai-review-claude-pr-${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}

@@ -19,6 +19,8 @@ jobs:
   # Build uniffi library for supported platforms
   build-uniffi:
     name: Build uniffi (${{ matrix.target }})
+    # ERA fork: releases and the bindings dispatch belong to UTEXO-Protocol
+    if: github.repository_owner == 'UTEXO-Protocol'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -76,6 +78,8 @@ jobs:
   # Build C-FFI library for supported platforms
   build-cffi:
     name: Build c-ffi (${{ matrix.target }})
+    # ERA fork: releases and the bindings dispatch belong to UTEXO-Protocol
+    if: github.repository_owner == 'UTEXO-Protocol'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -142,6 +146,8 @@ jobs:
   # Generate header file for C-FFI
   generate-header:
     name: Generate C header
+    # ERA fork: releases and the bindings dispatch belong to UTEXO-Protocol
+    if: github.repository_owner == 'UTEXO-Protocol'
     runs-on: ubuntu-latest
 
     steps:
@@ -172,6 +178,8 @@ jobs:
   # Create GitHub Release with all artifacts
   release:
     name: Create Release
+    # ERA fork: releases and the bindings dispatch belong to UTEXO-Protocol
+    if: github.repository_owner == 'UTEXO-Protocol'
     needs: [build-uniffi]
     runs-on: ubuntu-latest
     permissions:
@@ -255,6 +263,8 @@ jobs:
   # Trigger rebuild of bindings
   trigger-bindings:
     name: Trigger bindings rebuild
+    # ERA fork: releases and the bindings dispatch belong to UTEXO-Protocol
+    if: github.repository_owner == 'UTEXO-Protocol'
     needs: release
     runs-on: ubuntu-latest
 
