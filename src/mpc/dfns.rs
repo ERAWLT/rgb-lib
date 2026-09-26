@@ -226,7 +226,7 @@ impl DfnsProvider {
     ///
     /// The private key must be a P-256 (secp256r1) ECDSA key in PEM format.
     pub fn new(config: DfnsConfig) -> Result<Self, Error> {
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::api::rest_client_builder()?
             .user_agent("rgb-lib-dfns/0.1")
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(120))

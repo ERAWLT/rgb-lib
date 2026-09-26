@@ -16,13 +16,27 @@ description = "RGB wallet library migrations"
 name = "rgb_lib_migration"
 path = "src/lib.rs"
 
+# the sea-orm-cli migration binary (see README.md); rgb-lib only links the library
+[[bin]]
+name = "rgb-lib-migration"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+# ERA fork: the CLI and Postgres are only needed to author migrations. They stay on by default so
+# `sea-orm-cli migrate` keeps working here; rgb-lib depends on this crate without them.
+default = ["cli"]
+cli = [
+    "sea-orm-migration/cli",
+    "sea-orm-migration/runtime-tokio-rustls",
+    "sea-orm-migration/sqlx-postgres",
+]
+
 [dependencies]
 tokio = { version = "1", default-features = false, features = [
     "macros"
 ] }
 sea-orm-migration = { version = "2.0.1", default-features = false, features = [
-    "cli",
-    "runtime-tokio-rustls",
-    "sqlx-postgres",
+    "runtime-tokio",
     "sqlx-sqlite",
 ] }

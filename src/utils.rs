@@ -41,7 +41,7 @@ const LOCK_FILE_TIMEOUT_SECS: f32 = 1.0;
 #[cfg(not(test))]
 const LOCK_FILE_TIMEOUT_SECS: f32 = 3600.0;
 
-// sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
+// sea-orm with runtime-tokio needs a tokio runtime for connection pool management
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
 
