@@ -3,14 +3,20 @@ name: ERA fork checks
 # CI for ERAWLT/rgb-lib's own branches (era/**). The inherited upstream
 # workflows only fire on UTEXO's branch names (build/test/lint/format) or are
 # restricted to the UTEXO-Protocol owner (AI reviews, release), so this is the
-# only workflow that runs on our pushes. It proves what the fork adds without
-# the regtest services the upstream test suite needs:
+# only workflow that runs on our pushes. That restriction does not cover every
+# event; ERA.md section 2 says which ones and what closes them.
+#
+# The check job proves what the fork adds without the regtest services the
+# upstream test suite needs:
 #   - the keychain-layout patch (unit tests, no network);
 #   - the crate still builds with the exact feature set the ERA app uses
 #     (packages/era_rgb: no default features, esplora + vss) and with the
 #     upstream default (electrum) on top;
 #   - the dependency diet holds: no OpenSSL, aws-lc, Postgres or CLI crates
-#     on the app's mobile targets, and the one TLS stack left works.
+#     on the app's mobile targets, every HTTP client goes through the one
+#     prebuilt TLS config, and that config works.
+# The https job makes real TLS handshakes against UTEXO's public signet
+# services; it depends on third-party hosts, so it is kept out of check.
 # See ERA.md for what the fork changes and why.
 
 on:
@@ -19,12 +25,18 @@ on:
   pull_request:
     branches: ["era/**"]
   workflow_dispatch:
+  # GitHub fires schedule only from the default branch. While that is UTEXO's
+  # dev (no era.yml there) this never runs, and the https job runs only when
+  # dispatched by hand.
+  schedule:
+    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: era-${{ github.ref }}
+  # per event too: a push must not cancel a scheduled or dispatched https run
+  group: era-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -32,6 +44,8 @@ env:
 
 jobs:
   check:
+    # the schedule exists for the https job only
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -82,6 +96,30 @@ jobs:
           done
           exit $status
 
+      # reqwest is compiled with rustls-no-provider. A client built anywhere
+      # but api::rest_client_builder (which hands reqwest a prebuilt rustls
+      # config) compiles fine and fails at runtime: reqwest's own TLS path
+      # panics with "No provider set" when no process-wide CryptoProvider is
+      # installed, and otherwise verifies through rustls-platform-verifier,
+      # which on Android fails the handshake unless the app initialised it
+      # over JNI. This is a grep, not a type check: an alias such as
+      # `use reqwest::blocking::Client as Http; Http::new()` escapes it.
+      - name: HTTP clients only through api::rest_client_builder
+        run: |
+          pattern='RestClient::(new|builder|default)|reqwest::(blocking::)?(Client|ClientBuilder)::|reqwest::(blocking::)?get\('
+          if found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/api/mod.rs'); then
+            echo "::error::an HTTP client is built outside api::rest_client_builder; route it through the builder (ERA.md, dependency diet)"
+            printf '%s\n' "$found"
+            exit 1
+          fi
+          # the one legitimate construction must still match, or the
+          # pattern has gone stale and the check above proves nothing
+          if ! git grep -qE "$pattern" -- src/api/mod.rs; then
+            echo "::error::the pattern no longer matches rest_client_builder in src/api/mod.rs; update it"
+            exit 1
+          fi
+          echo "ok: every HTTP client comes from api::rest_client_builder"
+
       # SKIP_INIT: these tests are offline and must not try to start the
       # regtest services. The wallet ones create SQLite wallets (migrations on
       # the TLS-less tokio runtime) and exercise the manifest checks the
@@ -96,3 +134,37 @@ jobs:
 
       - name: Migration crate with its CLI (the authoring binary still builds)
         run: cargo test --locked -p rgb-lib-migration
+
+  https:
+    # Real TLS handshakes: UTEXO's signet RGB proxy through the rustls config
+    # of api::rest_client_builder, and UTEXO's signet Esplora indexer through
+    # minreq. Nothing else in CI leaves the runner. A failure may be the
+    # hosts, not the fork, so it is a signal to look at, not a red branch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+
+      # --include-ignored: the proxy test is #[ignore] (needs network), the
+      # Esplora one is not, and plain --ignored would silently skip it.
+      # --exact with a renamed test runs nothing and still passes, so the
+      # count is checked as well.
+      - name: Real https (RGB proxy, Esplora indexer)
+        env:
+          SKIP_INIT: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --features esplora,vss -- \
+            --include-ignored --exact \
+            api::tests_rest_client_tls::rest_client_talks_to_a_public_https_proxy \
+            wallet::test::new::signet_esplora_success 2>&1 | tee https-tests.log
+          if ! grep -q '^test result: ok\. 2 passed' https-tests.log; then
+            echo "::error::expected exactly the two https tests to run and pass"
+            exit 1
+          fi
