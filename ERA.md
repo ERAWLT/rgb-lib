@@ -10,7 +10,15 @@ features `esplora` + `vss`, pinned **by rev** of this branch.
 Rules for the branch:
 
 - **Never rewrite or force-push it.** The app pins a commit; a rev that is no longer
-  reachable from a ref breaks every build of that app version.
+  reachable from a ref breaks every build of that app version. The branch has not been
+  rewritten since `6ce375e` (2026-09-25); the one earlier rewrite, a non-fast-forward
+  push over `ca5f6b7`, predates any pin.
+- **Push only the branch to origin, never tags**: `git push origin era/configurable-derivation`,
+  never `--tags`, `--follow-tags` or `--mirror`, and never a UTEXO tag. A UTEXO `v*`
+  tag pushed here runs `release.yml` as it is in the tagged commit, which has no owner
+  condition (see [§2](#2-ci-1d26404-extended-in-f808c7f-and-07e16e5)). This clone
+  holds UTEXO's tags from `git fetch utexo --tags`, including `v0.3.0-beta.43-bfa`,
+  which origin does not have.
 - A new UTEXO base gets a **new branch** (see [Carrying the series](#carrying-the-series-onto-a-new-utexo-tag)),
   never a rebase of this one.
 - Commits are authored by people, with no AI co-author trailers.
@@ -19,10 +27,13 @@ Rules for the branch:
 
 | Commit | Subject | Upstream? |
 |---|---|---|
-| `6ce375e` | Add a configurable keychain layout to singlesig keys | Proposed to UTEXO (text [below](#pr-proposal-for-utexo)) |
+| `6ce375e` | Add a configurable keychain layout to singlesig keys | To propose to UTEXO (draft [below](#pr-proposal-for-utexo), not sent) |
 | `1d26404` | Run the fork's own checks on era branches only | Fork-only |
 | `f808c7f` | Carry one TLS stack and no migration CLI in the library | Fork-only |
-| this file | Document the ERA fork of rgb-lib | Fork-only |
+| `d82e21a` | Document the ERA fork of rgb-lib (this file) | Fork-only |
+| `07e16e5` | Guard HTTP client construction and probe real https in CI | Fork-only |
+
+Later commits that touch only this file are part of the series too.
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -98,23 +109,79 @@ wallet on the same account uses.
 defaults per network, shared-keychain and non-hardenable rejections, the single-account
 layout from xpubs and from a mnemonic, unchanged default descriptors).
 
-## 2. CI (`1d26404`, extended in `f808c7f`)
+## 2. CI (`1d26404`, extended in `f808c7f` and `07e16e5`)
 
-`.github/workflows/era.yml` runs on push / PR to `era/**` and on manual dispatch:
-rustfmt, `cargo check` with the app's feature set and with the upstream default on
-top, a dependency guard over the app's mobile targets, the unit tests above plus the
-REST-client TLS test and offline wallet tests, and the migration crate. Every cargo
-call is `--locked`: a fresh resolution fails on the yanked `secp256k1 0.32.0-beta.2`
-that `rgb-consensus 0.11.1-rc.11` requires.
+`.github/workflows/era.yml` has two jobs.
 
-The inherited workflows are restricted, not removed, so merges from upstream stay
-simple:
+- **check** runs on push / PR to `era/**` and on manual dispatch: rustfmt, `cargo check`
+  with the app's feature set and with the upstream default on top, a dependency guard
+  over the app's mobile targets, the HTTP client guard (below), the unit tests above
+  plus the REST-client TLS test and offline wallet tests, and the migration crate.
+  Every cargo call is `--locked`: a fresh resolution fails on the yanked
+  `secp256k1 0.32.0-beta.2` that `rgb-consensus 0.11.1-rc.11` requires.
+- **https** runs on manual dispatch and on a weekly schedule, with `continue-on-error`:
+  the two tests that make real TLS handshakes, to UTEXO's signet RGB proxy
+  (`rest_client_talks_to_a_public_https_proxy`, through `rest_client_builder`'s
+  config) and to its signet Esplora indexer (`wallet::test::new::signet_esplora_success`,
+  through minreq). They depend on third-party hosts, so they stay out of **check**; a
+  red run is a reason to look, not a broken branch. The step insists on exactly two
+  passes, because `--exact` with a renamed test runs nothing and passes. GitHub fires
+  `schedule` only from the default branch, so while that is UTEXO's `dev` the weekly
+  run never happens and the job runs only when dispatched.
 
-| Workflow | Trigger | In this fork |
+**The HTTP client guard.** reqwest is compiled with `rustls-no-provider`, so a client
+built anywhere but `api::rest_client_builder` compiles and fails at runtime: reqwest's
+own TLS path panics with "No provider set" when no process-wide `CryptoProvider` is
+installed, and otherwise verifies through `rustls-platform-verifier`, which on Android
+fails the handshake unless the app initialised it over JNI. The step fails when
+`RestClient::new/builder/default`, `reqwest::(blocking::)Client::` /
+`ClientBuilder::` or `reqwest::(blocking::)get(` appears in `src/` outside
+`src/api/mod.rs`, and when the pattern stops matching the one construction there. It
+is a grep, not a type check: an alias (`use reqwest::blocking::Client as Http;
+Http::new()`) escapes it.
+
+### The inherited workflows
+
+They are restricted, not removed, so merges from upstream stay simple. The
+restriction is an owner condition (`github.repository_owner == 'UTEXO-Protocol'`)
+added to their jobs **in the files on `era/**` commits only**. GitHub reads a
+workflow file from a different commit for each event, so the condition protects
+PRs into `era/**`, dispatches on an `era/**` ref and `v*` tags on `era/**` commits,
+and nothing else:
+
+| Workflow | Trigger | Not covered by the owner condition |
 |---|---|---|
-| build, test, lint, format | push / PR to `utexo-master`, `dev`, `stage`, `master` | untouched; never fire on `era/**` |
-| claude-code-review, kimi-code-review | PR label, PR comment mentioning the bot, dispatch | job runs only when `github.repository_owner == 'UTEXO-Protocol'` (UTEXO's API keys; kimi runs a third-party action pinned to `@main` with PR write access) |
-| release | any `v*` tag, dispatch | every job requires the same owner. This repository mirrors UTEXO's tags; a run here would publish a release on our repo and dispatch to UTEXO's binding repos with PATs we do not hold |
+| build, test, lint, format | push / PR to `utexo-master`, `dev`, `stage`, `master` | no condition needed: never fire on `era/**`, and we never push to those branches |
+| claude-code-review, kimi-code-review | PR label / sync, PR comment mentioning the bot, dispatch | **every `issue_comment`**: GitHub runs it from the default branch, `dev`, whose file has no condition. kimi runs a third-party action pinned to `@main` with PR and issue write access |
+| release | any `v*` tag, dispatch | **a `v*` tag on a UTEXO commit**: the file comes from the tagged commit. This repository mirrors UTEXO's tags; a run would publish a release on our repository (`contents: write`) and try to dispatch to UTEXO's binding repos with PATs we do not hold |
+
+Also uncovered: a dispatch or a PR on a non-`era/**` ref. On 2026-09-26 nothing had
+used any of this: the repository's Actions history held only `era.yml` runs, and the
+Actions API listed `era.yml` as its only workflow. That is the current state, not a
+control.
+
+**The real control is the repository settings**, which apply to every ref and every
+event. They need an admin of `ERAWLT/rgb-lib` (the lead):
+
+1. Disable `release`, `claude-code-review` and `kimi-code-review`: Actions → the
+   workflow → ⋯ → *Disable workflow*, or `gh workflow disable <file> -R ERAWLT/rgb-lib`.
+   A disabled workflow does not run for any event on any ref. The Actions list shows
+   a workflow only once GitHub has registered it; if the three are not listed, use 2.
+2. Or, in effect, allow only `era.yml`. GitHub has no per-file allowlist, but it has
+   one for actions: Settings → Actions → General → *Allow ERAWLT, and select
+   non-ERAWLT, actions and reusable workflows*, with *Allow actions created by
+   GitHub* unticked and exactly what `era.yml` uses listed: `actions/checkout@*`,
+   `actions-rust-lang/setup-rust-toolchain@*`, `Swatinem/rust-cache@*` (called inside
+   setup-rust-toolchain). Every job of the other three then stops at setup, because
+   each uses an action outside the list (`actions/upload-artifact`,
+   `softprops/action-gh-release`, `anthropics/claude-code-action`,
+   `UTEXO-Protocol/kimi-actions`). A new action in `era.yml` then needs a line there.
+3. Optionally, switch the default branch to `era/configurable-derivation`: an
+   `issue_comment` then reads the file with the condition, and the weekly https run
+   starts. It does nothing for a `v*` tag, which only 1 or 2 closes. If the series
+   moves to a new `era/<name>` branch, the default branch has to follow.
+
+On our side, the rule at the top: push the branch, never tags.
 
 ## 3. Dependency diet (`f808c7f`)
 
@@ -138,10 +205,12 @@ the Esplora indexer and VSS over https directly.
   list, multisig hub, DFNS) with a preconfigured `rustls::ClientConfig`: ring provider,
   Mozilla roots from `webpki-roots`, ALPN `h2` + `http/1.1` as reqwest would offer.
 - **Certificate verification uses the bundled Mozilla roots, not the platform
-  verifier.** reqwest's rustls path always verifies through
-  `rustls-platform-verifier`, which on Android has to be initialised over JNI with an
-  application `Context` and needs its Kotlin component in the app's Gradle build; a
-  missed init fails the first handshake. The Esplora client (minreq) and the VSS
+  verifier.** With `rustls-no-provider`, reqwest's own TLS path needs a process-wide
+  `CryptoProvider` (without one, building a client panics with "No provider set") and,
+  by default, the platform verifier: `rustls-platform-verifier`, which on Android has
+  to be initialised over JNI with an application `Context` and needs its Kotlin
+  component in the app's Gradle build; a missed init fails the first handshake. The
+  prebuilt config removes both dependencies. The Esplora client (minreq) and the VSS
   client (bitreq) already verify against bundled webpki roots, so all three HTTP
   clients now trust the same store on every platform. Consequences: user-installed and
   enterprise CAs are not trusted by the RGB proxy client any more (on a wallet that is
@@ -221,9 +290,9 @@ rgb-lib; the difference grows toward these numbers as the app exposes the online
 
 ```sh
 git fetch utexo --tags
-git switch -c era/<name> <utexo-tag>          # a new branch; never rebase this one
-git cherry-pick 6ce375e                       # keychain layout
-git cherry-pick 1d26404 f808c7f <ERA.md sha> # fork-only commits
+git switch -c era/<name> <utexo-tag>                    # a new branch; never rebase this one
+git cherry-pick 62a8c3a..era/configurable-derivation   # the whole series, in order
+git push origin era/<name>                              # the branch only, never --tags
 ```
 
 - `6ce375e` applies without conflicts on `v0.3.0-beta.34-bfa` and on
@@ -237,14 +306,23 @@ git cherry-pick 1d26404 f808c7f <ERA.md sha> # fork-only commits
   then let Cargo prune it with `cargo tree -p rgb-lib > /dev/null` (and the same in
   `bindings/c-ffi`, `bindings/uniffi`). Do **not** run `cargo update`: a fresh
   resolution fails on the yanked secp256k1.
-- Then run what CI runs: `cargo fmt --all -- --check`, both `cargo check` feature
-  sets, the dependency guard, and `SKIP_INIT=1 cargo test --locked --lib --features
-  esplora,vss -- tests_keychain_layout tests_rest_client_tls`.
+- Then run the steps of `era.yml` in order, both jobs (the `https` one needs network),
+  with the commands exactly as written there. The workflow is the checklist; a list
+  copied here would drift from it.
+- If the HTTP client guard fires, route the new client through
+  `api::rest_client_builder`; do not widen the exclusion.
 - If UTEXO has merged the layout patch, drop `6ce375e` and check that their field
   names and defaults match what the app sends.
 - In the app: bump the rev in `packages/era_rgb/rust/Cargo.toml`, copy this
   repository's `Cargo.lock` over the app crate's and run `cargo update --workspace`
-  there (the comment next to the dependency explains why).
+  there (the comment next to the dependency explains why). The copy drops the app's
+  own entries and `cargo update --workspace` resolves them afresh, so it can move
+  crates rgb-lib never uses. Diff the app's old and new `Cargo.lock` and accept
+  changes only in rgb-lib's graph (`cargo tree -p rgb-lib --target all -e normal,build
+  --prefix none`); anything else goes back with
+  `cargo update -p <crate>@<new> --precise <old>`. The other way round: keep the app's
+  lock, change the rev, run `cargo update -p rgb-lib`, then compare every version in
+  rgb-lib's graph with this repository's lock.
 
 ## PR proposal for UTEXO
 
