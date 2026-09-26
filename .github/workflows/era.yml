@@ -1,0 +1,58 @@
+name: ERA fork checks
+
+# CI for ERAWLT/rgb-lib's own branches (era/**). The inherited upstream
+# workflows only fire on UTEXO's branch names (build/test/lint/format) or are
+# restricted to the UTEXO-Protocol owner (AI reviews, release), so this is the
+# only workflow that runs on our pushes. It proves what the fork adds without
+# the regtest services the upstream test suite needs:
+#   - the keychain-layout patch (unit tests, no network);
+#   - the crate still builds with the exact feature set the ERA app uses
+#     (packages/era_rgb: no default features, esplora + vss) and with the
+#     upstream default (electrum) on top.
+# See ERA.md for what the fork changes and why.
+
+on:
+  push:
+    branches: ["era/**"]
+  pull_request:
+    branches: ["era/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: era-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          # the action defaults to "-D warnings"; a lint added by a new stable
+          # release in upstream code must not fail the fork's CI
+          rustflags: ""
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # --locked everywhere: a fresh resolution fails on the yanked
+      # secp256k1 0.32.0-beta.2 that rgb-consensus rc.11 requires, so the
+      # committed Cargo.lock is the only thing that resolves.
+      - name: Check with the app's feature set (no default features, esplora + vss)
+        run: cargo check --locked --no-default-features --features esplora,vss
+
+      - name: Check with default features + esplora + vss
+        run: cargo check --locked --features esplora,vss
+
+      - name: Unit tests of the keychain layout
+        run: cargo test --locked --lib --features esplora,vss -- tests_keychain_layout
