@@ -627,12 +627,21 @@ pub trait WalletCore {
             .and_then(|online_data| online_data.forwarder.as_ref())
     }
 
-    // ERA fork: every RGB proxy client is built here, so the forwarder carries all proxy traffic
+    // ERA fork: wallet code reaches an RGB proxy only through the helpers below, which take the
+    // route from the wallet's own online data, so no call site chooses it; the wallet's reject
+    // lists come from reject_list_resolver (online.rs), which passes the same forwarder.
+    // era.yml fails on any other construction of these clients or of the proxy check.
     // (in WalletCore, not WalletOnline: since the proxy protocol v1.0 an offline receive reserves its
     // invoice on the proxy too)
     #[cfg(feature = "_online")]
     fn proxy_client(&self, proxy_url: &str) -> Result<ProxyClient, Error> {
         ProxyClient::new_routed(proxy_url, self.forwarder())
+    }
+
+    // ERA fork: see proxy_client; utils::check_proxy on this wallet's route
+    #[cfg(feature = "_online")]
+    fn check_proxy_endpoint(&self, proxy_url: &str) -> Result<ServerInfoResponse, Error> {
+        check_proxy_routed(proxy_url, self.forwarder())
     }
 
     #[cfg(feature = "_online")]

@@ -125,24 +125,46 @@ jobs:
           echo "ok: every HTTP client comes from api::rest_client_builder"
 
       # With OnlineOptions::forwarder_url set, every RGB proxy and reject-list
-      # request must reach the loopback forwarder. Wallet code gets those
-      # clients from WalletOnline::proxy_client, RejectListClient::new_routed
-      # and check_proxy_routed, which pick the forwarder up; a plain ::new or
-      # check_proxy compiles fine and goes around it. Allowed: src/api (the
-      # clients themselves), the tests, check_proxy's own definition and
-      # rust_only::check_proxy_url (upstream's public function, which has no
-      # wallet and so no forwarder). Also a grep: a client built under another
-      # name escapes it.
-      - name: Proxy and reject-list clients only through the forwarder
+      # request must reach the loopback forwarder, and the forwarder is the
+      # wallet's: go_online stores it, and WalletOnline::proxy_client,
+      # reject_list_client and check_proxy_endpoint read it back. Every wallet
+      # call site goes through those three. Any other construction compiles
+      # fine and picks its own route: ProxyClient::new, RejectListClient::new
+      # and check_proxy go direct, and the _routed forms take whatever
+      # forwarder their caller passes, None included. So the step lists every
+      # construction outside the clients' own files and the tests, and fails
+      # unless it is exactly this set: the three helpers, upstream's
+      # check_proxy (definition, body, test), rust_only's check_proxy_url (no
+      # wallet, so no forwarder) and check_proxy_url_via_forwarder (given one
+      # explicitly), and the TLS tests in src/api/mod.rs. A new call site,
+      # upstream's or ours, or a second copy of a helper's line changes the
+      # set. Still a grep: a client built under another name (an alias)
+      # escapes it.
+      - name: Proxy and reject-list clients only through the wallet's route
         run: |
-          pattern='(ProxyClient|RejectListClient)::new\(|check_proxy\('
-          found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/api/' ':!src/wallet/test/' \
-            | grep -vE '^src/utils\.rs:[0-9]+:pub\(crate\) fn check_proxy\(proxy_url: &str\)' \
-            | grep -vE '^src/utils\.rs:[0-9]+: +let result = check_proxy\(&server\.url\(\)\);$' \
-            | grep -vE '^src/wallet/rust_only\.rs:[0-9]+: +check_proxy\(proxy_url\)$' || true)
-          if [ -n "$found" ]; then
-            echo "::error::a proxy or reject-list client that ignores the forwarder; use proxy_client(), new_routed or check_proxy_routed (ERA.md, proxy forwarder)"
-            printf '%s\n' "$found"
+          pattern='(ProxyClient|RejectListClient)::new(_routed)?\(|check_proxy(_routed)?\('
+          found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/wallet/test/' \
+              ':!src/api/proxy.rs' ':!src/api/reject_list.rs' ':!src/api/forwarder.rs' \
+            | sed -E 's/^([^:]+):[0-9]+:[[:space:]]*/\1: /' | LC_ALL=C sort || true)
+          expected=(
+            'src/wallet/online.rs: ProxyClient::new_routed(proxy_url, self.forwarder())'
+            'src/wallet/online.rs: RejectListClient::new_routed(reject_list_url, self.forwarder())'
+            'src/wallet/online.rs: check_proxy_routed(proxy_url, self.forwarder())'
+            'src/utils.rs: pub(crate) fn check_proxy(proxy_url: &str) -> Result<(), Error> {'
+            'src/utils.rs: check_proxy_routed(proxy_url, None)'
+            'src/utils.rs: pub(crate) fn check_proxy_routed('
+            'src/utils.rs: let proxy_client = ProxyClient::new_routed(proxy_url, forwarder)?;'
+            'src/utils.rs: let result = check_proxy(&server.url());'
+            'src/wallet/rust_only.rs: check_proxy(proxy_url)'
+            'src/wallet/rust_only.rs: check_proxy_routed(proxy_url, Some(&forwarder))'
+            'src/api/mod.rs: proxy::ProxyClient::new("https://proxy.example").unwrap();'
+            'src/api/mod.rs: reject_list::RejectListClient::new("https://reject.example").unwrap();'
+            'src/api/mod.rs: let proxy = proxy::ProxyClient::new("https://rgb-proxy.utexo.com/json-rpc").unwrap();'
+          )
+          expected=$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          if [ "$found" != "$expected" ]; then
+            echo "::error::a proxy or reject-list client built outside WalletOnline::proxy_client, reject_list_client and check_proxy_endpoint (ERA.md, proxy forwarder); + is in the tree, - is expected"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$found") | sed -n 's/^</-/p; s/^>/+/p' || true
             exit 1
           fi
           # upstream's own tests still build ProxyClient::new; if this stops
@@ -151,13 +173,13 @@ jobs:
             echo "::error::the pattern no longer matches ProxyClient::new in src/wallet/test; update it"
             exit 1
           fi
-          echo "ok: wallet code builds proxy and reject-list clients through the forwarder"
+          echo "ok: proxy and reject-list clients come only from the wallet's route"
 
       # SKIP_INIT: these tests are offline and must not try to start the
       # regtest services. The wallet ones create SQLite wallets (migrations on
       # the TLS-less tokio runtime) and exercise the manifest checks the
       # keychain-layout patch extends. The forwarder ones run against local
-      # mock servers (indexer, RGB proxy, forwarder).
+      # mock servers (indexer, RGB proxy, reject-list host, forwarder).
       - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, offline wallets)
         env:
           SKIP_INIT: "1"
