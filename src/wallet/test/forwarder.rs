@@ -1035,3 +1035,36 @@ fn send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment() {
     }
     direct.assert();
 }
+
+#[test]
+#[parallel]
+fn a_go_online_whose_new_indexer_fails_still_moves_the_forwarder() {
+    let mut services = Services::start();
+    let mut last_session = Server::new();
+    let mut wallet = get_test_wallet(false, None);
+    let online = wallet
+        .go_online(services.options(Some(last_session.url())))
+        .unwrap();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+
+    // a new session: the indexer route and the forwarder moved, and the probe of the new indexer
+    // URL fails (nothing listens on port 1)
+    let mut options = services.options(services.forwarder_url());
+    options.indexer_url = s!("http://127.0.0.1:1");
+    let result = wallet.go_online(options);
+    assert!(
+        matches!(result, Err(Error::InvalidIndexer { .. })),
+        "{result:?}"
+    );
+
+    // the wallet stays online on its last indexer, as upstream, but its proxy traffic already
+    // goes to the new forwarder, not to the last session's port
+    let stale = Untouchable::on(&mut last_session);
+    let direct = Untouchable::on(&mut services.proxy);
+    let forwarded = services.expect_forwarded(&proxy_rid, 1);
+    refresh(&mut wallet, online);
+    forwarded.assert();
+    stale.assert();
+    direct.assert();
+}
