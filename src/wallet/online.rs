@@ -6747,7 +6747,7 @@ pub trait WalletOnline: WalletOffline {
             for transport_endpoint in &mut local_recipient.transport_endpoints {
                 transport_endpoint.usable = *usable_endpoints
                     .entry(transport_endpoint.endpoint.clone())
-                    .or_insert_with(|| check_proxy_routed(&transport_endpoint.endpoint, self.forwarder()).is_ok());
+                    .or_insert_with(|| self.check_proxy_endpoint(&transport_endpoint.endpoint).is_ok());
             }
             if !local_recipient.transport_endpoints.iter().any(|t| t.usable) {
                 return Err(Error::InvalidTransportEndpoints {
