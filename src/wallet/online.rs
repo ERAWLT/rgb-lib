@@ -4194,6 +4194,15 @@ pub trait WalletOnline: WalletOffline {
         let released = transfers.iter().all(|t| t.ack_signature.is_some());
         let now = now().unix_timestamp();
         if !released && batch_transfer.is_expired(now) {
+            // ERA fork (to report upstream): unless its TX is on chain already. The DB can say
+            // "waiting for ACKs" with the TX broadcast: a kill between the broadcast below and the
+            // commit of this refresh, or a backup taken before the broadcast and restored. That
+            // transfer happened; failing it would stop crediting its change. It completes as the
+            // released case below does (broadcast_batch, the broadcast repeated harmlessly). A
+            // lookup that fails fails this refresh, and the next one asks again.
+            if let Some(updated) = self.complete_batch_if_tx_on_chain(txn, batch_transfer)? {
+                return Ok(Some(updated));
+            }
             debug!(
                 self.logger(),
                 "Transfer expired before broadcast, failing it instead of broadcasting"
