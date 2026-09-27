@@ -1304,15 +1304,93 @@ impl Staging {
         self.path.as_deref().expect("set until finish")
     }
 
-    /// Rename the staging directory to `wallet_dir`.
+    /// Rename the staging directory to `wallet_dir`, durably: every file and directory under the
+    /// staging directory is synced first, and the directory that holds `wallet_dir` after. A rename
+    /// can reach the disk before the data it moves (ext4's delayed allocation, f2fs checkpoints),
+    /// so without the first a power loss can leave a wallet in place whose files are short; without
+    /// the second, no wallet at all. Any failure leaves nothing in place: the staging directory
+    /// before the rename, the wallet directory after it.
     fn finish(mut self, wallet_dir: &Path) -> Result<(), Error> {
         let path = self.path.take().expect("set until finish");
-        if let Err(e) = fs::rename(&path, wallet_dir) {
+        if let Err(e) = sync_tree(&path).and_then(|()| {
+            record_fs_event(FsEvent::Rename(path.clone(), wallet_dir.to_path_buf()));
+            Ok(fs::rename(&path, wallet_dir)?)
+        }) {
             let _ = fs::remove_dir_all(&path);
-            return Err(e.into());
+            return Err(e);
+        }
+        if let Some(parent) = wallet_dir.parent()
+            && let Err(e) = sync_dir(parent)
+        {
+            let _ = fs::remove_dir_all(wallet_dir);
+            return Err(e);
         }
         Ok(())
     }
+}
+
+/// ERA fork: sync every file and directory under `root`, `root` included, each directory after
+/// what it holds.
+fn sync_tree(root: &Path) -> Result<(), Error> {
+    for entry in WalkDir::new(root).contents_first(true) {
+        let entry = entry.map_err(|e| Error::IO {
+            details: e.to_string(),
+        })?;
+        if entry.file_type().is_dir() {
+            sync_dir(entry.path())?;
+        } else {
+            record_fs_event(FsEvent::Sync(entry.path().to_path_buf()));
+            sync_hook(entry.path())?;
+            // (opened for writing: Windows syncs no file opened for reading only)
+            fs::OpenOptions::new()
+                .write(true)
+                .open(entry.path())?
+                .sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// ERA fork: sync the directory `dir`, so the entries it holds (created, renamed) are on disk.
+/// Where a directory cannot be opened as a file (Windows), there is nothing to sync this way.
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    record_fs_event(FsEvent::Sync(dir.to_path_buf()));
+    sync_hook(dir)?;
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// ERA fork: what a restore does to the disk that ordering matters for, recorded in tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FsEvent {
+    Sync(PathBuf),
+    Rename(PathBuf, PathBuf),
+}
+
+#[cfg(test)]
+static FS_EVENTS: std::sync::Mutex<Vec<FsEvent>> = std::sync::Mutex::new(Vec::new());
+/// Syncs a test makes fail: of any path under the first whose name is the second.
+#[cfg(test)]
+static FAILING_SYNCS: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn record_fs_event(_event: FsEvent) {
+    #[cfg(test)]
+    FS_EVENTS.lock().unwrap().push(_event);
+}
+
+/// A sync a test made fail.
+fn sync_hook(_path: &Path) -> Result<(), Error> {
+    #[cfg(test)]
+    if FAILING_SYNCS.lock().unwrap().iter().any(|(root, name)| {
+        _path.starts_with(root) && _path.file_name().is_some_and(|n| n == name.as_str())
+    }) {
+        return Err(Error::IO {
+            details: format!("sync of {_path:?} failed (test)"),
+        });
+    }
+    Ok(())
 }
 
 impl Drop for Staging {
@@ -3355,6 +3433,104 @@ mod tests {
         assert_eq!(left, expected);
         for name in &names {
             assert_eq!(fs::read(target.join(name)).unwrap(), b"someone else's file");
+        }
+    }
+
+    // ERA fork: the restored wallet is placed durably: everything under the staging directory
+    // synced before the rename, the directory holding the wallet after it, and a sync that fails
+    // leaves nothing in place
+
+    /// The recorded syncs and renames under `root`.
+    fn fs_events(root: &Path) -> Vec<FsEvent> {
+        FS_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| match event {
+                FsEvent::Sync(path) | FsEvent::Rename(path, _) => path.starts_with(root),
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn one_backup_server(key: &SecretKey) -> VssScript {
+        let [manifest, data, metadata] = uploaded(EXPECTED, key, true);
+        VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ])
+    }
+
+    #[test]
+    fn a_restore_syncs_the_wallet_before_it_places_it() {
+        let key = test_signing_key();
+        let server = one_backup_server(&key);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let restored = restore(config(&server, key), &target, Some(EXPECTED)).unwrap();
+
+        let events = fs_events(root.path());
+        let rename_at = events
+            .iter()
+            .position(|event| matches!(event, FsEvent::Rename(..)))
+            .expect("a rename");
+        let FsEvent::Rename(staging, placed) = events[rename_at].clone() else {
+            unreachable!()
+        };
+        assert_eq!(placed, restored);
+        let synced_before: Vec<PathBuf> = events[..rename_at]
+            .iter()
+            .map(|event| match event {
+                FsEvent::Sync(path) => path.clone(),
+                other => panic!("{other:?} before the rename"),
+            })
+            .collect();
+        // every file and directory the wallet holds, synced under its staging name
+        for entry in WalkDir::new(&restored) {
+            let entry = entry.unwrap();
+            let staged = staging.join(entry.path().strip_prefix(&restored).unwrap());
+            let at = synced_before
+                .iter()
+                .position(|path| *path == staged)
+                .unwrap_or_else(|| panic!("{staged:?} not synced before the rename"));
+            // and a directory after what it holds
+            if let Some(parent) = staged.parent()
+                && staged != staging
+            {
+                let parent_at = synced_before.iter().position(|p| p == parent).unwrap();
+                assert!(parent_at > at, "{parent:?} synced before {staged:?}");
+            }
+        }
+        // then the directory that holds the wallet, and nothing after
+        assert_eq!(events[rename_at + 1..], [FsEvent::Sync(target.clone())]);
+    }
+
+    #[test]
+    fn a_sync_that_fails_leaves_nothing_in_place() {
+        let key = test_signing_key();
+        let server = one_backup_server(&key);
+        // a file's sync, the staging directory's own, or the sync after the rename
+        for failing in ["some_file.txt", "subdir", "data"] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            FAILING_SYNCS
+                .lock()
+                .unwrap()
+                .push((root.path().to_path_buf(), failing.to_string()));
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(
+                matches!(&result, Err(Error::IO { details }) if details.contains("(test)")),
+                "{failing}: {result:?}"
+            );
+            // neither the staging directory nor the wallet, nor the target the restore made
+            assert_eq!(tree(root.path()), NOTHING, "{failing}");
+            // the rename happened only when the sync that failed came after it
+            let renamed = fs_events(root.path())
+                .iter()
+                .any(|event| matches!(event, FsEvent::Rename(..)));
+            assert_eq!(renamed, failing == "data", "{failing}");
         }
     }
 }
