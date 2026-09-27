@@ -641,6 +641,22 @@ fn get_cypher_secrets(password: &str, backup_pub_data: &BackupPubData) -> Result
     Ok(key)
 }
 
+/// ERA fork: read into `buffer` until it is full or `reader` has nothing more, so that a short
+/// count means the end of the data whatever sizes the reader hands out: the blocks of an encrypted
+/// stream are told apart by their size, and only the last one is short.
+pub(crate) fn read_block(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 pub(crate) fn stream_be32_nonce(
     prefix: &[u8; BACKUP_NONCE_LENGTH],
     position: u32,
@@ -674,7 +690,8 @@ fn encrypt_file(
 
     // encrypt file
     loop {
-        let read_count = source_file.read(&mut buffer)?;
+        // ERA fork: a whole block unless the file ends here (File::read may return less)
+        let read_count = read_block(&mut source_file, &mut buffer)?;
         let is_last = read_count != BACKUP_BUFFER_LEN_ENCRYPT;
         if !is_last && position == u32::MAX {
             return Err(Error::Internal {
@@ -718,7 +735,8 @@ fn decrypt_file(
 
     // decrypt file
     loop {
-        let read_count = source_file.read(&mut buffer)?;
+        // ERA fork: see encrypt_file
+        let read_count = read_block(&mut source_file, &mut buffer)?;
         if read_count == BACKUP_BUFFER_LEN_DECRYPT {
             if position == u32::MAX {
                 return Err(Error::Internal {
@@ -731,7 +749,13 @@ fn decrypt_file(
                 .map_err(|_| Error::WrongPassword)?;
             destination_file.write_all(&cleartext)?;
         } else if read_count == 0 {
-            break;
+            // ERA fork: the file ends without its final block, the only short one, which
+            // encrypt_file always writes (a tag alone for data that fills its last block). Every
+            // block so far authenticated, so the password is right and the file is cut short:
+            // what came out is a prefix of the backup, not the backup.
+            return Err(Error::IO {
+                details: s!("the encrypted backup ends without its final block: it is truncated"),
+            });
         } else {
             let nonce = stream_be32_nonce(&nonce_prefix, position, true);
             let cleartext = aead
@@ -744,4 +768,83 @@ fn decrypt_file(
     }
 
     Ok(())
+}
+
+// ERA fork: the decryption refuses a stream that ends without its final block, and the file
+// backups written before that still restore
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::test::era_fixtures::{FIXTURE_PASSWORD, dir_listing, fixture_dir};
+
+    const PASSWORD: &str = "password";
+
+    fn pub_data() -> BackupPubData {
+        BackupPubData {
+            // cheap: what is under test is the stream, not the key derivation
+            scrypt_params: ScryptParams::new(Some(4), Some(8), Some(1)),
+            salt: s!("abcdefghijklmnopqrstuvwx"),
+            nonce: s!("0123456789abcdefghi"),
+            version: BACKUP_VERSION,
+        }
+    }
+
+    #[test]
+    fn a_backup_cut_short_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let clear = dir.path().join("clear");
+        let sealed = dir.path().join("sealed");
+        let cut = dir.path().join("cut");
+        let opened = dir.path().join("opened");
+        // no data, a byte, one and two whole blocks (their final block a tag alone), more
+        for len in [0usize, 1, 239, 478, 1000] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            fs::write(&clear, &plain).unwrap();
+            encrypt_file(&clear, &sealed, PASSWORD, &pub_data()).unwrap();
+            decrypt_file(&sealed, &opened, PASSWORD, &pub_data()).unwrap();
+            assert_eq!(fs::read(&opened).unwrap(), plain, "{len}");
+            let bytes = fs::read(&sealed).unwrap();
+            for at in 0..bytes.len() {
+                fs::write(&cut, &bytes[..at]).unwrap();
+                let result = decrypt_file(&cut, &opened, PASSWORD, &pub_data());
+                if at % BACKUP_BUFFER_LEN_DECRYPT == 0 {
+                    // every block there authenticates, the final one is missing
+                    assert!(
+                        matches!(result, Err(Error::IO { ref details }) if details.contains("truncated")),
+                        "{len} cut at {at}: {result:?}"
+                    );
+                } else {
+                    // a partial block does not authenticate
+                    assert!(
+                        matches!(result, Err(Error::WrongPassword)),
+                        "{len} cut at {at}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d82e21a_file_backup_still_restores() {
+        // Wallet::backup at d82e21a, the rev the ERA app pinned before the check above
+        let fixtures = fixture_dir("d82e21a");
+        let fingerprint = fs::read_to_string(fixtures.join("vss_backup_fingerprint.txt")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // restore_backup works next to the backup file: a copy, not the fixture
+        let backup = root.path().join("seal").join("file_backup.bin");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::copy(fixtures.join("file_backup.bin"), &backup).unwrap();
+        let target = root.path().join("data");
+        restore_backup(
+            backup.to_str().unwrap(),
+            FIXTURE_PASSWORD,
+            target.to_str().unwrap(),
+        )
+        .unwrap();
+        // what d82e21a's own restore_backup made of it
+        assert_eq!(
+            dir_listing(&target, &fingerprint),
+            fs::read_to_string(fixtures.join("file_backup_listing.txt")).unwrap()
+        );
+    }
 }

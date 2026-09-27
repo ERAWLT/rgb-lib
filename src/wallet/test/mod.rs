@@ -439,6 +439,8 @@ mod create_utxos;
 mod delete_transfers;
 #[cfg(feature = "electrum")]
 mod drain_to;
+// ERA fork: backups an older rev wrote, which must keep restoring
+pub(crate) mod era_fixtures;
 #[cfg(feature = "electrum")]
 mod fail_transfers;
 #[cfg(feature = "electrum")]

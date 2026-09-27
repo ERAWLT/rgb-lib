@@ -846,6 +846,11 @@ pub fn encrypt_data(
 /// The `signing_key`, `metadata`, and `info` must match what was passed to
 /// [`encrypt_data`]; otherwise the AEAD authentication tag check fails and an
 /// `Error::VssError` is returned.
+///
+/// ERA fork: so is data that ends without its final block (cut short, or empty): each block is
+/// authenticated with its position and whether it is the last, so what this returns is all of
+/// what `encrypt_data` sealed under this key and metadata, in order. It says nothing of when: an
+/// older backup, served with its own metadata, decrypts just as well.
 pub fn decrypt_data(
     encrypted: &[u8],
     signing_key: &SecretKey,
@@ -880,7 +885,13 @@ pub fn decrypt_data(
                     })?;
             decrypted.extend(cleartext);
         } else if read_count == 0 {
-            break;
+            // ERA fork: the data ends without its final block, the only short one, which
+            // encrypt_data always writes (a tag alone for data that fills its last block, and for
+            // no data at all). What came out is a prefix of the data, not the data.
+            return Err(Error::VssError {
+                details: "decryption failed: the data ends without its final block (truncated)"
+                    .to_string(),
+            });
         } else {
             let nonce = stream_be32_nonce(&nonce_prefix, position, true);
             let cleartext =
@@ -1669,6 +1680,95 @@ mod tests {
             assert!(!content.contains(fingerprint));
         }
     }
+    // ERA fork: decrypt_data refuses data that ends without its final block, and the backups
+    // written before that (fixtures from d82e21a, see wallet::test::era_fixtures) still decrypt
+
+    #[test]
+    fn decrypt_data_refuses_data_cut_short() {
+        let key = test_signing_key();
+        let metadata = VssEncryptionMetadata::new();
+        // no data, a byte, one and two whole blocks (their final block a tag alone), more
+        for len in [0usize, 1, 239, 478, 1000] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let sealed = encrypt_data(&plain, &key, &metadata, None).unwrap();
+            assert_eq!(decrypt_data(&sealed, &key, &metadata, None).unwrap(), plain);
+            for at in 0..sealed.len() {
+                let result = decrypt_data(&sealed[..at], &key, &metadata, None);
+                let details = match result {
+                    Err(Error::VssError { details }) => details,
+                    other => panic!("{len} cut at {at}: {other:?}"),
+                };
+                // after whole blocks, every one authenticates and the final one is missing; a
+                // partial block does not authenticate
+                assert_eq!(
+                    details.contains("truncated"),
+                    at % BACKUP_BUFFER_LEN_DECRYPT == 0,
+                    "{len} cut at {at}: {details}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d82e21a_stream_vectors_still_decrypt() {
+        use crate::wallet::test::era_fixtures::{
+            STREAM_VECTOR_LENGTHS, fixture_dir, fixture_signing_key, fixture_stream_metadata,
+            stream_plaintext,
+        };
+        let key = fixture_signing_key();
+        let metadata = fixture_stream_metadata();
+        let vectors =
+            fs::read_to_string(fixture_dir("d82e21a").join("vss_stream_vectors.txt")).unwrap();
+        let mut lengths = vec![];
+        for line in vectors.lines() {
+            let (len, sealed) = line.split_once(' ').unwrap();
+            let len: usize = len.parse().unwrap();
+            let sealed = hex::decode(sealed).unwrap();
+            let plain = stream_plaintext(len);
+            assert_eq!(
+                decrypt_data(&sealed, &key, &metadata, None).unwrap(),
+                plain,
+                "{len}"
+            );
+            // and today's encrypt_data writes the same bytes
+            assert_eq!(
+                encrypt_data(&plain, &key, &metadata, None).unwrap(),
+                sealed,
+                "{len}"
+            );
+            lengths.push(len);
+        }
+        assert_eq!(lengths, STREAM_VECTOR_LENGTHS);
+    }
+
+    #[test]
+    fn d82e21a_vss_backup_still_restores() {
+        use crate::wallet::test::era_fixtures::{dir_listing, fixture_dir, fixture_signing_key};
+        // what a VSS server holds for a backup uploaded at d82e21a, the rev the ERA app pinned
+        // before the check above
+        let fixtures = fixture_dir("d82e21a");
+        let read = |name: &str| fs::read(fixtures.join(name)).unwrap();
+        let fingerprint = String::from_utf8(read("vss_backup_fingerprint.txt")).unwrap();
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![read("vss_backup_manifest.json")]),
+            (
+                BACKUP_KEY_FINGERPRINT,
+                vec![fingerprint.clone().into_bytes()],
+            ),
+            (BACKUP_KEY_DATA, vec![read("vss_backup_data.bin")]),
+            (BACKUP_KEY_METADATA, vec![read("vss_backup_metadata.json")]),
+        ]);
+        let listing = fs::read_to_string(fixtures.join("vss_backup_listing.txt")).unwrap();
+        for expected in [Some(fingerprint.as_str()), None] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let restored =
+                restore(config(&server, fixture_signing_key()), &target, expected).unwrap();
+            assert_eq!(restored, target.join(&fingerprint));
+            assert_eq!(dir_listing(&target, &fingerprint), listing, "{expected:?}");
+        }
+    }
+
     /// ERA fork: a VSS server whose getObject answers follow a script: the n-th read of a key
     /// gets the n-th value listed for it (the last one again after that), so a server that
     /// answers two reads of one key differently can be played. A key with no values is not

@@ -198,14 +198,16 @@ jobs:
       # the TLS-less tokio runtime) and exercise the manifest checks the
       # keychain-layout patch extends. The forwarder ones run against local
       # mock servers (indexer, RGB proxy, reject-list host, forwarder), the VSS
-      # ones against a scripted VSS server.
-      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, offline wallets)
+      # ones against a scripted VSS server. The VSS and file backup ones also
+      # restore backups an older rev wrote (src/wallet/test/fixtures).
+      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets)
         env:
           SKIP_INIT: "1"
         run: >
           cargo test --locked --lib --features esplora,vss --
           tests_keychain_layout tests_rest_client_tls
           api::forwarder:: wallet::test::forwarder:: wallet::vss::tests::
+          wallet::backup::tests::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
 
       - name: Migration crate with its CLI (the authoring binary still builds)
