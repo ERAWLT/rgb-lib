@@ -734,4 +734,5 @@ mod sign_psbt;
 mod sync;
 #[cfg(feature = "electrum")]
 mod validate_consignment;
+#[cfg(feature = "electrum")]
 mod witness_receive;
