@@ -518,44 +518,42 @@ pub trait WalletOnline: WalletOffline {
                 }
                 // ERA fork: a forwarder that no longer lets a send's ACK poll through (the user's
                 // consent for the recipient's proxy gone, a target it may not be given) would
-                // otherwise keep the send from ever failing. A send waiting for its ACKs has
-                // normally broadcast nothing, but not always: a backup taken before the broadcast
-                // and restored, or a kill between the broadcast in try_complete_batch and the
-                // commit of its refresh, leaves it waiting with its TX on chain, and failing that
-                // one would stop crediting its change. So it is failed only if the indexer does not
-                // know its TX; a lookup that fails keeps it too. Not a receive: a donation's
+                // otherwise keep the send from ever failing: that counts as no change, and the
+                // send is failed below if its TX is not on chain. Not a receive: a donation's
                 // witness may already be on chain.
-                Err(e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }))
+                Err(Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. })
                     if !batch_transfer.incoming
                         && batch_transfer.status == TransferStatus::WaitingCounterparty =>
                 {
-                    match self.batch_tx_known(batch_transfer) {
-                        Ok(false) => Ok(None),
-                        Ok(true) => {
-                            warn!(
-                                self.logger(),
-                                "Not failing batch transfer {}: the indexer knows its TX",
-                                batch_transfer.idx
-                            );
-                            Err(e)
-                        }
-                        // (the lookup's error unsaid: it can name the indexer's URL, which carries
-                        // the forwarder's session secret in the app)
-                        Err(_) => {
-                            warn!(
-                                self.logger(),
-                                "Not failing batch transfer {}: its TX could not be looked up",
-                                batch_transfer.idx
-                            );
-                            Err(e)
-                        }
-                    }
+                    Ok(None)
                 }
                 Err(e) => Err(e),
                 Ok(v) => Ok(v),
             }?;
         // fail transfer if the status didn't change after a refresh
         if updated_batch_transfer.is_none() {
+            // ERA fork: unless it is a send whose TX is on chain. A send that has not reached
+            // WaitingConfirmations has normally broadcast nothing, but not always: a donation,
+            // inflation or burn broadcasts in its *_end, and a send in try_complete_batch, before
+            // the commit that records it, so a kill in between, or a backup (the app's seal) taken
+            // before and restored, leaves it Initiated or WaitingCounterparty with its TX on
+            // chain. Failing it would report as undone a transfer that happened and stop crediting
+            // its change; it completes by the path it was on (the *_end called again with the
+            // signed PSBT, the ACKs coming in). So it is failed only if the indexer does not know
+            // its TX, and a lookup that fails fails the call.
+            if !batch_transfer.incoming
+                && matches!(
+                    batch_transfer.status,
+                    TransferStatus::Initiated | TransferStatus::WaitingCounterparty
+                )
+                && self.batch_tx_known(batch_transfer)?
+            {
+                warn!(
+                    self.logger(),
+                    "Not failing batch transfer {}: the indexer knows its TX", batch_transfer.idx
+                );
+                return Ok(TryFailBatchTransferOutcome::CannotFail);
+            }
             self.fail_batch_transfer(txn, batch_transfer)?;
             Ok(TryFailBatchTransferOutcome::Failed)
         } else {
@@ -620,11 +618,14 @@ pub trait WalletOnline: WalletOffline {
                 }
             }
 
-            transfers_changed = true;
-            if let TryFailBatchTransferOutcome::Refreshed =
-                self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)?
-            {
-                cannot_fail = true;
+            match self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)? {
+                TryFailBatchTransferOutcome::Failed => transfers_changed = true,
+                TryFailBatchTransferOutcome::Refreshed => {
+                    transfers_changed = true;
+                    cannot_fail = true;
+                }
+                // ERA fork: nothing changed, and it cannot be failed
+                TryFailBatchTransferOutcome::CannotFail => cannot_fail = true,
             }
         } else {
             // fail all expired transfers that are in a fallible status
@@ -643,13 +644,17 @@ pub trait WalletOnline: WalletOffline {
                     }
                 }
                 // ERA fork: each attempt in a savepoint of its own. A transfer the forwarder's
-                // policy keeps from refreshing (see try_fail_batch_transfer) is left as it was,
-                // with nothing of its attempt kept (a receive's refresh marks the endpoint it got
-                // the consignment from as used, or stores the asset it receives, before its ACK is
-                // refused), and does not keep the others from failing: the call would otherwise
-                // roll all of them back. Only a transfer failed or refreshed is a change.
+                // policy keeps from refreshing (see try_fail_batch_transfer), a send whose TX is on
+                // chain, or one whose lookup the indexer fails (as UTEXO's v0.3.0-beta.43-bfa skips
+                // indexer and network errors here) is left as it was, with none of its attempt's
+                // database writes kept (a receive's refresh marks the endpoint it got the
+                // consignment from as used, or stores the asset it receives, before its ACK is
+                // refused; files it wrote, such as a downloaded consignment, stay), and does not
+                // keep the others from failing: the call would otherwise roll all of them back.
+                // Only a transfer failed or refreshed is a change.
                 let attempt = txn.savepoint()?;
                 match self.try_fail_batch_transfer(&attempt, batch_transfer, &db_data) {
+                    Ok(TryFailBatchTransferOutcome::CannotFail) => drop(attempt),
                     Err(
                         e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
                     ) => {
@@ -657,6 +662,16 @@ pub trait WalletOnline: WalletOffline {
                         warn!(
                             self.logger(),
                             "Not failing batch transfer {}: {e}", batch_transfer.idx
+                        );
+                    }
+                    // (the error unsaid: it can name the indexer's URL, which carries the
+                    // forwarder's session secret in the app)
+                    Err(Error::Indexer { .. } | Error::Network { .. }) => {
+                        drop(attempt);
+                        warn!(
+                            self.logger(),
+                            "Not failing batch transfer {}: the indexer or the network failed",
+                            batch_transfer.idx
                         );
                     }
                     other => {
@@ -2054,7 +2069,11 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         transfers: &[DbTransfer],
     ) -> Result<Option<DbBatchTransfer>, Error> {
-        if transfers.iter().any(|t| t.ack == Some(false)) {
+        // ERA fork: a NACK fails the batch, unless its TX is on chain already (a kill between the
+        // broadcast below and the commit of its refresh, and a proxy that answers the next poll
+        // with a NACK): the transfer happened. It is then left as it is (see
+        // try_fail_batch_transfer).
+        if transfers.iter().any(|t| t.ack == Some(false)) && !self.batch_tx_known(batch_transfer)? {
             return Ok(Some(
                 self.fail_batch_transfer(txn, batch_transfer)
                     .map_err(|e| match e {

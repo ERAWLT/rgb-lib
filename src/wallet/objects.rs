@@ -2115,6 +2115,10 @@ pub struct ReceivedConsignmentMeta {
 pub enum TryFailBatchTransferOutcome {
     Failed,
     Refreshed,
+    /// ERA fork: the batch is an outgoing one whose TX the indexer knows: failing it would report
+    /// as undone a transfer that happened, and stop crediting its change (UTEXO's
+    /// `v0.3.0-beta.43-bfa` has the same variant, for its prepare batches)
+    CannotFail,
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]

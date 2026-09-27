@@ -1518,10 +1518,14 @@ fn a_refused_send_whose_tx_the_indexer_knows_or_cannot_tell_is_not_failed() {
         let direct = Untouchable::on(&mut services.proxy);
         let refusal = services.expect_refusals(&target, "ack.get", "consent-expired", 2);
 
-        // failing it alone reports the refusal, and the send keeps waiting
+        // failing it alone: it cannot be failed (its TX on chain), or the lookup's error; the send
+        // keeps waiting
         let result = wallet.fail_transfers(online, Some(send), false, true);
         assert!(
-            matches!(result, Err(Error::ForwarderRefused { .. })),
+            match state {
+                OnChain::Unreachable => matches!(result, Err(Error::Indexer { .. })),
+                _ => matches!(result, Err(Error::CannotFailBatchTransfer)),
+            },
             "{state:?}: {result:?}"
         );
         assert_eq!(
@@ -1542,6 +1546,221 @@ fn a_refused_send_whose_tx_the_indexer_knows_or_cannot_tell_is_not_failed() {
         refusal.assert();
         lookup.iter().for_each(Mock::assert);
         direct.assert();
+    }
+}
+
+/// A send as its *_end leaves it before the commit that records it, or as a backup from before
+/// its *_end has it: [`send_waiting_for_ack`] in `status`.
+fn send_in_status(
+    wallet: &Wallet,
+    recipient_id: &str,
+    endpoint: &str,
+    status: TransferStatus,
+) -> i32 {
+    let idx = send_waiting_for_ack(wallet, recipient_id, endpoint);
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch_transfer = txn
+        .get_db_data(false)
+        .unwrap()
+        .batch_transfers
+        .into_iter()
+        .find(|bt| bt.idx == idx)
+        .unwrap();
+    let mut updated: DbBatchTransferActMod = batch_transfer.into();
+    updated.status = ActiveValue::Set(status);
+    txn.update_batch_transfer(&mut updated).unwrap();
+    txn.commit().unwrap();
+    idx
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_send_whose_tx_is_on_chain_is_never_failed() {
+    // with or without a forwarder: a donation, inflation or burn broadcasts in its *_end and a send
+    // in try_complete_batch, before the commit that records it; a kill in between, or a backup
+    // (the app's seal) taken before and restored, leaves it Initiated (which a refresh does not
+    // touch), or WaitingCounterparty with no ACK to be had, and its TX on chain. fail_transfers
+    // failed either without looking at the chain.
+    for state in [
+        OnChain::Unknown,
+        OnChain::Mempool,
+        OnChain::Confirmed,
+        OnChain::Unreachable,
+    ] {
+        let mut services = Services::start();
+        let (mut wallet, online) = services.online_wallet();
+        let target = services.target();
+        let lookup = services.tx_lookup(state);
+        let direct = Untouchable::on(&mut services.proxy);
+        let initiated = send_in_status(&wallet, "r1", &target, TransferStatus::Initiated);
+        let waiting = send_waiting_for_ack(&wallet, "r2", &target);
+        // no ACK yet
+        let no_ack = services.expect_rpc(
+            &target,
+            "ack.get",
+            json!({"recipient_id": "r2"}),
+            Json::Null,
+        );
+
+        // each alone, as the app's cancel does
+        for send in [initiated, waiting] {
+            let status = status_of(&wallet, send);
+            let result = wallet.fail_transfers(online, Some(send), false, true);
+            match state {
+                OnChain::Unknown => {
+                    assert!(matches!(result, Ok(true)), "{status:?}: {result:?}");
+                    assert_eq!(status_of(&wallet, send), TransferStatus::Failed);
+                }
+                OnChain::Mempool | OnChain::Confirmed => {
+                    assert!(
+                        matches!(result, Err(Error::CannotFailBatchTransfer)),
+                        "{state:?} {status:?}: {result:?}"
+                    );
+                    assert_eq!(status_of(&wallet, send), status, "{state:?}");
+                }
+                OnChain::Unreachable => {
+                    assert!(
+                        matches!(result, Err(Error::Indexer { .. })),
+                        "{status:?}: {result:?}"
+                    );
+                    assert_eq!(status_of(&wallet, send), status, "{state:?}");
+                }
+            }
+        }
+
+        // every expired transfer at once: the same ones failed or kept, and a change reported
+        // only when one was failed
+        let initiated = send_in_status(&wallet, "r3", &target, TransferStatus::Initiated);
+        let waiting = send_waiting_for_ack(&wallet, "r4", &target);
+        let no_ack_bulk = services.expect_rpc(
+            &target,
+            "ack.get",
+            json!({"recipient_id": "r4"}),
+            Json::Null,
+        );
+        for send in [initiated, waiting] {
+            expire(&wallet, send);
+        }
+        let changed = wallet.fail_transfers(online, None, false, true).unwrap();
+        let failed = matches!(state, OnChain::Unknown);
+        assert_eq!(changed, failed, "{state:?}");
+        for (send, status) in [
+            (initiated, TransferStatus::Initiated),
+            (waiting, TransferStatus::WaitingCounterparty),
+        ] {
+            let expected = if failed {
+                TransferStatus::Failed
+            } else {
+                status
+            };
+            assert_eq!(status_of(&wallet, send), expected, "{state:?}");
+        }
+        for mock in [no_ack, no_ack_bulk].iter().chain(&lookup) {
+            mock.assert();
+        }
+        direct.assert();
+    }
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_receive_is_failed_as_upstream_fails_it_whatever_the_chain_says() {
+    // the chain check is for sends: a receive whose consignment never came is failed without a
+    // lookup, whatever TX the batch carries
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let batch_transfer = txn
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .into_iter()
+            .find(|bt| bt.idx == transfer.batch_transfer_idx)
+            .unwrap();
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.txid = ActiveValue::Set(Some(FAKE_TXID.to_string()));
+        txn.update_batch_transfer(&mut updated).unwrap();
+        txn.commit().unwrap();
+    }
+    let no_consignment = services.expect_forwarded(&proxy_rid, 1);
+    let never = services
+        .esplora
+        .mock("GET", Matcher::Regex(s!("^/tx/")))
+        .expect(0)
+        .create();
+    assert!(
+        wallet
+            .fail_transfers(online, Some(transfer.batch_transfer_idx), false, true)
+            .unwrap()
+    );
+    assert_eq!(
+        status_of(&wallet, transfer.batch_transfer_idx),
+        TransferStatus::Failed
+    );
+    no_consignment.assert();
+    never.assert();
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_nack_does_not_fail_a_send_whose_tx_is_on_chain() {
+    // a kill between the broadcast and the commit of its refresh, and a proxy that then answers
+    // with a NACK: the transfer happened all the same
+    for state in [OnChain::Unknown, OnChain::Confirmed, OnChain::Unreachable] {
+        let mut services = Services::start();
+        let (mut wallet, online) = services.online_wallet();
+        let target = services.target();
+        let lookup = services.tx_lookup(state);
+        let send = send_waiting_for_ack(&wallet, "recipient", &target);
+        let nack = services.expect_rpc(
+            &target,
+            "ack.get",
+            json!({"recipient_id": "recipient"}),
+            json!(false),
+        );
+        let result = wallet.refresh(online, None, vec![], true).unwrap();
+        let refreshed = &result[&send];
+        match state {
+            // failed, as upstream
+            OnChain::Unknown => assert_eq!(
+                refreshed,
+                &RefreshedTransfer {
+                    updated_status: Some(TransferStatus::Failed),
+                    failure: None,
+                }
+            ),
+            // left as it is
+            OnChain::Confirmed => assert_eq!(
+                refreshed,
+                &RefreshedTransfer {
+                    updated_status: None,
+                    failure: None,
+                }
+            ),
+            // the refresh fails, and the next one asks again
+            _ => assert!(
+                matches!(
+                    refreshed,
+                    RefreshedTransfer {
+                        updated_status: None,
+                        failure: Some(Error::Indexer { .. }),
+                    }
+                ),
+                "{refreshed:?}"
+            ),
+        }
+        if !matches!(state, OnChain::Unknown) {
+            assert_eq!(
+                status_of(&wallet, send),
+                TransferStatus::WaitingCounterparty,
+                "{state:?}"
+            );
+        }
+        nack.assert();
+        lookup.iter().for_each(Mock::assert);
     }
 }
 
