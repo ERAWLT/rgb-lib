@@ -2050,8 +2050,14 @@ pub trait WalletOnline: WalletOffline {
         // don't broadcast a transfer that has expired: past its expiration the recipient is
         // allowed to fail it, so broadcasting now could complete a transfer the recipient has
         // already given up on
+        // ERA fork (to report to UTEXO): unless its TX is on chain already. The DB can say
+        // "waiting for ACKs" with the TX broadcast: a kill between the broadcast below and the
+        // commit of this refresh, or a backup taken before the broadcast and restored. That
+        // transfer happened; failing it would stop crediting its change. It goes on as one that
+        // has not expired (the broadcast is repeated, harmlessly). A lookup that fails fails this
+        // refresh, and the next one asks again.
         let now = now().unix_timestamp();
-        if batch_transfer.expiration.unwrap_or(now) < now {
+        if batch_transfer.expiration.unwrap_or(now) < now && !self.batch_tx_known(batch_transfer)? {
             debug!(
                 self.logger(),
                 "Transfer expired before broadcast, failing it instead of broadcasting"

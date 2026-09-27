@@ -3,8 +3,9 @@
 //! the real proxy.
 //!
 //! No regtest services: the Esplora indexer, the RGB proxy, the reject-list host and the
-//! forwarder are local mock servers, and the indexer only answers the genesis lookup `go_online`
-//! makes. Every request rgb-lib sends to a proxy or a reject list is sent here by the wallet code
+//! forwarder are local mock servers, and the indexer answers only the genesis lookup `go_online`
+//! makes and, where a test says so, the lookup of a send's TX (`OnChain`). Every request rgb-lib
+//! sends to a proxy or a reject list is sent here by the wallet code
 //! that sends it in production, the call sites of `WalletOnline::proxy_client`,
 //! `reject_list_client` and `check_proxy_endpoint`, and has to arrive at the forwarder, at the
 //! path of `forwarder_url`, with both `X-Era-Forward-*` headers, while the real host is never
@@ -1423,6 +1424,76 @@ fn a_refused_send_whose_tx_the_indexer_knows_or_cannot_tell_is_not_failed() {
         refusal.assert();
         lookup.iter().for_each(Mock::assert);
         direct.assert();
+    }
+}
+
+#[test]
+#[serial(forwarder)]
+fn an_expired_send_is_failed_on_its_last_ack_only_if_its_tx_is_not_on_chain() {
+    // upstream's gap (to report to UTEXO), with or without a forwarder: every ACK in and the send
+    // expired, try_complete_batch failed it without looking at the chain, where its TX may be
+    // already (a kill between the broadcast and the commit of its refresh, a backup from before)
+    for state in [
+        OnChain::Unknown,
+        OnChain::Mempool,
+        OnChain::Confirmed,
+        OnChain::Unreachable,
+    ] {
+        let mut services = Services::start();
+        let (mut wallet, online) = services.online_wallet();
+        let target = services.target();
+        let send = send_waiting_for_ack(&wallet, "recipient", &target);
+        expire(&wallet, send);
+        let lookup = services.tx_lookup(state);
+        let ack = services.expect_rpc(
+            &target,
+            "ack.get",
+            json!({"recipient_id": "recipient"}),
+            json!(true),
+        );
+        let result = wallet.refresh(online, None, vec![], true).unwrap();
+        let refreshed = &result[&send];
+        match state {
+            // nothing on chain: failed, as upstream
+            OnChain::Unknown => assert_eq!(
+                refreshed,
+                &RefreshedTransfer {
+                    updated_status: Some(TransferStatus::Failed),
+                    failure: None,
+                }
+            ),
+            // on chain: on to the broadcast, which reads the send's signed PSBT (not written here)
+            OnChain::Mempool | OnChain::Confirmed => assert!(
+                matches!(
+                    refreshed,
+                    RefreshedTransfer {
+                        updated_status: None,
+                        failure: Some(Error::IO { .. }),
+                    }
+                ),
+                "{state:?}: {refreshed:?}"
+            ),
+            // the lookup failed: so does the refresh, and the next one asks again
+            OnChain::Unreachable => assert!(
+                matches!(
+                    refreshed,
+                    RefreshedTransfer {
+                        updated_status: None,
+                        failure: Some(Error::Indexer { .. }),
+                    }
+                ),
+                "{state:?}: {refreshed:?}"
+            ),
+        }
+        if !matches!(state, OnChain::Unknown) {
+            assert_eq!(
+                status_of(&wallet, send),
+                TransferStatus::WaitingCounterparty,
+                "{state:?}"
+            );
+        }
+        ack.assert();
+        lookup.iter().for_each(Mock::assert);
     }
 }
 
