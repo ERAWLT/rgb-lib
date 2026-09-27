@@ -18,7 +18,9 @@ name: ERA fork checks
 #   - the proxy forwarder patch: with OnlineOptions::forwarder_url set, every
 #     RGB proxy and reject-list request goes to the loopback forwarder (unit
 #     tests against local mock servers, plus a guard on how wallet code builds
-#     those clients).
+#     those clients);
+#   - the bindings still build: the uniffi UDL mirrors the Error enum, and a
+#     variant the fork adds without mirroring it breaks only that build.
 # The https job makes real TLS handshakes against UTEXO's public signet
 # services; it depends on third-party hosts, so it is kept out of check.
 # See ERA.md for what the fork changes and why.
@@ -73,6 +75,18 @@ jobs:
 
       - name: Check with default features + esplora + vss
         run: cargo check --locked --features esplora,vss
+
+      # Each binding is a workspace of its own, with its own Cargo.lock. The
+      # uniffi one generates its scaffolding from the UDL, which lists every
+      # variant of rgb_lib::Error: a variant added to the enum and not to the
+      # UDL compiles in the library and fails only here. The C-FFI one comes
+      # along cheaply. CARGO_TARGET_DIR shares the build of the steps above.
+      - name: Bindings build (uniffi UDL mirrors the Error enum; C-FFI)
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo check --locked --manifest-path bindings/uniffi/Cargo.toml
+          cargo check --locked --manifest-path bindings/c-ffi/Cargo.toml
 
       # cargo tree resolves for any target without its toolchain, so the
       # mobile graphs are checked here without an NDK or Xcode
@@ -129,20 +143,22 @@ jobs:
       # wallet's: go_online stores it, and WalletOnline::proxy_client,
       # reject_list_client and check_proxy_endpoint read it back. Every wallet
       # call site goes through those three. Any other construction compiles
-      # fine and picks its own route: ProxyClient::new, RejectListClient::new
-      # and check_proxy go direct, and the _routed forms take whatever
-      # forwarder their caller passes, None included. So the step lists every
-      # construction outside the clients' own files and the tests, and fails
-      # unless it is exactly this set: the three helpers, upstream's
-      # check_proxy (definition, body, test), rust_only's check_proxy_url (no
-      # wallet, so no forwarder) and check_proxy_url_via_forwarder (given one
-      # explicitly), and the TLS tests in src/api/mod.rs. A new call site,
+      # fine and picks its own route: ProxyClient::new, RejectListClient::new,
+      # check_proxy and rust_only::check_proxy_url go direct, and the _routed
+      # forms and check_proxy_url_via_forwarder take whatever forwarder their
+      # caller passes, None included. So the step lists every construction
+      # and every call of those checks outside the clients' own files and the
+      # tests, and fails unless it is exactly this set: the three helpers,
+      # upstream's check_proxy (definition, body, test), rust_only's
+      # check_proxy_url (no wallet, so no forwarder) and
+      # check_proxy_url_via_forwarder (given one explicitly), with their
+      # definitions, and the TLS tests in src/api/mod.rs. A new call site,
       # upstream's or ours, or a second copy of a helper's line changes the
       # set. Still a grep: a client built under another name (an alias)
       # escapes it.
       - name: Proxy and reject-list clients only through the wallet's route
         run: |
-          pattern='(ProxyClient|RejectListClient)::new(_routed)?\(|check_proxy(_routed)?\('
+          pattern='(ProxyClient|RejectListClient)::new(_routed)?\(|check_proxy(_routed|_url|_url_via_forwarder)?\('
           found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/wallet/test/' \
               ':!src/api/proxy.rs' ':!src/api/reject_list.rs' ':!src/api/forwarder.rs' \
             | sed -E 's/^([^:]+):[0-9]+:[[:space:]]*/\1: /' | LC_ALL=C sort || true)
@@ -157,6 +173,8 @@ jobs:
             'src/utils.rs: let result = check_proxy(&server.url());'
             'src/wallet/rust_only.rs: check_proxy(proxy_url)'
             'src/wallet/rust_only.rs: check_proxy_routed(proxy_url, Some(&forwarder))'
+            'src/wallet/rust_only.rs: pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {'
+            'src/wallet/rust_only.rs: pub fn check_proxy_url_via_forwarder(proxy_url: &str, forwarder_url: &str) -> Result<(), Error> {'
             'src/api/mod.rs: proxy::ProxyClient::new("https://proxy.example").unwrap();'
             'src/api/mod.rs: reject_list::RejectListClient::new("https://reject.example").unwrap();'
             'src/api/mod.rs: let proxy = proxy::ProxyClient::new("https://rgb-proxy.utexo.com/json-rpc").unwrap();'
