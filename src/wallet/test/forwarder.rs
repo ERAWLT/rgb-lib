@@ -1226,3 +1226,173 @@ fn a_refusal_reason_is_never_read_as_the_proxys_answer() {
     nack.assert();
     direct.assert();
 }
+
+fn expire(wallet: &Wallet, batch_transfer_idx: i32) {
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch_transfer = txn
+        .get_db_data(false)
+        .unwrap()
+        .batch_transfers
+        .into_iter()
+        .find(|bt| bt.idx == batch_transfer_idx)
+        .unwrap();
+    let mut expired: DbBatchTransferActMod = batch_transfer.into();
+    expired.expiration = ActiveValue::Set(Some(now().unix_timestamp() - 60));
+    txn.update_batch_transfer(&mut expired).unwrap();
+    txn.commit().unwrap();
+}
+
+fn status_of(wallet: &Wallet, batch_transfer_idx: i32) -> TransferStatus {
+    let txn = wallet.database().begin_transaction().unwrap();
+    txn.get_db_data(false)
+        .unwrap()
+        .batch_transfers
+        .into_iter()
+        .find(|bt| bt.idx == batch_transfer_idx)
+        .unwrap()
+        .status
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_send_the_forwarder_no_longer_carries_can_be_failed() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+
+    // its ACK poll refused (the user's consent for the recipient's proxy is gone): nothing was
+    // broadcast, so the send can be failed
+    let refused = send_waiting_for_ack(&wallet, "recipient", &target);
+    expire(&wallet, refused);
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&target, "ack.get", "consent-expired");
+    assert!(
+        wallet
+            .fail_transfers(online, Some(refused), false, true)
+            .unwrap()
+    );
+    assert_eq!(status_of(&wallet, refused), TransferStatus::Failed);
+    refusal.assert();
+    refusal.remove();
+
+    // its endpoint one the forwarder may not be given: no request, and the send can be failed
+    let unroutable = send_waiting_for_ack(
+        &wallet,
+        "recipient",
+        "http://rgb-proxy.example@evil.example/json-rpc",
+    );
+    let never = Untouchable::on(&mut services.forwarder);
+    assert!(
+        wallet
+            .fail_transfers(online, Some(unroutable), false, true)
+            .unwrap()
+    );
+    assert_eq!(status_of(&wallet, unroutable), TransferStatus::Failed);
+    never.assert();
+    direct.assert();
+}
+
+#[test]
+#[serial(forwarder)]
+fn an_outage_still_keeps_a_send_from_failing() {
+    // upstream: a send whose ACK poll fails cannot be failed, the recipient may have answered
+    let services = Services::start();
+    let mut wallet = get_test_wallet(false, None);
+    // nothing listens on port 1
+    let online = wallet
+        .go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .unwrap();
+    let send = send_waiting_for_ack(&wallet, "recipient", &services.target());
+    expire(&wallet, send);
+    let result = wallet.fail_transfers(online, Some(send), false, true);
+    assert!(matches!(result, Err(Error::Proxy { .. })), "{result:?}");
+    // failing every expired transfer stops at it too, as upstream
+    let result = wallet.fail_transfers(online, None, false, true);
+    assert!(matches!(result, Err(Error::Proxy { .. })), "{result:?}");
+    assert_eq!(
+        status_of(&wallet, send),
+        TransferStatus::WaitingCounterparty
+    );
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let refused_target = s!("https://refused-proxy.example/json-rpc");
+    let quiet_target = s!("https://quiet-proxy.example/json-rpc");
+
+    // a receive whose consignment the wallet refuses and whose NACK the forwarder refuses: its
+    // refresh fails with the refusal, and a receive is never failed past one (a donation may be on
+    // chain)
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let blocked = transfer.batch_transfer_idx;
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+    // a send whose ACK poll is refused, and one whose recipient has not answered yet
+    let refused = send_waiting_for_ack(&wallet, "recipient-1", &refused_target);
+    let quiet = send_waiting_for_ack(&wallet, "recipient-2", &quiet_target);
+    for idx in [blocked, refused, quiet] {
+        expire(&wallet, idx);
+    }
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let consignment = services
+        .forwarder
+        .mock("POST", FORWARDER_PATH)
+        .match_header(FORWARD_TARGET_HEADER, target.as_str())
+        .match_body(Matcher::PartialJson(json!({
+            "method": "consignment.get",
+            "params": {"recipient_id": proxy_rid},
+        })))
+        .with_body(
+            json!({"jsonrpc": "2.0", "id": null, "result": {
+                "consignment": "not base64!", "txid": FAKE_TXID, "vout": 1, "validated": null,
+            }})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let nack = services
+        .forwarder
+        .mock("POST", FORWARDER_PATH)
+        .match_header(FORWARD_TARGET_HEADER, target.as_str())
+        .match_body(Matcher::PartialJson(json!({"method": "ack.post"})))
+        .with_status(403)
+        .with_header(FORWARD_REFUSED_HEADER, "not-allowlisted")
+        .with_header(FORWARD_SESSION_HEADER, FORWARDER_PATH)
+        .expect(2)
+        .create();
+    let refusal = services.expect_refusal(&refused_target, "ack.get", "consent-expired");
+    let no_ack = services.expect_rpc(
+        &quiet_target,
+        "ack.get",
+        json!({"recipient_id": "recipient-2"}),
+        Json::Null,
+    );
+
+    // failing every expired transfer: both sends fail, the receive stays, and nothing is rolled
+    // back because of it
+    assert!(wallet.fail_transfers(online, None, false, true).unwrap());
+    assert_eq!(status_of(&wallet, refused), TransferStatus::Failed);
+    assert_eq!(status_of(&wallet, quiet), TransferStatus::Failed);
+    assert_eq!(
+        status_of(&wallet, blocked),
+        TransferStatus::WaitingCounterparty
+    );
+    // failing that one receive still reports why it cannot be failed
+    let result = wallet.fail_transfers(online, Some(blocked), false, true);
+    assert!(
+        matches!(result, Err(Error::ForwarderRefused { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        status_of(&wallet, blocked),
+        TransferStatus::WaitingCounterparty
+    );
+    for mock in [consignment, nack, refusal, no_ack] {
+        mock.assert();
+    }
+    direct.assert();
+}

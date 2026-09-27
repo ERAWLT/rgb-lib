@@ -507,6 +507,17 @@ pub trait WalletOnline: WalletOffline {
                 Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
                     Ok(None)
                 }
+                // ERA fork: a send still waiting for its ACKs has broadcast nothing, so failing it
+                // gives nothing away, and a forwarder that no longer lets its ACK poll through (the
+                // user's consent for the recipient's proxy gone, a target it may not be given)
+                // would otherwise keep it from ever failing. Not a receive: a donation's witness
+                // may already be on chain.
+                Err(Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. })
+                    if !batch_transfer.incoming
+                        && batch_transfer.status == TransferStatus::WaitingCounterparty =>
+                {
+                    Ok(None)
+                }
                 Err(e) => Err(e),
                 Ok(v) => Ok(v),
             }?;
@@ -599,7 +610,22 @@ pub trait WalletOnline: WalletOffline {
                     }
                 }
                 transfers_changed = true;
-                self.try_fail_batch_transfer(txn, batch_transfer, &db_data)?;
+                match self.try_fail_batch_transfer(txn, batch_transfer, &db_data) {
+                    // ERA fork: a transfer the forwarder's policy keeps from refreshing (a receive,
+                    // see try_fail_batch_transfer) is left as it is, and does not keep the others
+                    // from failing: the call would otherwise roll all of them back
+                    Err(
+                        e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
+                    ) => {
+                        warn!(
+                            self.logger(),
+                            "Not failing batch transfer {}: {e}", batch_transfer.idx
+                        );
+                    }
+                    other => {
+                        other?;
+                    }
+                }
             }
         }
 
