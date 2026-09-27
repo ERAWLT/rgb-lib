@@ -502,6 +502,9 @@ mod sign_psbt;
 mod sync;
 #[cfg(feature = "electrum")]
 mod tx_known_to_wallet;
+// ERA fork: CC-99
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+mod unrecorded_spends;
 // ERA fork: upstream's tests call restore_from_vss, deprecated in the fork
 #[cfg(feature = "vss")]
 #[allow(deprecated)]

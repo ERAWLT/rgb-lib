@@ -2126,6 +2126,14 @@ pub trait WalletOnline: WalletOffline {
             .expect("batch transfer should have a TXID");
         let transfer_dir = self.get_transfers_dir().join(txid);
         let signed_psbt = self.get_signed_psbt(&transfer_dir)?;
+        // ERA fork (to report to UTEXO): the file must hold this transfer's TX. Another one (a
+        // misplaced or restored file) would be broadcast, spending coins this transfer never
+        // reserved, and this transfer's fascia would then be consumed as if it were its witness.
+        if signed_psbt.unsigned_tx.compute_txid().to_string() != *txid {
+            return Err(Error::InvalidPsbt {
+                details: s!("the signed PSBT of this transfer is for another TX"),
+            });
+        }
         let mut runtime = self.rgb_runtime()?;
         let fascia_path = transfer_dir.join(FASCIA_FILE);
         let fascia_str = fs::read_to_string(fascia_path)?;
