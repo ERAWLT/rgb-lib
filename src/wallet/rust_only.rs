@@ -104,6 +104,17 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     check_proxy(proxy_url)
 }
 
+/// ERA fork: [`check_proxy_url`] through a loopback forwarder, as a wallet online with
+/// [`OnlineOptions::forwarder_url`] checks a recipient's proxy.
+///
+/// An error is raised if `forwarder_url` is not a valid forwarder URL, and otherwise as for
+/// [`check_proxy_url`]. The proxy is never contacted directly.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub fn check_proxy_url_via_forwarder(proxy_url: &str, forwarder_url: &str) -> Result<(), Error> {
+    let forwarder = Forwarder::new(forwarder_url)?;
+    check_proxy_routed(proxy_url, Some(&forwarder))
+}
+
 /// Validate a consignment using the witness bundled in the consignment (offchain).
 /// This works before the witness transaction is broadcast, unlike [`get_resolver`]-based
 /// validation which requires the TX to be in the indexer.

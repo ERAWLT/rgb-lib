@@ -437,6 +437,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided forwarder URL is invalid (it must be plain http to a loopback IP literal)
+    #[error("Invalid forwarder URL: {details}")]
+    InvalidForwarderUrl {
+        /// Error details
+        details: String,
+    },
+
     /// Invalid witness version
     #[error("Invalid witness version: {witness_version}")]
     InvalidWitnessVersion {

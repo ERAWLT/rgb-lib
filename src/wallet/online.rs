@@ -41,6 +41,18 @@ pub trait WalletOnline: WalletOffline {
         &self.online_data().as_ref().unwrap().resolver
     }
 
+    // ERA fork: the forwarder set by go_online, if any (OnlineOptions::forwarder_url)
+    fn forwarder(&self) -> Option<&Forwarder> {
+        self.online_data()
+            .as_ref()
+            .and_then(|online_data| online_data.forwarder.as_ref())
+    }
+
+    // ERA fork: every RGB proxy client is built here, so the forwarder carries all proxy traffic
+    fn proxy_client(&self, proxy_url: &str) -> Result<ProxyClient, Error> {
+        ProxyClient::new_routed(proxy_url, self.forwarder())
+    }
+
     fn check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
         #[cfg(test)]
         if skip_check_fee_rate() {
@@ -667,12 +679,20 @@ pub trait WalletOnline: WalletOffline {
             hub_client: None,
             user_role: None,
             vanilla_sync_lookback: online_options.vanilla_sync_lookback,
+            // ERA fork: set by go_online_impl
+            forwarder: None,
         };
 
         Ok((online, online_data))
     }
 
     fn go_online_impl(&mut self, online_options: &OnlineOptions) -> Result<Online, Error> {
+        // ERA fork: validated before anything changes, so a refused URL leaves the wallet as it was
+        let forwarder = online_options
+            .forwarder_url
+            .as_deref()
+            .map(Forwarder::new)
+            .transpose()?;
         let indexer_url = &online_options.indexer_url;
         let online = if let Some(online_data) = self.online_data().as_ref() {
             let online = Online { id: online_data.id };
@@ -690,6 +710,12 @@ pub trait WalletOnline: WalletOffline {
             *self.online_data_mut() = Some(online_data);
             online
         };
+        // ERA fork: every branch above leaves online data in place, and the forwarder always
+        // follows the latest call, including one that keeps the indexer
+        self.online_data_mut()
+            .as_mut()
+            .expect("online data was set above")
+            .forwarder = forwarder;
 
         if !online_options.skip_consistency_check {
             let txn = self.database().begin_transaction()?;
@@ -720,7 +746,7 @@ pub trait WalletOnline: WalletOffline {
         );
 
         if let ReceiveMode::Proxy { proxy_url } = mode {
-            let proxy_client = ProxyClient::new(proxy_url)?;
+            let proxy_client = self.proxy_client(proxy_url)?;
             match proxy_client.post_ack(&recipient_id, false) {
                 Ok(r) => {
                     debug!(self.logger(), "Consignment NACK response: {:?}", r);
@@ -766,7 +792,7 @@ pub trait WalletOnline: WalletOffline {
             }
             let file_bytes = match mode {
                 ReceiveMode::Proxy { proxy_url } => {
-                    let proxy_client = ProxyClient::new(proxy_url)?;
+                    let proxy_client = self.proxy_client(proxy_url)?;
                     let media_res = proxy_client.get_media(&digest)?;
                     #[cfg(test)]
                     debug!(self.logger(), "Media GET response: {:?}", media_res);
@@ -827,7 +853,7 @@ pub trait WalletOnline: WalletOffline {
         proxy_url: &str,
         recipient_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
-        let proxy_client = ProxyClient::new(proxy_url)?;
+        let proxy_client = self.proxy_client(proxy_url)?;
         let consignment_res = proxy_client.get_consignment(&recipient_id);
         if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
             debug!(
@@ -929,7 +955,7 @@ pub trait WalletOnline: WalletOffline {
         &self,
         reject_list_url: &str,
     ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
-        let reject_list_client = RejectListClient::new(reject_list_url)?;
+        let reject_list_client = RejectListClient::new_routed(reject_list_url, self.forwarder())?;
         let list = reject_list_client.get_reject_list()?;
         let reject_list = list.trim();
         let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
@@ -1070,7 +1096,7 @@ pub trait WalletOnline: WalletOffline {
         }
 
         if let ReceiveMode::Proxy { proxy_url } = mode {
-            let proxy_client = ProxyClient::new(proxy_url)?;
+            let proxy_client = self.proxy_client(proxy_url)?;
             match proxy_client.post_ack(&recipient_id, true) {
                 Ok(r) => {
                     if let Some(ref err) = r.error {
@@ -1882,7 +1908,7 @@ pub trait WalletOnline: WalletOffline {
                     self.logger(),
                     "Recipient ID: {recipient_id} (proxy routing id: {proxy_rid})"
                 );
-                let proxy_client = ProxyClient::new(&proxy_url)?;
+                let proxy_client = self.proxy_client(&proxy_url)?;
                 let ack_res = proxy_client.get_ack(&proxy_rid)?;
                 debug!(
                     self.logger(),
@@ -3180,7 +3206,7 @@ pub trait WalletOnline: WalletOffline {
                 let vout = mock_vout(recipient.local_recipient_data.vout());
                 #[cfg(not(test))]
                 let vout = recipient.local_recipient_data.vout();
-                let proxy_client = ProxyClient::new(&proxy_url)?;
+                let proxy_client = self.proxy_client(&proxy_url)?;
                 match self.post_consignment_to_proxy(
                     &proxy_client,
                     proxy_rid.clone(),
@@ -3797,7 +3823,9 @@ pub trait WalletOnline: WalletOffline {
                             used: false,
                             usable: false,
                         };
-                        if check_proxy(&transport_endpoint.endpoint).is_ok() {
+                        if check_proxy_routed(&transport_endpoint.endpoint, self.forwarder())
+                            .is_ok()
+                        {
                             local_transport_endpoint.usable = true;
                             found_valid = true;
                         }

@@ -75,6 +75,8 @@ pub struct OnlineData {
     pub(crate) hub_client: Option<MultisigHubClient>,
     pub(crate) user_role: Option<UserRole>,
     pub(crate) vanilla_sync_lookback: u32,
+    // ERA fork: set by go_online from OnlineOptions::forwarder_url
+    pub(crate) forwarder: Option<Forwarder>,
 }
 
 /// Options for the [`Wallet::go_online`] and [`MultisigWallet::go_online`] methods.
@@ -96,6 +98,22 @@ pub struct OnlineOptions {
     /// Number of addresses before the last used (or last revealed if none) address to sync when
     /// doing an automatic FastSync for the vanilla keychain
     pub vanilla_sync_lookback: u32,
+    /// ERA fork: URL of a loopback HTTP forwarder that carries every RGB proxy and reject-list
+    /// request this wallet makes while online (`http://` to `127.0.0.0/8` or `[::1]`, optionally
+    /// with a path).
+    ///
+    /// Each request is sent to this URL instead of the endpoint it is meant for, unchanged
+    /// otherwise, and names that endpoint in the `X-Era-Forward-Target` header (an absolute
+    /// `https://` URL for an `rpcs://` transport endpoint, `http://` for `rpc://`) and the service
+    /// in `X-Era-Forward-Kind` (`rgb-proxy` or `reject-list`). Invoices and the transport
+    /// endpoints stored with transfers keep the real endpoints. A forwarder that is down or
+    /// refuses is an error; there is no fallback to a direct connection, and redirects are not
+    /// followed. Indexer traffic is not affected: point `indexer_url` at the forwarder for that.
+    ///
+    /// `None` (the default, and what a missing field deserializes to) contacts those services
+    /// directly, as upstream rgb-lib does. The contract is described in the fork's `ERA.md`.
+    #[serde(default)]
+    pub forwarder_url: Option<String>,
 }
 
 // ────────────────────────────────────────────────────────────

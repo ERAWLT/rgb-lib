@@ -1,8 +1,13 @@
-use super::*;
+use super::{
+    forwarder::{FORWARD_KIND_RGB_PROXY, Forwarder},
+    *,
+};
 
 pub struct ProxyClient {
     client: RestClient,
     base_url: String,
+    // ERA fork: when set, requests go to this loopback forwarder instead of base_url
+    forwarder: Option<Forwarder>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -83,7 +88,36 @@ impl ProxyClient {
         Ok(Self {
             client,
             base_url: base_url.to_string(),
+            forwarder: None,
         })
+    }
+
+    /// ERA fork: [`Self::new`] without a forwarder, otherwise a client that sends every request
+    /// meant for `base_url` to `forwarder` (see [`Forwarder`]).
+    pub(crate) fn new_routed(base_url: &str, forwarder: Option<&Forwarder>) -> Result<Self, Error> {
+        let Some(forwarder) = forwarder else {
+            return Self::new(base_url);
+        };
+        Ok(Self {
+            client: forwarder.client()?,
+            base_url: base_url.to_string(),
+            forwarder: Some(forwarder.clone()),
+        })
+    }
+
+    // ERA fork: every request starts here, so none can bypass the forwarder
+    fn post(&self) -> Result<reqwest::blocking::RequestBuilder, Error> {
+        match &self.forwarder {
+            None => Ok(self.client.post(&self.base_url)),
+            Some(forwarder) => forwarder
+                .request(
+                    &self.client,
+                    reqwest::Method::POST,
+                    &self.base_url,
+                    FORWARD_KIND_RGB_PROXY,
+                )
+                .map_err(Self::req_err),
+        }
     }
 
     fn req_err(e: impl std::fmt::Display) -> Error {
@@ -99,8 +133,7 @@ impl ProxyClient {
             id: None,
             params: None,
         };
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()
@@ -118,8 +151,7 @@ impl ProxyClient {
                 recipient_id: recipient_id.to_string(),
             }),
         };
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()
@@ -140,8 +172,7 @@ impl ProxyClient {
                 recipient_id: recipient_id.to_string(),
             }),
         };
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()
@@ -159,8 +190,7 @@ impl ProxyClient {
                 attachment_id: attachment_id.to_string(),
             }),
         };
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()
@@ -183,8 +213,7 @@ impl ProxyClient {
                 ack,
             }),
         };
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .header(CONTENT_TYPE, JSON)
             .json(&body)
             .send()
@@ -220,8 +249,7 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params)
             .file("file", consignment_path)?;
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .multipart(form)
             .send()
             .map_err(Self::req_err)?
@@ -244,8 +272,7 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params)
             .file("file", media_path)?;
-        self.client
-            .post(&self.base_url)
+        self.post()?
             .multipart(form)
             .send()
             .map_err(Self::req_err)?

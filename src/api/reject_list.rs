@@ -1,8 +1,13 @@
-use super::*;
+use super::{
+    forwarder::{FORWARD_KIND_REJECT_LIST, Forwarder},
+    *,
+};
 
 pub struct RejectListClient {
     client: RestClient,
     base_url: String,
+    // ERA fork: when set, requests go to this loopback forwarder instead of base_url
+    forwarder: Option<Forwarder>,
 }
 
 impl RejectListClient {
@@ -14,6 +19,20 @@ impl RejectListClient {
         Ok(Self {
             client,
             base_url: base_url.to_string(),
+            forwarder: None,
+        })
+    }
+
+    /// ERA fork: [`Self::new`] without a forwarder, otherwise a client that sends every request
+    /// meant for `base_url` to `forwarder` (see [`Forwarder`]).
+    pub(crate) fn new_routed(base_url: &str, forwarder: Option<&Forwarder>) -> Result<Self, Error> {
+        let Some(forwarder) = forwarder else {
+            return Self::new(base_url);
+        };
+        Ok(Self {
+            client: forwarder.client()?,
+            base_url: base_url.to_string(),
+            forwarder: Some(forwarder.clone()),
         })
     }
 
@@ -24,8 +43,19 @@ impl RejectListClient {
     }
 
     pub(crate) fn get_reject_list(&self) -> Result<String, Error> {
-        self.client
-            .get(&self.base_url)
+        // ERA fork: through the forwarder when one is set
+        let request = match &self.forwarder {
+            None => self.client.get(&self.base_url),
+            Some(forwarder) => forwarder
+                .request(
+                    &self.client,
+                    reqwest::Method::GET,
+                    &self.base_url,
+                    FORWARD_KIND_REJECT_LIST,
+                )
+                .map_err(Self::req_err)?,
+        };
+        request
             .send()
             .map_err(Self::req_err)?
             .text()

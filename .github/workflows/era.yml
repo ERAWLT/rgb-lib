@@ -15,6 +15,10 @@ name: ERA fork checks
 #   - the dependency diet holds: no OpenSSL, aws-lc, Postgres or CLI crates
 #     on the app's mobile targets, every HTTP client goes through the one
 #     prebuilt TLS config, and that config works.
+#   - the proxy forwarder patch: with OnlineOptions::forwarder_url set, every
+#     RGB proxy and reject-list request goes to the loopback forwarder (unit
+#     tests against local mock servers, plus a guard on how wallet code builds
+#     those clients).
 # The https job makes real TLS handshakes against UTEXO's public signet
 # services; it depends on third-party hosts, so it is kept out of check.
 # See ERA.md for what the fork changes and why.
@@ -120,16 +124,47 @@ jobs:
           fi
           echo "ok: every HTTP client comes from api::rest_client_builder"
 
+      # With OnlineOptions::forwarder_url set, every RGB proxy and reject-list
+      # request must reach the loopback forwarder. Wallet code gets those
+      # clients from WalletOnline::proxy_client, RejectListClient::new_routed
+      # and check_proxy_routed, which pick the forwarder up; a plain ::new or
+      # check_proxy compiles fine and goes around it. Allowed: src/api (the
+      # clients themselves), the tests, check_proxy's own definition and
+      # rust_only::check_proxy_url (upstream's public function, which has no
+      # wallet and so no forwarder). Also a grep: a client built under another
+      # name escapes it.
+      - name: Proxy and reject-list clients only through the forwarder
+        run: |
+          pattern='(ProxyClient|RejectListClient)::new\(|check_proxy\('
+          found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/api/' ':!src/wallet/test/' \
+            | grep -vE '^src/utils\.rs:[0-9]+:pub\(crate\) fn check_proxy\(proxy_url: &str\)' \
+            | grep -vE '^src/utils\.rs:[0-9]+: +let result = check_proxy\(&server\.url\(\)\);$' \
+            | grep -vE '^src/wallet/rust_only\.rs:[0-9]+: +check_proxy\(proxy_url\)$' || true)
+          if [ -n "$found" ]; then
+            echo "::error::a proxy or reject-list client that ignores the forwarder; use proxy_client(), new_routed or check_proxy_routed (ERA.md, proxy forwarder)"
+            printf '%s\n' "$found"
+            exit 1
+          fi
+          # upstream's own tests still build ProxyClient::new; if this stops
+          # matching, the pattern has gone stale and the check above proves nothing
+          if ! git grep -qE "$pattern" -- 'src/wallet/test/'; then
+            echo "::error::the pattern no longer matches ProxyClient::new in src/wallet/test; update it"
+            exit 1
+          fi
+          echo "ok: wallet code builds proxy and reject-list clients through the forwarder"
+
       # SKIP_INIT: these tests are offline and must not try to start the
       # regtest services. The wallet ones create SQLite wallets (migrations on
       # the TLS-less tokio runtime) and exercise the manifest checks the
-      # keychain-layout patch extends.
-      - name: Unit tests (keychain layout, REST client TLS, offline wallets)
+      # keychain-layout patch extends. The forwarder ones run against local
+      # mock servers (indexer, RGB proxy, forwarder).
+      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, offline wallets)
         env:
           SKIP_INIT: "1"
         run: >
           cargo test --locked --lib --features esplora,vss --
           tests_keychain_layout tests_rest_client_tls
+          api::forwarder:: wallet::test::forwarder::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
 
       - name: Migration crate with its CLI (the authoring binary still builds)

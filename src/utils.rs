@@ -596,7 +596,16 @@ pub(crate) fn calculate_descriptor_from_xpub(
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn check_proxy(proxy_url: &str) -> Result<(), Error> {
-    let proxy_client = ProxyClient::new(proxy_url)?;
+    check_proxy_routed(proxy_url, None)
+}
+
+/// ERA fork: [`check_proxy`], through `forwarder` when one is given.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn check_proxy_routed(
+    proxy_url: &str,
+    forwarder: Option<&Forwarder>,
+) -> Result<(), Error> {
+    let proxy_client = ProxyClient::new_routed(proxy_url, forwarder)?;
     let mut err_details = s!("unable to connect to proxy");
     if let Ok(server_info) = proxy_client.get_info() {
         if let Some(info) = server_info.result {

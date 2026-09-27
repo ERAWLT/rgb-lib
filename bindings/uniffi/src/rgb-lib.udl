@@ -65,6 +65,7 @@ interface RgbLibError {
   InvalidAttachments(string details);
   InvalidBitcoinKeys();
   InvalidKeychainLayout(string details);
+  InvalidForwarderUrl(string details);
   InvalidBitcoinNetwork(string network);
   InvalidColoringInfo(string details);
   InvalidConsignment();
@@ -467,6 +468,7 @@ dictionary OnlineOptions {
   string indexer_url;
   boolean skip_consistency_check;
   u32 vanilla_sync_lookback;
+  string? forwarder_url = null;
 };
 
 [Remote]
