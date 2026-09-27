@@ -223,6 +223,7 @@ fn go_online(wallet: &mut MpcWallet) -> Online {
             skip_consistency_check: true,
             vanilla_sync_lookback: 20,
             forwarder_url: None,
+            complete_unrecorded_spends: false,
         })
         .expect("failed to go online");
     println!("[OK] Online (id: {})", online.id);

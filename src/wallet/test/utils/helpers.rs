@@ -335,6 +335,7 @@ pub(crate) fn test_go_online_options(indexer_url: Option<&str>) -> OnlineOptions
         skip_consistency_check: true,
         vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK as u32,
         forwarder_url: None,
+        complete_unrecorded_spends: false,
     }
 }
 

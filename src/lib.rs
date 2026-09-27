@@ -123,7 +123,7 @@ pub use crate::{
     database::enums::{
         AssetSchema, Assignment, TransferStatus, TransportType, WalletTransactionType,
     },
-    error::Error,
+    error::{Error, InconsistencyReason, UnrecordedSpendReason},
     keys::{generate_keys, restore_keys},
     utils::{BitcoinNetwork, block_on},
     wallet::{
@@ -298,8 +298,8 @@ use crate::wallet::test::{
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[cfg(test)]
 use crate::wallet::test::{
-    mock_input_unspents, mock_local_version, mock_send_end_crash, mock_vout, skip_build_dag,
-    skip_check_fee_rate,
+    mock_fail_before_completion_commit, mock_input_unspents, mock_local_version,
+    mock_send_end_crash, mock_vout, skip_build_dag, skip_check_fee_rate,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::{

@@ -204,6 +204,16 @@ impl WalletOnline for Wallet {
         }
         Ok(())
     }
+
+    // ERA fork (CC-99)
+    fn complete_unrecorded_spends(
+        &mut self,
+        txn: &DbTxn,
+        runtime: &mut RgbRuntime,
+        details: String,
+    ) -> Result<Vec<CompletedSpend>, Error> {
+        unrecorded_spends::complete(self, txn, runtime, details)
+    }
 }
 
 /// Common offline APIs of the wallet.
@@ -844,6 +854,19 @@ impl Wallet {
         info!(self.logger(), "Going offline...");
         self.go_offline_impl();
         info!(self.logger(), "Go offline completed");
+    }
+
+    /// ERA fork (CC-99): the spends of this wallet that the consistency check of the last
+    /// [`go_online`](Wallet::go_online) completed (`OnlineOptions::complete_unrecorded_spends`).
+    ///
+    /// Empty when nothing was completed, when that call skipped the check, when it failed, and
+    /// while the wallet is offline. Each call to `go_online` replaces it, so a host that wants
+    /// to act on a completion reads it right after the call that made it.
+    pub fn completed_spends(&self) -> Vec<CompletedSpend> {
+        self.online_data()
+            .as_ref()
+            .map(|online_data| online_data.completed_spends.clone())
+            .unwrap_or_default()
     }
 
     /// Send bitcoin funds to the provided address.

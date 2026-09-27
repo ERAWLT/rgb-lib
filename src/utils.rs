@@ -863,9 +863,48 @@ impl RgbRuntime {
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn persist(&mut self) -> Result<(), Error> {
         self.persist_on_drop = false;
+        // ERA fork (CC-99, tests): a stash that cannot be written
+        #[cfg(test)]
+        if crate::wallet::test::mock_stash_persist_fail() {
+            return Err(Error::IO {
+                details: s!("simulated stash write failure"),
+            });
+        }
         self.stock.store().map_err(|error| Error::IO {
             details: error.to_string(),
         })
+    }
+
+    /// ERA fork (CC-99): `fascia` without the bundles the stash already holds, `None` when it holds
+    /// them all.
+    ///
+    /// Completing a spend consumes a fascia the stash may hold already: the operation whose record
+    /// was lost consumed it before dying (S2), or an earlier completion did and then failed to
+    /// commit. A second consume is a merge on rgb-ops 0.11.1-rc.11, but that is a property of the
+    /// stash implementation, so it is not relied on. A bundle in the stash implies its index and
+    /// state: `consume_fascia` commits the three together and the stash last.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
+        let seal_witness = fascia.seal_witness().clone();
+        let stash = self.stock.as_stash_provider();
+        let unknown: BTreeMap<ContractId, rgbstd::TransitionBundle> = fascia
+            .into_bundles()
+            .into_iter()
+            .filter(|(_, bundle)| stash.bundle(bundle.bundle_id()).is_err())
+            .collect();
+        Confined::try_from(unknown)
+            .ok()
+            .map(|bundles| Fascia::new(seal_witness, bundles))
+    }
+
+    /// ERA fork (CC-99, tests): the public witness the stash holds for `witness_id`.
+    #[cfg(all(test, any(feature = "electrum", feature = "esplora")))]
+    pub(crate) fn stash_pub_witness(&self, witness_id: RgbTxid) -> Option<PubWitness> {
+        self.stock
+            .as_stash_provider()
+            .witness(witness_id)
+            .ok()
+            .map(|w| w.public.clone())
     }
 
     pub(crate) fn export_contract(

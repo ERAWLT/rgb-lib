@@ -139,6 +139,8 @@ interface RgbLibError {
   TooManySignaturesInPsbt();
   UnknownRgbSchema(string schema_id);
   UnknownTransfer(string txid);
+  UnrecordedSpend(string txid, string reason, i32? batch_transfer_idx);
+  UnrecordedSpendUnseen(string txid, i32? batch_transfer_idx);
   UnsupportedBackupVersion(string version);
   UnsupportedBurn(AssetSchema asset_schema);
   UnsupportedInflation(AssetSchema asset_schema);
@@ -472,6 +474,7 @@ dictionary OnlineOptions {
   boolean skip_consistency_check;
   u32 vanilla_sync_lookback;
   string? forwarder_url = null;
+  boolean complete_unrecorded_spends = false;
 };
 
 [Remote]

@@ -679,6 +679,35 @@ pub enum Error {
         txid: String,
     },
 
+    /// ERA fork (CC-99): a colored spend this wallet recorded, which the indexer knows, cannot be
+    /// completed by `go_online` (`OnlineOptions::complete_unrecorded_spends`).
+    ///
+    /// Nothing was written. The same wallet state gives the same answer, so retrying does not
+    /// help; `reason` ([`UnrecordedSpendReason`]) says what is in the way.
+    #[error("Cannot complete a spend recorded by this wallet (TX {txid}): {reason}")]
+    UnrecordedSpend {
+        /// ID of the spending transaction
+        txid: String,
+        /// Why it cannot be completed, one of the codes of [`UnrecordedSpendReason`]
+        reason: String,
+        /// The batch transfer that recorded the spend (`None` for a drain, or when several records
+        /// name the transaction)
+        batch_transfer_idx: Option<i32>,
+    },
+
+    /// ERA fork (CC-99): the wallet's view of the chain has its coins spent by a transaction this
+    /// wallet recorded, but the indexer answers that it does not know that transaction.
+    ///
+    /// Nothing was written. The indexer may be lagging, or the transaction may have left every
+    /// mempool after the wallet applied it locally; a later `go_online` can succeed.
+    #[error("The indexer does not know a spend recorded by this wallet (TX {txid})")]
+    UnrecordedSpendUnseen {
+        /// ID of the spending transaction
+        txid: String,
+        /// The batch transfer that recorded the spend (`None` for a drain)
+        batch_transfer_idx: Option<i32>,
+    },
+
     /// The backup version is not supported
     #[error("Backup version not supported")]
     UnsupportedBackupVersion {
@@ -783,6 +812,133 @@ pub enum Error {
     /// The provided password is incorrect
     #[error("The provided password is incorrect")]
     WrongPassword,
+}
+
+// ERA fork (CC-99): what `details` of an Inconsistency ends with when the consistency check
+// refused to complete an unrecorded spend
+const INCONSISTENCY_REASON_PREFIX: &str = "; reason=";
+
+impl Error {
+    /// ERA fork (CC-99): why the consistency check of `go_online` with
+    /// `OnlineOptions::complete_unrecorded_spends` refused, as [`Error::Inconsistency`] or
+    /// [`Error::RestoredBackupInconsistent`], to complete this wallet's spends.
+    ///
+    /// `None` for every other error, and for an inconsistency found without that option or by a
+    /// check other than the one of spent coins.
+    pub fn inconsistency_reason(&self) -> Option<InconsistencyReason> {
+        match self {
+            Error::Inconsistency { details } | Error::RestoredBackupInconsistent { details } => {
+                let (_, code) = details.rsplit_once(INCONSISTENCY_REASON_PREFIX)?;
+                InconsistencyReason::from_code(code)
+            }
+            _ => None,
+        }
+    }
+
+    // ERA fork (CC-99): the inconsistency the completion refuses with, the upstream details
+    // followed by the spending TXs and the reason
+    pub(crate) fn unrecorded_inconsistency(
+        details: String,
+        spenders: &[String],
+        reason: InconsistencyReason,
+    ) -> Self {
+        Error::Inconsistency {
+            details: format!(
+                "{details}; spenders: {spenders:?}{INCONSISTENCY_REASON_PREFIX}{}",
+                reason.code()
+            ),
+        }
+    }
+}
+
+/// ERA fork (CC-99): why coins of this wallet that its view of the chain has spent could not be
+/// attributed to a spend this wallet can complete (see [`Error::inconsistency_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InconsistencyReason {
+    /// A coin is spent by a transaction this wallet has no record of: another install of the
+    /// wallet spent it, or this copy is older than the operation that did
+    SpenderNotRecorded,
+    /// A coin has no spender in the wallet's view of the chain: the transaction that created it
+    /// was replaced or reorganized away
+    NoCanonicalSpender,
+    /// A colored output of a spend this wallet recorded was spent by a transaction it has no
+    /// record of
+    LaterSpendUnrecorded,
+}
+
+impl InconsistencyReason {
+    /// The stable code of the reason.
+    pub fn code(&self) -> &'static str {
+        match self {
+            InconsistencyReason::SpenderNotRecorded => "spender-not-recorded",
+            InconsistencyReason::NoCanonicalSpender => "no-canonical-spender",
+            InconsistencyReason::LaterSpendUnrecorded => "later-spend-unrecorded",
+        }
+    }
+
+    /// The reason with this code, if any.
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            InconsistencyReason::SpenderNotRecorded,
+            InconsistencyReason::NoCanonicalSpender,
+            InconsistencyReason::LaterSpendUnrecorded,
+        ]
+        .into_iter()
+        .find(|r| r.code() == code)
+    }
+}
+
+/// ERA fork (CC-99): why a spend this wallet recorded, which the indexer knows, cannot be
+/// completed (the `reason` of [`Error::UnrecordedSpend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnrecordedSpendReason {
+    /// The transfer that recorded it is `Failed`
+    TransferFailed,
+    /// The transfer that recorded it is in a status that is committed together with its spent
+    /// inputs (`WaitingConfirmations`, `Settled`), or the drain that recorded it is no longer
+    /// pending
+    UnexpectedStatus,
+    /// More than one record names the transaction
+    RecordAmbiguous,
+    /// The record is of an operation the completion does not handle (an inflation, a burn, a link,
+    /// or a vanilla transaction other than a drain)
+    RecordKindUnsupported,
+    /// The transfer's saved data (`transfers/<txid>/`) is missing or cannot be read
+    TransferDataMissing,
+    /// The transfer's saved data or reservations do not match the transaction
+    RecordMismatch,
+    /// The RGB stash refused the transfer's state transitions
+    StashRefused,
+}
+
+impl UnrecordedSpendReason {
+    /// The stable code of the reason.
+    pub fn code(&self) -> &'static str {
+        match self {
+            UnrecordedSpendReason::TransferFailed => "transfer-failed",
+            UnrecordedSpendReason::UnexpectedStatus => "unexpected-status",
+            UnrecordedSpendReason::RecordAmbiguous => "record-ambiguous",
+            UnrecordedSpendReason::RecordKindUnsupported => "record-kind-unsupported",
+            UnrecordedSpendReason::TransferDataMissing => "transfer-data-missing",
+            UnrecordedSpendReason::RecordMismatch => "record-mismatch",
+            UnrecordedSpendReason::StashRefused => "stash-refused",
+        }
+    }
+
+    /// The reason with this code, if any.
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            UnrecordedSpendReason::TransferFailed,
+            UnrecordedSpendReason::UnexpectedStatus,
+            UnrecordedSpendReason::RecordAmbiguous,
+            UnrecordedSpendReason::RecordKindUnsupported,
+            UnrecordedSpendReason::TransferDataMissing,
+            UnrecordedSpendReason::RecordMismatch,
+            UnrecordedSpendReason::StashRefused,
+        ]
+        .into_iter()
+        .find(|r| r.code() == code)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -169,6 +169,9 @@ thread_local! {
     pub(crate) static MOCK_VOUT: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_LOCAL_VERSION: RefCell<Option<String>> = const { RefCell::new(None) };
     pub(crate) static MOCK_SEND_END_CRASH: RefCell<Option<()>> = const { RefCell::new(None) };
+    // ERA fork (CC-99)
+    pub(crate) static MOCK_FAIL_BEFORE_COMPLETION_COMMIT: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_STASH_PERSIST_FAIL: RefCell<Option<()>> = const { RefCell::new(None) };
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -401,6 +404,28 @@ pub fn mock_send_end_crash() -> bool {
         false
     } else {
         println!("simulating send_end crash (mock)");
+        true
+    }
+}
+
+// ERA fork (CC-99): go_online fails after completing a spend, before its commit
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub fn mock_fail_before_completion_commit() -> bool {
+    if MOCK_FAIL_BEFORE_COMPLETION_COMMIT.take().is_none() {
+        false
+    } else {
+        println!("simulating a failure before the completion commit (mock)");
+        true
+    }
+}
+
+// ERA fork (CC-99): RgbRuntime::persist fails
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub fn mock_stash_persist_fail() -> bool {
+    if MOCK_STASH_PERSIST_FAIL.take().is_none() {
+        false
+    } else {
+        println!("simulating a stash write failure (mock)");
         true
     }
 }

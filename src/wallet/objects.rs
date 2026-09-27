@@ -77,6 +77,8 @@ pub struct OnlineData {
     pub(crate) vanilla_sync_lookback: u32,
     // ERA fork: set by go_online from OnlineOptions::forwarder_url
     pub(crate) forwarder: Option<Forwarder>,
+    // ERA fork (CC-99): what the last go_online completed (OnlineOptions::complete_unrecorded_spends)
+    pub(crate) completed_spends: Vec<CompletedSpend>,
 }
 
 /// Options for the [`Wallet::go_online`] and [`MultisigWallet::go_online`] methods.
@@ -124,6 +126,29 @@ pub struct OnlineOptions {
     /// `ERA.md`.
     #[serde(default)]
     pub forwarder_url: Option<String>,
+    /// ERA fork (CC-99): whether the consistency check completes this wallet's own colored spends
+    /// whose record was lost, instead of refusing to go online.
+    ///
+    /// Such a spend is a transaction this wallet built and recorded at its `*_begin` (a send, or a
+    /// drain begun with `dry_run = false`) that reached the network while the operation that
+    /// broadcast it did not commit: its answer was lost, the process died, or the wallet was
+    /// restored from a backup taken in between. Its inputs are then spent on chain and unspent in
+    /// the wallet's database, which upstream reports as [`Error::Inconsistency`] on every
+    /// `go_online`. With this set, the check writes what that operation would have committed
+    /// (the inputs spent, the change known, the RGB transition in the stash, the transfer
+    /// `WaitingConfirmations`, the drain's reservations released), provided every coin in
+    /// question is spent by such a transaction and the indexer knows it; it broadcasts nothing
+    /// and contacts no RGB proxy. What it completed is read with
+    /// [`Wallet::completed_spends`](crate::wallet::Wallet::completed_spends). Anything it cannot
+    /// prove is refused as before, with nothing written: [`Error::Inconsistency`] (whose
+    /// [`Error::inconsistency_reason`] says why), [`Error::UnrecordedSpendUnseen`],
+    /// [`Error::UnrecordedSpend`] or the indexer's error.
+    ///
+    /// `false` (the default, and what a missing field deserializes to) keeps upstream's check.
+    /// Ignored with `skip_consistency_check`, and on multisig and MPC wallets. The contract is
+    /// described in the fork's `ERA.md`.
+    #[serde(default)]
+    pub complete_unrecorded_spends: bool,
 }
 
 // ────────────────────────────────────────────────────────────

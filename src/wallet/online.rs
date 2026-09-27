@@ -10,7 +10,7 @@ use schemata::GS_LINKED_TO_CONTRACT;
 const SCHEMAS_SUPPORTING_BURN: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
-const SIGNED_PSBT_FILE: &str = "signed.psbt";
+pub(crate) const SIGNED_PSBT_FILE: &str = "signed.psbt";
 
 const MIN_FEE_RATE: u64 = 1;
 
@@ -699,10 +699,29 @@ pub trait WalletOnline: WalletOffline {
 
     fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error>;
 
-    fn check_consistency(&mut self, txn: &DbTxn, runtime: &RgbRuntime) -> Result<(), Error> {
+    // ERA fork (CC-99): the upstream verdict on an inconsistency of spent coins, unless the wallet
+    // type can complete its own unrecorded spends (the singlesig Wallet, see unrecorded_spends)
+    fn complete_unrecorded_spends(
+        &mut self,
+        _txn: &DbTxn,
+        _runtime: &mut RgbRuntime,
+        details: String,
+    ) -> Result<Vec<CompletedSpend>, Error> {
+        Err(Error::Inconsistency { details })
+    }
+
+    // ERA fork (CC-99): `complete` (OnlineOptions::complete_unrecorded_spends) lets the check
+    // complete own unrecorded spends, which it returns; without it the check is upstream's and
+    // returns nothing
+    fn check_consistency(
+        &mut self,
+        txn: &DbTxn,
+        runtime: &mut RgbRuntime,
+        complete: bool,
+    ) -> Result<Vec<CompletedSpend>, Error> {
         info!(self.logger(), "Doing a consistency check...");
 
-        let result = self.check_consistency_inner(txn, runtime);
+        let result = self.check_consistency_inner(txn, runtime, complete);
         #[cfg(feature = "vss")]
         {
             let marker = self
@@ -715,17 +734,31 @@ pub trait WalletOnline: WalletOffline {
                         details: details.clone(),
                     });
                 }
-                Ok(()) => {
+                // ERA fork (CC-99): a completion becomes durable only with go_online's commit,
+                // which removes the marker after it
+                Ok(completed) if completed.is_empty() => {
                     let _ = std::fs::remove_file(marker);
                 }
-                Err(_) => {}
+                _ => {}
             }
         }
         result
     }
 
-    fn check_consistency_inner(&mut self, txn: &DbTxn, runtime: &RgbRuntime) -> Result<(), Error> {
-        self.wallet_specific_consistency_checks(txn)?;
+    fn check_consistency_inner(
+        &mut self,
+        txn: &DbTxn,
+        runtime: &mut RgbRuntime,
+        complete: bool,
+    ) -> Result<Vec<CompletedSpend>, Error> {
+        let completed = match self.wallet_specific_consistency_checks(txn) {
+            Ok(()) => vec![],
+            // ERA fork (CC-99)
+            Err(Error::Inconsistency { details }) if complete => {
+                self.complete_unrecorded_spends(txn, runtime, details)?
+            }
+            Err(e) => return Err(e),
+        };
 
         let asset_ids: Vec<String> = runtime
             .contracts()?
@@ -750,7 +783,7 @@ pub trait WalletOnline: WalletOffline {
         }
 
         info!(self.logger(), "Consistency check completed");
-        Ok(())
+        Ok(completed)
     }
 
     fn get_fee_estimation_impl(&self, blocks: u16) -> Result<f64, Error> {
@@ -781,6 +814,7 @@ pub trait WalletOnline: WalletOffline {
             vanilla_sync_lookback: online_options.vanilla_sync_lookback,
             // ERA fork: set by go_online_impl
             forwarder: None,
+            completed_spends: vec![],
         };
 
         Ok((online, online_data))
@@ -843,19 +877,58 @@ pub trait WalletOnline: WalletOffline {
         };
         // ERA fork: every branch above that did not return leaves online data in place, and the
         // forwarder follows the latest call, including one that keeps the indexer
-        self.online_data_mut()
+        let online_data = self
+            .online_data_mut()
             .as_mut()
-            .expect("online data was set above")
-            .forwarder = forwarder;
+            .expect("online data was set above");
+        online_data.forwarder = forwarder;
+        // ERA fork (CC-99): what this call completes, if anything
+        online_data.completed_spends = vec![];
 
         if !online_options.skip_consistency_check {
             let txn = self.database().begin_transaction()?;
-            let runtime = self.rgb_runtime()?;
-            self.check_consistency(&txn, &runtime)?;
+            let mut runtime = self.rgb_runtime()?;
+            let completed = self.check_consistency(
+                &txn,
+                &mut runtime,
+                online_options.complete_unrecorded_spends,
+            )?;
+            // ERA fork (CC-99): a completion is a wallet operation, recorded as every *_end records
+            // one; with nothing completed this is upstream's check
+            if !completed.is_empty() {
+                self.update_backup_info(&txn, false)?;
+                #[cfg(test)]
+                if mock_fail_before_completion_commit() {
+                    return Err(Error::Internal {
+                        details: s!("simulated failure before the completion commit"),
+                    });
+                }
+            }
             txn.commit()?;
+            if !completed.is_empty() {
+                drop(runtime);
+                self.completion_committed(completed);
+            }
         }
 
         Ok(online)
+    }
+
+    // ERA fork (CC-99): after the commit that made a completion durable
+    fn completion_committed(&mut self, completed: Vec<CompletedSpend>) {
+        #[cfg(feature = "vss")]
+        {
+            // the copy restored from a VSS backup is consistent now
+            let marker = self
+                .wallet_dir()
+                .join(crate::wallet::vss::VSS_RESTORE_MARKER);
+            let _ = std::fs::remove_file(marker);
+        }
+        self.trigger_auto_backup();
+        self.online_data_mut()
+            .as_mut()
+            .expect("online data was set by go_online")
+            .completed_spends = completed;
     }
 
     fn get_signed_psbt(&self, transfer_dir: &Path) -> Result<Psbt, Error> {
