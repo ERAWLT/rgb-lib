@@ -619,6 +619,22 @@ pub trait WalletCore {
         &mut self.internals_mut().online_data
     }
 
+    // ERA fork: the forwarder set by go_online, if any (OnlineOptions::forwarder_url)
+    #[cfg(feature = "_online")]
+    fn forwarder(&self) -> Option<&Forwarder> {
+        self.online_data()
+            .as_ref()
+            .and_then(|online_data| online_data.forwarder.as_ref())
+    }
+
+    // ERA fork: every RGB proxy client is built here, so the forwarder carries all proxy traffic
+    // (in WalletCore, not WalletOnline: since the proxy protocol v1.0 an offline receive reserves its
+    // invoice on the proxy too)
+    #[cfg(feature = "_online")]
+    fn proxy_client(&self, proxy_url: &str) -> Result<ProxyClient, Error> {
+        ProxyClient::new_routed(proxy_url, self.forwarder())
+    }
+
     #[cfg(feature = "_online")]
     fn indexer(&self) -> &Indexer {
         &self.online_data().as_ref().unwrap().indexer

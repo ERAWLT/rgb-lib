@@ -662,6 +662,9 @@ pub fn validate_consignment(
         Some(&RemoteRejectListResolver {
             evm_rpc_urls,
             evm_chains_checked: false,
+            // no wallet, so no forwarder
+            #[cfg(feature = "_online")]
+            forwarder: None,
         }),
         safe_height,
         options,
@@ -831,6 +834,10 @@ pub(crate) struct RemoteRejectListResolver<'a> {
     /// wallet checks that when going online), so they're not asked which chain they are on
     /// before reading a list
     pub(crate) evm_chains_checked: bool,
+    /// ERA fork: the loopback forwarder carrying the requests for lists served at a URL (a
+    /// wallet's, see `OnlineOptions::forwarder_url`); `None` requests them directly
+    #[cfg(feature = "_online")]
+    pub(crate) forwarder: Option<&'a Forwarder>,
 }
 
 #[cfg(feature = "_validation")]
@@ -843,7 +850,12 @@ impl RemoteRejectListResolver<'_> {
     ) -> Result<(RejectList, usize), Error> {
         Ok(match source {
             RejectListSource::Url(url) => {
-                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?)
+                // ERA fork: through the wallet's forwarder when it has one
+                #[cfg(feature = "_online")]
+                let reject_list_client = RejectListClient::new_routed(url, self.forwarder)?;
+                #[cfg(not(feature = "_online"))]
+                let reject_list_client = RejectListClient::new(url)?;
+                RejectList::parse(&reject_list_client.get_reject_list()?)
             }
             RejectListSource::Evm(contract) => {
                 let evm_client = if self.evm_chains_checked {

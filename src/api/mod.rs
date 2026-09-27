@@ -1,5 +1,7 @@
 pub(crate) mod evm;
 #[cfg(feature = "_online")]
+pub(crate) mod forwarder;
+#[cfg(feature = "_online")]
 pub(crate) mod multisig_hub;
 #[cfg(feature = "_online")]
 pub(crate) mod proxy;

@@ -1472,10 +1472,10 @@ pub trait WalletOffline: WalletBackup {
             let mut draining = false;
             for endpoint in &endpoints {
                 // skip endpoints that are unreachable or run an unsupported protocol version
-                let Ok(info) = check_proxy(endpoint) else {
+                let Ok(info) = check_proxy_routed(endpoint, self.forwarder()) else {
                     continue;
                 };
-                let proxy_client = ProxyClient::new(endpoint)?;
+                let proxy_client = self.proxy_client(endpoint)?;
                 // only needed by proxies with proxy-level authentication enabled
                 let signature = self.online_data().as_ref().and_then(|online_data| {
                     online_data.proxy_auth_signature(

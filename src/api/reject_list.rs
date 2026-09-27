@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    forwarder::{FORWARD_KIND_REJECT_LIST, Forwarder},
+    *,
+};
 
 /// Maximum size, in bytes, of a reject list line: the allow prefix (`!`), the opout
 /// (`{opid}/{ty}/{no}`, a hex opid and two decimal `u16`s) and a CRLF line ending
@@ -9,6 +12,8 @@ const MAX_REJECT_LIST_SIZE: u64 = MAX_REJECT_LIST_ENTRIES * MAX_REJECT_LIST_LINE
 pub struct RejectListClient {
     client: RestClient,
     base_url: String,
+    // ERA fork: when set, requests go to this loopback forwarder instead of base_url
+    forwarder: Option<Forwarder>,
 }
 
 impl RejectListClient {
@@ -33,6 +38,20 @@ impl RejectListClient {
         Ok(Self {
             client,
             base_url: base_url.to_string(),
+            forwarder: None,
+        })
+    }
+
+    /// ERA fork: [`Self::new`] without a forwarder, otherwise a client that sends every request
+    /// meant for `base_url` to `forwarder` (see [`Forwarder`]).
+    pub(crate) fn new_routed(base_url: &str, forwarder: Option<&Forwarder>) -> Result<Self, Error> {
+        let Some(forwarder) = forwarder else {
+            return Self::new(base_url);
+        };
+        Ok(Self {
+            client: forwarder.client()?,
+            base_url: base_url.to_string(),
+            forwarder: Some(forwarder.clone()),
         })
     }
 
@@ -43,11 +62,19 @@ impl RejectListClient {
     }
 
     pub(crate) fn get_reject_list(&self) -> Result<String, Error> {
-        let resp = self
-            .client
-            .get(&self.base_url)
-            .send()
-            .map_err(Self::req_err)?;
+        // ERA fork: through the forwarder when one is set
+        let request = match &self.forwarder {
+            None => self.client.get(&self.base_url),
+            Some(forwarder) => forwarder
+                .request(
+                    &self.client,
+                    reqwest::Method::GET,
+                    &self.base_url,
+                    FORWARD_KIND_REJECT_LIST,
+                )
+                .map_err(Self::req_err)?,
+        };
+        let resp = request.send().map_err(Self::req_err)?;
         // an error page (or a redirect, not followed) is not a reject list: taking it as one would
         // make every opout look allowed
         let status = resp.status();

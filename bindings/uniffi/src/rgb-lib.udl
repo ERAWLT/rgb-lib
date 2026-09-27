@@ -71,6 +71,7 @@ interface RgbLibError {
   InvalidBeforeBlock(string details);
   InvalidBitcoinKeys();
   InvalidKeychainLayout(string details);
+  InvalidForwarderUrl(string details);
   InvalidBitcoinNetwork(string network);
   InvalidBurnReason(string details);
   InvalidColoringInfo(string details);
@@ -549,6 +550,7 @@ dictionary OnlineOptions {
   u32 failed_witness_receive_grace_secs;
   record<string, string> proxy_auth_keys;
   record<u64, EvmChain> evm_chains;
+  string? forwarder_url = null;
 };
 
 [Remote]
