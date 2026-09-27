@@ -59,8 +59,9 @@ impl RejectListClient {
     ///
     /// The caller reads the body as the list and skips every line that is not an opout, so any
     /// answer that is not the list itself (a forwarder refusing the host, an upstream that is
-    /// down, an error page) would validate the asset against an empty list. Only a 200 answer
-    /// that is empty or holds at least one opout is read as the list. The forwarder's refusal is
+    /// down, an error page, a list cut short) would validate the asset against an empty or partial
+    /// list. Only a 200 answer whose body has a checked end (a length or chunked framing) and is
+    /// empty or holds at least one opout is read as the list. The forwarder's refusal is
     /// [`Error::ForwarderRefused`], anything else is [`Error::RejectListService`].
     fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
         // an error names the list, not the forwarder (see Forwarder::scrub)
@@ -85,6 +86,13 @@ impl RejectListClient {
                 details: format!("HTTP {status} from the forwarder"),
             });
         }
+        // and only a whole one: a body that the connection's close ends cannot be told from one
+        // cut short (after its first line, say)
+        if !has_checked_end(&response) {
+            return Err(Error::RejectListService {
+                details: s!("the forwarded answer has neither a length nor chunked framing"),
+            });
+        }
         let list = response.text().map_err(scrubbed)?;
         // and text that holds no opout at all is not a list either (an error page passed on with
         // a 200); an empty answer is an empty list
@@ -100,6 +108,33 @@ impl RejectListClient {
         }
         Ok(list)
     }
+}
+
+/// ERA fork: whether the body of `response` has an end the client checks, so that reading it
+/// fails if the body is cut short: a `Content-Length` (hyper fails on a shorter body), chunked as
+/// the last transfer coding (it fails without the last chunk), or HTTP/2 framing. An HTTP/1 body
+/// without either ends where the connection closes, wherever that is.
+fn has_checked_end(response: &reqwest::blocking::Response) -> bool {
+    if response.version() >= reqwest::Version::HTTP_2 {
+        return true;
+    }
+    let headers = response.headers();
+    if headers.contains_key(reqwest::header::CONTENT_LENGTH) {
+        return true;
+    }
+    // the codings of every Transfer-Encoding line, in order: chunked must be the last one
+    let codings: Vec<String> = headers
+        .get_all(reqwest::header::TRANSFER_ENCODING)
+        .iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .map(|coding| coding.trim().to_ascii_lowercase())
+                .filter(|coding| !coding.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    codings.last().is_some_and(|coding| coding == "chunked")
 }
 
 #[cfg(test)]

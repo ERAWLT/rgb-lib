@@ -909,6 +909,105 @@ pub(crate) mod tests {
         direct.assert();
     }
 
+    /// A forwarder on a local socket that answers one request with `answer` as raw bytes, then
+    /// closes the connection.
+    fn raw_forwarder(answer: String) -> Forwarder {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // the request: a GET, headers only
+                let mut request = vec![];
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        });
+        Forwarder::new(&format!("http://{addr}{FWD_PATH}")).unwrap()
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn a_forwarded_reject_list_is_read_only_whole() {
+        let target = "https://issuer.example/lists/usdt.txt";
+        let line = format!(
+            "{}\n",
+            Opout::new(rgbstd::OpId::from([1u8; 32]), OS_ASSET, 0)
+        );
+        let two = format!("{line}!{line}");
+        let chunk = |text: &str| format!("{:x}\r\n{text}\r\n", text.len());
+        let ok = "HTTP/1.1 200 OK\r\n";
+        for (name, answer, list) in [
+            (
+                "a length",
+                format!("{ok}Content-Length: {}\r\n\r\n{two}", two.len()),
+                Some(two.clone()),
+            ),
+            (
+                "chunked",
+                format!(
+                    "{ok}Transfer-Encoding: chunked\r\n\r\n{}{}0\r\n\r\n",
+                    chunk(&line),
+                    chunk(&format!("!{line}"))
+                ),
+                Some(two.clone()),
+            ),
+            (
+                "empty, a length of 0",
+                format!("{ok}Content-Length: 0\r\n\r\n"),
+                Some(s!("")),
+            ),
+            (
+                "empty, chunked",
+                format!("{ok}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+                Some(s!("")),
+            ),
+            // cut short, where the client can tell
+            (
+                "a length longer than the body",
+                format!("{ok}Content-Length: {}\r\n\r\n{line}", two.len()),
+                None,
+            ),
+            (
+                "chunked without the last chunk",
+                format!("{ok}Transfer-Encoding: chunked\r\n\r\n{}", chunk(&line)),
+                None,
+            ),
+            // ended by the close: whole or cut short after its first line, no telling
+            (
+                "ended by the close",
+                format!("{ok}Connection: close\r\n\r\n{line}"),
+                None,
+            ),
+            (
+                "empty, ended by the close",
+                format!("{ok}Connection: close\r\n\r\n"),
+                None,
+            ),
+            (
+                "chunked, then another coding",
+                format!(
+                    "{ok}Transfer-Encoding: chunked, identity\r\nConnection: close\r\n\r\n{line}"
+                ),
+                None,
+            ),
+        ] {
+            let forwarder = raw_forwarder(answer);
+            let client = RejectListClient::new_routed(target, Some(&forwarder)).unwrap();
+            match (client.get_reject_list(), list) {
+                (Ok(got), Some(list)) => assert_eq!(got, list, "{name}"),
+                (Err(Error::RejectListService { .. }), None) => {}
+                (result, _) => panic!("{name}: {result:?}"),
+            }
+        }
+    }
+
     #[test]
     #[serial(forwarder)]
     fn a_refusal_without_the_echo_is_logged_without_the_path() {
