@@ -72,11 +72,12 @@ Rules for the branch:
 | `3988f38` | Stop claiming an interrupted chunked upload keeps the previous backup | To propose to UTEXO |
 | `c88f20a` | Leave the forwarder's path out of its Debug form | Fork-only |
 | `a140543` | Guard every mention of the proxy and reject-list client types | Fork-only |
+| `b761c25` | Sync a restored wallet before renaming it into place, and its parent | To propose to UTEXO |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
 `e7bdaa4` ([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the series is carried;
-`45c3b39`, `777fe57`, `dcc9654` to `d6357cf` and `4ea8ccd` to `3988f38` are
+`45c3b39`, `777fe57`, `dcc9654` to `d6357cf`, `4ea8ccd` to `3988f38` and `b761c25` are
 [§5](#5-backup-restore-checks).
 
 ## 1. Configurable keychain layout (`6ce375e`)
@@ -895,8 +896,9 @@ server-made backup it tried was refused by `restore_from_vss_expecting` with enc
 the rest was open), `dcc9654`, `55cb0c9`, `b8df12d`, `6921d07`, `bb85811` and `d6357cf`, and after
 a review of those (which restored every genuine backup it could make at `d82e21a`: whole-block
 files, a 6.7 MB one, chunked VSS backups including exactly 2 MiB and 2 MiB + 1), `4ea8ccd`,
-`c188e63`, `ba96a80` and `3988f38`. They cover the VSS restore and, for the decryption, the file
-backup too (`Wallet::backup` / `restore_backup`, the app's D6 seals).
+`c188e63`, `ba96a80` and `3988f38`; then `b761c25`, after a review of `era_rgb` found the
+restored wallet placed before any of it was on disk. They cover the VSS restore and, for the
+decryption, the file backup too (`Wallet::backup` / `restore_backup`, the app's D6 seals).
 
 ### Why
 
@@ -983,6 +985,16 @@ Both restores, each answer of the server read once, in this order:
    `create_new` as `vss_restore_<unix time>`, with a `_<n>` suffix when that name is taken, so a
    file that was there is neither written to nor removed. A completed restore keeps its log in
    the target, as upstream; the log names neither the server URL nor the store ID (`45c3b39`).
+9. **The wallet is placed durably** (`b761c25`). A rename can reach the disk before the data it
+   moves (ext4's delayed allocation and jbd2 commits, f2fs checkpoints), so a power loss could
+   leave a restored wallet in place with short files: a short `rgb_lib_db`, short consignments,
+   a short `bdk_db_watch_only`, which rgb-lib self-heals and the app would then seal and upload
+   over the good copy on the server. Before the rename, every file and directory under the
+   staging directory is fsynced (each directory after what it holds); after it, the directory
+   that holds the wallet, so the rename is on disk when the restore returns. Every sync's error
+   fails the restore: before the rename the staging directory goes, after it the wallet
+   directory goes, so nothing is left in place either way. Directories are synced where they can
+   be opened as files (unix: Android and iOS included). The host need not sync the tree again.
 
 ### What decryption proves
 
@@ -1036,7 +1048,10 @@ than asked); for the files rgb-lib writes that changes nothing.
   disk. The app does not disable encryption.
 - `delete_backup` still trusts the manifest's `chunk_count` (upstream's; not a restore).
 - `restore_backup` (file) still leaves its `restore_<ts>` log, and the target directory, after a
-  failure, as upstream does (the bridge removes the log); step 8 is VSS's.
+  failure, as upstream does (the bridge removes the log); step 8 is VSS's. It stages and renames
+  nothing either: it extracts the wallet in place and syncs nothing, so step 9 has nothing to
+  order there, and a host that needs the restored files on disk syncs the tree after it (the
+  bridge does).
 - **An interrupted chunked upload leaves no restorable backup.** `upload_chunked` writes each
   chunk under the previous backup's keys (`backup/chunk/<i>`) and the manifest and metadata
   last, so an upload that stops after its first chunk leaves the previous manifest describing
@@ -1048,7 +1063,7 @@ than asked); for the files rgb-lib writes that changes nothing.
 ### Tests
 
 `cargo test --locked --lib --features esplora,vss -- wallet::vss::tests:: wallet::backup::tests::`
-(43 and 3 tests, offline; the first in `era.yml` since `45c3b39`, the second since `dcc9654`). A
+(45 and 3 tests, offline; the first in `era.yml` since `45c3b39`, the second since `dcc9654`). A
 scripted VSS server answers `getObject` per key and per read, and counts the reads, so the host's
 read can be told the truth and rgb-lib's something else.
 
@@ -1082,6 +1097,12 @@ read can be told the truth and rgb-lib's something else.
   naming more chunks than 1 MiB chunks make refused before any download; a backup of more than
   4 MiB restored in 4 MiB and in 1 MiB chunks; the download stopping at the first chunk that
   does not decrypt (reads 1-0-0, 1-1-0, 1-1-1).
+- `b761c25`, through a test-only record of syncs and renames and a hook that fails a chosen sync:
+  every file and directory of the restored wallet synced under its staging name before the
+  rename, each directory after its contents, the target directory right after the rename and
+  nothing else; a failing file or directory sync leaving nothing and no rename, a failing sync
+  after the rename leaving nothing either. The record stands for the syncs: the test cannot see
+  the disk's own ordering.
 
 Mutations: `777fe57`'s 7 and the two log lines put back (round 2); round 3, 28 (truncation 4,
 metadata and sizes 9, extraction 9, plaintext 2, cleanup 4), each failing a test. A tenth size
@@ -1090,7 +1111,9 @@ clause went. Round 4, 15, each failing a test: upper case refused again, either 
 exact, the directory named after the server for an encrypted backup, the existence check
 dropped; either cleanup dropped, an existing log file reused, a directory that was there counted
 as made; the chunk bound per byte again or per 4 MiB chunk, decryption at the end of the
-download, the truncation check dropped, a whole block held back.
+download, the truncation check dropped, a whole block held back. `b761c25`, 7, each failing a
+test: the file syncs or the directory syncs dropped, parents synced first, the rename first,
+the parent sync dropped, sync errors ignored, the wallet kept after a failed parent sync.
 
 ## Carrying the series onto a new UTEXO tag
 
