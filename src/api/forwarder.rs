@@ -1,13 +1,13 @@
 //! ERA fork: a loopback forwarder for rgb-lib's RGB proxy and reject-list traffic.
 //!
-//! A host that routes every network request through its own code (the ERA app filters hosts and
-//! pins TLS in a forwarder it runs on loopback) can point rgb-lib's indexer at that forwarder, but
-//! not the RGB proxy: the proxy endpoint is a property of each invoice, public by necessity, and a
-//! reject-list URL is a property of an asset contract. With a [`Forwarder`] set through
-//! [`OnlineOptions::forwarder_url`], [`ProxyClient`] and [`RejectListClient`] send every request
-//! to the forwarder instead of its real URL, otherwise exactly as they would have sent it, and
-//! name the real URL in [`FORWARD_TARGET_HEADER`]. A real URL with userinfo or a fragment is not
-//! sent at all ([`Error::InvalidForwardTarget`]). Invoices, stored transport endpoints and
+//! A host that routes every network request through its own code (the ERA app decides in a
+//! forwarder it runs on loopback where each request may go) can point rgb-lib's indexer at that
+//! forwarder, but not the RGB proxy: the proxy endpoint is a property of each invoice, public by
+//! necessity, and a reject-list URL is a property of an asset contract. With a [`Forwarder`] set
+//! through [`OnlineOptions::forwarder_url`], [`ProxyClient`] and [`RejectListClient`] send every
+//! request to the forwarder instead of its real URL, otherwise exactly as they would have sent
+//! it, and name the real URL in [`FORWARD_TARGET_HEADER`]. A real URL with userinfo or a fragment
+//! is not sent at all ([`Error::InvalidForwardTarget`]). Invoices, stored transport endpoints and
 //! everything else rgb-lib shows keep the real URL. `ERA.md` spells the contract out.
 //!
 //! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`], and the
