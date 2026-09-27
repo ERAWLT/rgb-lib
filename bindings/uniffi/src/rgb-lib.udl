@@ -67,6 +67,7 @@ interface RgbLibError {
   InvalidBitcoinKeys();
   InvalidKeychainLayout(string details);
   InvalidForwarderUrl(string details);
+  InvalidForwardTarget(string details);
   InvalidBitcoinNetwork(string network);
   InvalidColoringInfo(string details);
   InvalidConsignment();

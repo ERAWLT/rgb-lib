@@ -3846,9 +3846,14 @@ pub trait WalletOnline: WalletOffline {
                             usable: false,
                         };
                         let probe = self.check_proxy_endpoint(&transport_endpoint.endpoint);
-                        // ERA fork
-                        if let Err(e @ Error::ForwarderRefused { .. }) = &probe {
-                            refused.get_or_insert_with(|| e.clone());
+                        // ERA fork: an endpoint the forwarder may not be given fails the send, a
+                        // refusal is kept
+                        match &probe {
+                            Err(e @ Error::InvalidForwardTarget { .. }) => return Err(e.clone()),
+                            Err(e @ Error::ForwarderRefused { .. }) => {
+                                refused.get_or_insert_with(|| e.clone());
+                            }
+                            _ => {}
                         }
                         if probe.is_ok() {
                             local_transport_endpoint.usable = true;

@@ -6,7 +6,8 @@
 //! reject-list URL is a property of an asset contract. With a [`Forwarder`] set through
 //! [`OnlineOptions::forwarder_url`], [`ProxyClient`] and [`RejectListClient`] send every request
 //! to the forwarder instead of its real URL, otherwise exactly as they would have sent it, and
-//! name the real URL in [`FORWARD_TARGET_HEADER`]. Invoices, stored transport endpoints and
+//! name the real URL in [`FORWARD_TARGET_HEADER`]. A real URL with userinfo or a fragment is not
+//! sent at all ([`Error::InvalidForwardTarget`]). Invoices, stored transport endpoints and
 //! everything else rgb-lib shows keep the real URL. `ERA.md` spells the contract out.
 //!
 //! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`], and the
@@ -98,18 +99,39 @@ impl Forwarder {
     ///
     /// `target` is parsed as reqwest parses a request URL, and the header carries the parsed form,
     /// which is the URL reqwest would have requested. A target reqwest would refuse (unparsable,
-    /// not `http`/`https`, no host) is refused here, with a message the caller wraps in its own
-    /// error variant, so it fails the way it fails without a forwarder.
+    /// not `http`/`https`, no host) is refused here as `unsupported` (the caller's own error
+    /// variant), so it fails the way it fails without a forwarder.
+    ///
+    /// A target with userinfo or a fragment is [`Error::InvalidForwardTarget`], and no request is
+    /// made. The forwarder checks the target against an allowlist, and neither part has a place
+    /// in an RGB proxy or reject-list URL; userinfo can put a trusted-looking name before the
+    /// real host (`https://known.host@other.host/`), which a forwarder matching text instead of
+    /// the parsed host would take for the known one.
     pub(crate) fn request(
         &self,
         client: &RestClient,
         method: reqwest::Method,
         target: &str,
         kind: &'static str,
-    ) -> Result<reqwest::blocking::RequestBuilder, String> {
-        let target = Url::parse(target).map_err(|e| format!("invalid target URL: {e}"))?;
-        if !matches!(target.scheme(), "http" | "https") || !target.has_host() {
-            return Err(format!("unsupported target URL: {target}"));
+        unsupported: impl FnOnce(String) -> Error,
+    ) -> Result<reqwest::blocking::RequestBuilder, Error> {
+        let target = match Url::parse(target) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => url,
+            Ok(url) => return Err(unsupported(format!("unsupported target URL: {url}"))),
+            Err(e) => return Err(unsupported(format!("invalid target URL: {e}"))),
+        };
+        if !target.username().is_empty() || target.password().is_some() {
+            return Err(Error::InvalidForwardTarget {
+                details: format!(
+                    "a forwarded URL may not carry userinfo (its host is {})",
+                    target.host_str().unwrap_or_default()
+                ),
+            });
+        }
+        if target.fragment().is_some() {
+            return Err(Error::InvalidForwardTarget {
+                details: format!("a forwarded URL may not carry a fragment: {target}"),
+            });
         }
         Ok(client
             .request(method, self.url.clone())
@@ -323,6 +345,94 @@ pub(crate) mod tests {
             assert_eq!(client.get_ack("rid").unwrap().result, Some(false));
             mock.assert();
         }
+    }
+
+    #[test]
+    fn the_target_header_is_the_parsed_url() {
+        // what the forwarder compares against its allowlist: url::Url's serialization
+        let mut fwd = Server::new();
+        for (given, sent) in [
+            // host lower-cased and in punycode, the scheme's default port dropped
+            (
+                "https://PROXY.Exämple.COM:443/json-rpc",
+                "https://proxy.xn--exmple-cua.com/json-rpc",
+            ),
+            // an IPv4 address in another notation
+            (
+                "http://0x7f.1:3000/json-rpc",
+                "http://127.0.0.1:3000/json-rpc",
+            ),
+            // dot segments resolved, a space percent-encoded
+            (
+                "https://proxy.example.com/a/../json rpc",
+                "https://proxy.example.com/json%20rpc",
+            ),
+            // an empty userinfo is no userinfo
+            (
+                "https://@proxy.example.com/json-rpc",
+                "https://proxy.example.com/json-rpc",
+            ),
+        ] {
+            let mock = forwarded_json(&mut fwd, sent, "ack.get", json!(false));
+            let client = ProxyClient::new_routed(given, Some(&forwarder(&fwd))).unwrap();
+            assert_eq!(
+                client.get_ack("rid").unwrap().result,
+                Some(false),
+                "{given}"
+            );
+            mock.assert();
+        }
+    }
+
+    #[test]
+    fn a_target_with_userinfo_or_a_fragment_is_refused_before_any_request() {
+        let mut fwd = Server::new();
+        let never = untouchable(&mut fwd);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for target in [
+            // what rgb-lib derives from rpcs://rgb-proxy.utexo.com@evil.example/json-rpc: the
+            // host is evil.example
+            "https://rgb-proxy.utexo.com@evil.example/json-rpc",
+            "http://user:password@proxy.example.com/json-rpc",
+            "http://:password@proxy.example.com/json-rpc",
+            "https://proxy.example.com/json-rpc#fragment",
+            "https://proxy.example.com/json-rpc#",
+        ] {
+            let refused = |result: Result<(), Error>| {
+                assert!(
+                    matches!(result, Err(Error::InvalidForwardTarget { .. })),
+                    "{target}: {result:?}"
+                )
+            };
+            let client = ProxyClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
+            refused(client.get_info().map(|_| ()));
+            refused(client.get_ack("rid").map(|_| ()));
+            refused(client.get_consignment("rid").map(|_| ()));
+            refused(client.get_media("digest").map(|_| ()));
+            refused(client.post_ack("rid", true).map(|_| ()));
+            refused(
+                client
+                    .post_consignment("rid", file.path(), "00", Some(1))
+                    .map(|_| ()),
+            );
+            refused(client.post_media("digest", file.path()).map(|_| ()));
+            refused(crate::utils::check_proxy_routed(
+                target,
+                Some(&forwarder(&fwd)),
+            ));
+            refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
+                target,
+                &fwd.url(),
+            ));
+            let reject = RejectListClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
+            refused(reject.get_reject_list().map(|_| ()));
+        }
+        never.assert();
+
+        // without a forwarder nothing changes: the request is made as upstream makes it (here to
+        // a port nothing listens on)
+        let upstream = ProxyClient::new_routed("http://user@127.0.0.1:1/json-rpc", None).unwrap();
+        assert_matches!(upstream.get_info(), Err(Error::Proxy { .. }));
     }
 
     #[test]

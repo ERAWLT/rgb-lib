@@ -69,8 +69,8 @@ impl RejectListClient {
                 reqwest::Method::GET,
                 &self.base_url,
                 FORWARD_KIND_REJECT_LIST,
-            )
-            .map_err(Self::req_err)?
+                Self::req_err,
+            )?
             .send()
             .map_err(Self::req_err)?;
         if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {

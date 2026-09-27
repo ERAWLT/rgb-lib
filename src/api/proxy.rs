@@ -109,14 +109,13 @@ impl ProxyClient {
     fn post(&self) -> Result<reqwest::blocking::RequestBuilder, Error> {
         match &self.forwarder {
             None => Ok(self.client.post(&self.base_url)),
-            Some(forwarder) => forwarder
-                .request(
-                    &self.client,
-                    reqwest::Method::POST,
-                    &self.base_url,
-                    FORWARD_KIND_RGB_PROXY,
-                )
-                .map_err(Self::req_err),
+            Some(forwarder) => forwarder.request(
+                &self.client,
+                reqwest::Method::POST,
+                &self.base_url,
+                FORWARD_KIND_RGB_PROXY,
+                Self::req_err,
+            ),
         }
     }
 

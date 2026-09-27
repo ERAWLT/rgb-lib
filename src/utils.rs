@@ -599,8 +599,9 @@ pub(crate) fn check_proxy(proxy_url: &str) -> Result<(), Error> {
     check_proxy_routed(proxy_url, None)
 }
 
-/// ERA fork: [`check_proxy`], through `forwarder` when one is given. The forwarder's refusal is
-/// [`Error::ForwarderRefused`], not "unable to connect to proxy".
+/// ERA fork: [`check_proxy`], through `forwarder` when one is given. The forwarder's refusal and a
+/// URL it may not be given are [`Error::ForwarderRefused`] and [`Error::InvalidForwardTarget`],
+/// not "unable to connect to proxy".
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn check_proxy_routed(
     proxy_url: &str,
@@ -609,8 +610,10 @@ pub(crate) fn check_proxy_routed(
     let proxy_client = ProxyClient::new_routed(proxy_url, forwarder)?;
     let mut err_details = s!("unable to connect to proxy");
     let server_info = proxy_client.get_info();
-    // ERA fork: a forwarder's refusal is not a proxy out of reach (only a forwarder refuses)
-    if let Err(e @ Error::ForwarderRefused { .. }) = server_info {
+    // ERA fork: neither is a proxy out of reach (only a routed request produces them)
+    if let Err(e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. })) =
+        server_info
+    {
         return Err(e);
     }
     if let Ok(server_info) = server_info {

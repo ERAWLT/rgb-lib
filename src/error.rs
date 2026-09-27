@@ -457,6 +457,19 @@ pub enum Error {
         details: String,
     },
 
+    /// ERA fork: a URL a request would be forwarded for (a transport endpoint, a reject-list URL)
+    /// carries userinfo or a fragment, so it is not sent to the forwarder of
+    /// `OnlineOptions::forwarder_url` at all.
+    ///
+    /// Such a URL comes from a counterparty's invoice or an asset contract, and userinfo can put
+    /// a trusted-looking name before the real host (`https://known.host@other.host/`). No request
+    /// is made.
+    #[error("Invalid forward target: {details}")]
+    InvalidForwardTarget {
+        /// Error details
+        details: String,
+    },
+
     /// Invalid witness version
     #[error("Invalid witness version: {witness_version}")]
     InvalidWitnessVersion {
