@@ -10,8 +10,9 @@
 //! is not sent at all ([`Error::InvalidForwardTarget`]). Invoices, stored transport endpoints and
 //! everything else rgb-lib shows keep the real URL. `ERA.md` spells the contract out.
 //!
-//! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`], and the
-//! clients report [`Error::ForwarderRefused`]; any other answer is read as the target's.
+//! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`] (and, when
+//! its URL has a path, [`FORWARD_SESSION_HEADER`] echoing it), and the clients report
+//! [`Error::ForwarderRefused`]; any other answer is read as the target's.
 //!
 //! Without a forwarder the clients behave as upstream: the same client configuration, the same
 //! requests, no extra header.
@@ -30,6 +31,8 @@ pub(crate) const FORWARD_KIND_RGB_PROXY: &str = "rgb-proxy";
 pub(crate) const FORWARD_KIND_REJECT_LIST: &str = "reject-list";
 /// Header of a forwarder's refusal, sent with status 403: its value is the reason.
 pub(crate) const FORWARD_REFUSED_HEADER: &str = "x-era-forward-refused";
+/// Header of a forwarder's refusal that names the path of the forwarder's URL, echoing it back.
+pub(crate) const FORWARD_SESSION_HEADER: &str = "x-era-forward-session";
 /// The longest refusal reason kept, in characters.
 const MAX_REFUSAL_REASON: usize = 256;
 
@@ -153,14 +156,33 @@ impl Forwarder {
     }
 
     /// The forwarder's refusal of a request meant for `target`, if `response` is one: status 403
-    /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason. Anything else
-    /// is the target's answer or the forwarder failing, and the caller reads it as it would read
-    /// the target's own answer.
-    pub(crate) fn refusal(response: &reqwest::blocking::Response, target: &str) -> Option<Error> {
+    /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason, and, when the
+    /// forwarder's URL has a path, [`FORWARD_SESSION_HEADER`] naming that path exactly. Anything
+    /// else is the target's answer or the forwarder failing, and the caller reads it as it would
+    /// read the target's own answer.
+    ///
+    /// A target's answer relayed with its headers could carry a refusal header of its own
+    /// making; it cannot carry the path, which holds the session's secret and never leaves the
+    /// device. A forwarder at the root has no path to echo, and its refusals go unchecked.
+    pub(crate) fn refusal(
+        &self,
+        response: &reqwest::blocking::Response,
+        target: &str,
+    ) -> Option<Error> {
         if response.status() != reqwest::StatusCode::FORBIDDEN {
             return None;
         }
         let reason = response.headers().get(FORWARD_REFUSED_HEADER)?;
+        let path = self.url.path();
+        if path != "/"
+            && response
+                .headers()
+                .get(FORWARD_SESSION_HEADER)
+                .map(|echo| echo.as_bytes())
+                != Some(path.as_bytes())
+        {
+            return None;
+        }
         Some(Error::ForwarderRefused {
             // as the target header named it
             target: Url::parse(target).map_or_else(|_| target.to_string(), String::from),
@@ -732,6 +754,57 @@ pub(crate) mod tests {
                 reason: s!("not-allowlisted"),
             }
         );
+        direct.assert();
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn a_refusal_counts_only_with_the_forwarders_path_echoed() {
+        // a forwarder with a secret in its path: its refusal echoes the path, which a target
+        // whose answer the forwarder relays with its headers does not know
+        let mut proxy = Server::new();
+        let target = format!("{}/json-rpc", proxy.url());
+        let direct = untouchable(&mut proxy);
+        let path = "/session-secret/rgb";
+        for (echo, refused) in [
+            (Some(path), true),
+            (None, false),
+            (Some("/another-session/rgb"), false),
+            (Some("/session-secret/rgb/"), false),
+        ] {
+            let mut fwd = Server::new();
+            let _answers = ["POST", "GET"].map(|method| {
+                let answer = fwd
+                    .mock(method, path)
+                    .with_status(403)
+                    .with_header(FORWARD_REFUSED_HEADER, "not-allowlisted");
+                match echo {
+                    Some(echo) => answer.with_header(FORWARD_SESSION_HEADER, echo),
+                    None => answer,
+                }
+                .create()
+            });
+            let secret = Forwarder::new(&format!("{}{path}", fwd.url())).unwrap();
+            let client = ProxyClient::new_routed(&target, Some(&secret)).unwrap();
+            let reject = RejectListClient::new_routed(&target, Some(&secret)).unwrap();
+            if refused {
+                assert_matches!(client.get_ack("rid"), Err(Error::ForwarderRefused { .. }));
+                assert_matches!(
+                    reject.get_reject_list(),
+                    Err(Error::ForwarderRefused { .. })
+                );
+            } else {
+                // an ordinary 403: what a proxy that does not answer JSON-RPC and a list that
+                // is not there come to
+                let ack = client.get_ack("rid");
+                assert!(matches!(ack, Err(Error::Proxy { .. })), "{echo:?}: {ack:?}");
+                let list = reject.get_reject_list();
+                assert!(
+                    matches!(list, Err(Error::RejectListService { .. })),
+                    "{echo:?}: {list:?}"
+                );
+            }
+        }
         direct.assert();
     }
 

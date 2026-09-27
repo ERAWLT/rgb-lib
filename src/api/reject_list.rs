@@ -75,7 +75,7 @@ impl RejectListClient {
             )?
             .send()
             .map_err(scrubbed)?;
-        if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {
+        if let Some(refusal) = forwarder.refusal(&response, &self.base_url) {
             return Err(refusal);
         }
         let status = response.status();

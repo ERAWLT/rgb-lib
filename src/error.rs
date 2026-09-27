@@ -127,7 +127,8 @@ pub enum Error {
     FingerprintMismatch,
 
     /// ERA fork: the forwarder of `OnlineOptions::forwarder_url` refused to carry a request
-    /// (status 403 with an `X-Era-Forward-Refused` header).
+    /// (status 403 with an `X-Era-Forward-Refused` header and, when the forwarder's URL has a
+    /// path, an `X-Era-Forward-Session` header naming it).
     ///
     /// This is the forwarder's policy speaking, not the target: the same request gets the same
     /// answer until something changes on the forwarder's side (its allowlist, a user's consent).

@@ -42,7 +42,7 @@ use serde_json::{Value as Json, json};
 use super::*;
 use crate::api::forwarder::{
     FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST, FORWARD_KIND_RGB_PROXY, FORWARD_REFUSED_HEADER,
-    FORWARD_TARGET_HEADER, tests::Untouchable,
+    FORWARD_SESSION_HEADER, FORWARD_TARGET_HEADER, tests::Untouchable,
 };
 use crate::utils::{append_recipient_nonce, derive_proxy_recipient_id};
 
@@ -187,6 +187,8 @@ impl Services {
             .match_body(Matcher::Regex(regex::escape(method)))
             .with_status(403)
             .with_header(FORWARD_REFUSED_HEADER, reason)
+            // the forwarder's path, which only the forwarder knows
+            .with_header(FORWARD_SESSION_HEADER, FORWARDER_PATH)
             .with_body("refused")
             .expect(1)
             .create()

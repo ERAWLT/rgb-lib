@@ -108,7 +108,8 @@ pub struct OnlineOptions {
     /// `https://` URL for an `rpcs://` transport endpoint, `http://` for `rpc://`) and the service
     /// in `X-Era-Forward-Kind` (`rgb-proxy` or `reject-list`). An endpoint with userinfo or a
     /// fragment is not requested at all ([`Error::InvalidForwardTarget`]). A 403 answer with an
-    /// `X-Era-Forward-Refused` header is the forwarder's refusal ([`Error::ForwarderRefused`]),
+    /// `X-Era-Forward-Refused` header and, when this URL has a path, an `X-Era-Forward-Session`
+    /// header naming the path is the forwarder's refusal ([`Error::ForwarderRefused`]),
     /// and a reject list is read only from a 2xx answer. Invoices and the transport endpoints
     /// stored with transfers keep the real endpoints. There is no fallback to a direct
     /// connection, redirects are not followed, and no error names this URL. Indexer traffic is

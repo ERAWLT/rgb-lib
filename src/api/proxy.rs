@@ -126,16 +126,16 @@ impl ProxyClient {
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> Result<JsonRpcResponse<R>, Error> {
-        if self.forwarder.is_none() {
+        let Some(forwarder) = &self.forwarder else {
             return request
                 .send()
                 .map_err(Self::req_err)?
                 .json::<JsonRpcResponse<R>>()
                 .map_err(Self::req_err);
-        }
+        };
         let scrubbed = |e: reqwest::Error| Self::req_err(Forwarder::scrub(e, &self.base_url));
         let response = request.send().map_err(scrubbed)?;
-        if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {
+        if let Some(refusal) = forwarder.refusal(&response, &self.base_url) {
             return Err(refusal);
         }
         response.json::<JsonRpcResponse<R>>().map_err(scrubbed)
