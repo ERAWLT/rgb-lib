@@ -1311,12 +1311,28 @@ pub trait WalletOnline: WalletOffline {
                         continue;
                     }
                 }
-                // expired transfers: the proxy operation has lapsed, no need to revoke released TXs
-                if !matches!(
-                    self.try_fail_batch_transfer(txn, batch_transfer, &db_data, false)?,
-                    TryFailBatchTransferOutcome::Denied
-                ) {
-                    transfers_changed = true;
+                // expired transfers: the proxy operation has lapsed, no need to revoke released TXs.
+                // ERA fork: each attempt in a savepoint of its own (beta.8's with_savepoint). A
+                // transfer the forwarder's policy keeps from failing is left as it was, with
+                // nothing of its attempt kept, and does not keep the others from failing: the call
+                // would otherwise roll all of them back. Only a transfer failed or refreshed is a
+                // change.
+                match txn.with_savepoint(|attempt| {
+                    self.try_fail_batch_transfer(attempt, batch_transfer, &db_data, false)
+                }) {
+                    Err(
+                        e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
+                    ) => {
+                        warn!(
+                            self.logger(),
+                            "Not failing batch transfer {}: {e}", batch_transfer.idx
+                        );
+                    }
+                    other => {
+                        if !matches!(other?, TryFailBatchTransferOutcome::Denied) {
+                            transfers_changed = true;
+                        }
+                    }
                 }
             }
             // a mint whose lock can't be checked now (e.g. no EVM RPC URL is configured for its
