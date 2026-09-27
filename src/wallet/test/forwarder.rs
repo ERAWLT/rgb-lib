@@ -1,18 +1,22 @@
 //! ERA fork: a wallet online with a forwarder (`OnlineOptions::forwarder_url`) sends its RGB proxy
-//! traffic to the forwarder, while invoices and stored transport endpoints keep the real proxy.
+//! and reject-list traffic to the forwarder, while invoices and stored transport endpoints keep
+//! the real proxy.
 //!
-//! No regtest services: the Esplora indexer, the RGB proxy and the forwarder are local mock
-//! servers. The indexer only answers the genesis lookup `go_online` makes, and every `refresh` is
-//! run with `skip_sync`, so the one network request the wallet makes is `consignment.get` for a
-//! pending witness receive. The client-level tests in `api::forwarder` cover the other proxy
-//! methods.
+//! No regtest services: the Esplora indexer, the RGB proxy, the reject-list host and the
+//! forwarder are local mock servers. The indexer only answers the genesis lookup `go_online`
+//! makes, and every `refresh` is run with `skip_sync`, so the network requests are the ones under
+//! test: `consignment.get` for a pending witness receive, and the reject list, fetched through
+//! the wallet's own `get_reject_list` (its callers validate an IFA consignment or build an IFA
+//! send, and neither exists without a chain). The client-level tests in `api::forwarder` cover
+//! the other proxy methods.
 
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::json;
 
 use super::*;
 use crate::api::forwarder::{
-    FORWARD_KIND_HEADER, FORWARD_KIND_RGB_PROXY, FORWARD_TARGET_HEADER, tests::Untouchable,
+    FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST, FORWARD_KIND_RGB_PROXY, FORWARD_TARGET_HEADER,
+    tests::Untouchable,
 };
 
 const REGTEST_GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
@@ -22,6 +26,8 @@ const NO_CONSIGNMENT: &str = r#"{"jsonrpc":"2.0","id":null,"result":null,"error"
 struct Services {
     esplora: ServerGuard,
     proxy: ServerGuard,
+    // the host of an asset's reject list
+    issuer: ServerGuard,
     forwarder: ServerGuard,
     _genesis: Mock,
 }
@@ -36,9 +42,28 @@ impl Services {
         Self {
             esplora,
             proxy: Server::new(),
+            issuer: Server::new(),
             forwarder: Server::new(),
             _genesis: genesis,
         }
+    }
+
+    /// The URL of a reject list, as an asset contract names it.
+    fn reject_list_url(&self) -> String {
+        format!("{}/lists/usdt.txt", self.issuer.url())
+    }
+
+    /// The reject list arriving at the forwarder, meant for the issuer, answered with `status`.
+    fn expect_reject_list(&mut self, status: usize, body: &str) -> Mock {
+        let target = self.reject_list_url();
+        self.forwarder
+            .mock("GET", "/")
+            .match_header(FORWARD_TARGET_HEADER, target.as_str())
+            .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
+            .with_status(status)
+            .with_body(body)
+            .expect(1)
+            .create()
     }
 
     /// The transport endpoint as it goes into an invoice.
@@ -271,4 +296,43 @@ fn a_forwarder_that_is_down_fails_the_request_without_a_fallback() {
         .find(|t| t.idx == transfer.idx)
         .unwrap();
     assert_eq!(transfer_after.status, TransferStatus::WaitingCounterparty);
+}
+
+fn opout(byte: u8) -> Opout {
+    Opout::new(rgbstd::OpId::from([byte; 32]), OS_ASSET, 0)
+}
+
+#[test]
+#[parallel]
+fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
+    let mut services = Services::start();
+    let list_url = services.reject_list_url();
+    let mut wallet = get_test_wallet(false, None);
+    wallet
+        .go_online(services.options(services.forwarder_url()))
+        .unwrap();
+    let direct = Untouchable::on(&mut services.issuer);
+
+    // a 2xx answer is the list, parsed as upstream parses it
+    let (rejected, allowed) = (opout(1), opout(2));
+    let list = services.expect_reject_list(200, &format!("{rejected}\n!{allowed}\nnot an opout\n"));
+    let (reject_opouts, allow_opouts) = wallet.get_reject_list(&list_url).unwrap();
+    assert_eq!(reject_opouts, HashSet::from([rejected]));
+    assert_eq!(allow_opouts, HashSet::from([allowed]));
+    list.assert();
+    list.remove();
+
+    // anything else is an error, never an empty list the consignment would pass against
+    for status in [403, 503] {
+        let answer = services.expect_reject_list(status, "<html>error page</html>\n");
+        let result = wallet.get_reject_list(&list_url);
+        assert!(
+            matches!(&result, Err(Error::RejectListService { details })
+                if details.contains(&status.to_string())),
+            "{status}: {result:?}"
+        );
+        answer.assert();
+        answer.remove();
+    }
+    direct.assert();
 }

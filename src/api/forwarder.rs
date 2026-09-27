@@ -342,6 +342,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_forwarded_reject_list_fails_closed() {
+        let mut issuer = Server::new();
+        let target = format!("{}/lists/usdt.txt", issuer.url());
+        let direct = untouchable(&mut issuer);
+        // read as a list, an error page holds no opout, which would validate the asset against
+        // an empty list: whatever the body, only a 2xx is a list
+        for status in [403, 503, 404, 500, 307] {
+            let mut fwd = Server::new();
+            let answer = fwd
+                .mock("GET", "/")
+                .match_header(FORWARD_TARGET_HEADER, target.as_str())
+                .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
+                .with_status(status)
+                .with_body("<html>not a reject list</html>\n")
+                .expect(1)
+                .create();
+            let client = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+            let result = client.get_reject_list();
+            assert!(
+                matches!(&result, Err(Error::RejectListService { details })
+                    if details.contains(&status.to_string())),
+                "{status}: {result:?}"
+            );
+            answer.assert();
+        }
+        direct.assert();
+    }
+
+    #[test]
+    fn without_a_forwarder_the_reject_list_is_read_as_upstream_reads_it() {
+        // upstream reads the body of any answer as the list; the fork changes only the routed
+        // path, so this stays as it is (ERA.md, proxy forwarder)
+        let mut issuer = Server::new();
+        let list = issuer
+            .mock("GET", "/list")
+            .with_status(503)
+            .with_body("unavailable")
+            .expect(1)
+            .create();
+        let client = RejectListClient::new_routed(&format!("{}/list", issuer.url()), None).unwrap();
+        assert_eq!(client.get_reject_list().unwrap(), "unavailable");
+        list.assert();
+    }
+
+    #[test]
     fn without_a_forwarder_requests_go_direct_and_carry_no_header() {
         let mut proxy = Server::new();
         let target = format!("{}/json-rpc", proxy.url());

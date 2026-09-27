@@ -44,22 +44,41 @@ impl RejectListClient {
 
     pub(crate) fn get_reject_list(&self) -> Result<String, Error> {
         // ERA fork: through the forwarder when one is set
-        let request = match &self.forwarder {
-            None => self.client.get(&self.base_url),
-            Some(forwarder) => forwarder
-                .request(
-                    &self.client,
-                    reqwest::Method::GET,
-                    &self.base_url,
-                    FORWARD_KIND_REJECT_LIST,
-                )
-                .map_err(Self::req_err)?,
-        };
-        request
+        if let Some(forwarder) = &self.forwarder {
+            return self.get_forwarded(forwarder);
+        }
+        self.client
+            .get(&self.base_url)
             .send()
             .map_err(Self::req_err)?
             .text()
             .map_err(Self::req_err)
+    }
+
+    /// ERA fork: [`Self::get_reject_list`] through `forwarder`, failing closed.
+    ///
+    /// The caller reads the body as the list and skips every line that is not an opout, so any
+    /// answer that is not the list itself (a forwarder refusing the host, an upstream that is
+    /// down, an error page) would validate the asset against an empty list. Only a 2xx answer is
+    /// read as the list; anything else is [`Error::RejectListService`] with the status.
+    fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
+        let response = forwarder
+            .request(
+                &self.client,
+                reqwest::Method::GET,
+                &self.base_url,
+                FORWARD_KIND_REJECT_LIST,
+            )
+            .map_err(Self::req_err)?
+            .send()
+            .map_err(Self::req_err)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::RejectListService {
+                details: format!("HTTP {status} from the forwarder"),
+            });
+        }
+        response.text().map_err(Self::req_err)
     }
 }
 
