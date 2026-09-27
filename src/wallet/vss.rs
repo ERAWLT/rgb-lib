@@ -1319,6 +1319,13 @@ impl Drop for Staging {
 /// is not written anywhere. [`restore_from_vss_expecting`] also checks whose wallet it is.
 ///
 /// Returns the path to the restored wallet directory.
+///
+/// ERA fork: deprecated in the fork, kept for the bindings and upstream's own tests. A host that
+/// knows which wallet it restores uses [`restore_from_vss_expecting`], which also checks that the
+/// backup is that wallet's, and before it reads any of it.
+#[deprecated(
+    note = "ERA fork: use restore_from_vss_expecting, which checks whose wallet the backup is"
+)]
 pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Result<PathBuf, Error> {
     restore_from_vss_impl(config, target_dir, None).await
 }
@@ -2188,6 +2195,8 @@ mod tests {
         entries
     }
 
+    // (restore_from_vss is deprecated in the fork, and tested all the same)
+    #[allow(deprecated)]
     fn restore(
         config: VssBackupConfig,
         target: &Path,

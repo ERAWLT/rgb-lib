@@ -499,9 +499,12 @@ mod sign_psbt;
 mod sync;
 #[cfg(feature = "electrum")]
 mod tx_known_to_wallet;
+// ERA fork: upstream's tests call restore_from_vss, deprecated in the fork
 #[cfg(feature = "vss")]
+#[allow(deprecated)]
 mod vss;
 #[cfg(feature = "vss")]
+#[allow(deprecated)]
 mod vss_e2e;
 #[cfg(feature = "electrum")]
 mod witness_receive;
