@@ -1377,20 +1377,18 @@ async fn restore_from_vss_impl(
         return Err(Error::InvalidFingerprint);
     }
 
-    // ERA fork: a restore that fails leaves nothing behind: not its log, and not the target
-    // directory (nor a parent of it) if it made it. These are the ones it makes, deepest first.
+    // ERA fork: a restore that fails leaves nothing behind that it made: not its log, and not the
+    // target directory (nor a parent of it) if it made them, and nothing that was there before
     let target_dir_path = PathBuf::from(target_dir);
-    let created: Vec<PathBuf> = target_dir_path
-        .ancestors()
-        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
-        .map(Path::to_path_buf)
-        .collect();
-    let log_name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
-    let result = match fs::create_dir_all(target_dir)
-        .map_err(Error::from)
-        .and_then(|()| setup_logger(&target_dir_path, Some(&log_name)))
-    {
-        Ok((logger, logger_guard)) => {
+    let created = create_dirs(&target_dir_path)?;
+    let result = match new_log_file(&target_dir_path).and_then(|log_name| {
+        let logger = setup_logger(&target_dir_path, Some(&log_name));
+        if logger.is_err() {
+            let _ = fs::remove_file(target_dir_path.join(&log_name));
+        }
+        Ok((log_name, logger?))
+    }) {
+        Ok((log_name, (logger, logger_guard))) => {
             let result =
                 restore_logged(config, &target_dir_path, expected_fingerprint, &logger).await;
             // (the log is complete and closed once both are gone)
@@ -1404,12 +1402,62 @@ async fn restore_from_vss_impl(
         Err(e) => Err(e),
     };
     if result.is_err() {
-        // remove_dir leaves one that is not empty
-        for dir in &created {
-            let _ = fs::remove_dir(dir);
-        }
+        remove_dirs(&created);
     }
     result
+}
+
+/// ERA fork: create `dir` and its missing parents, as `fs::create_dir_all` does, and return the
+/// directories this call created, in order. Only a directory `fs::create_dir` made counts: one
+/// that was there, whatever path reaches it (`missing/../there`), is not this call's.
+fn create_dirs(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut created = vec![];
+    let mut path = PathBuf::new();
+    for component in dir.components() {
+        path.push(component);
+        match fs::create_dir(&path) {
+            Ok(()) => created.push(path.clone()),
+            // there already (a root answers with another error than AlreadyExists on some systems)
+            Err(_) if path.is_dir() => {}
+            Err(e) => {
+                remove_dirs(&created);
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// ERA fork: remove `created` (from [`create_dirs`]), deepest first, each only if it is empty.
+fn remove_dirs(created: &[PathBuf]) {
+    for dir in created.iter().rev() {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+/// ERA fork: create the restore's log file in `dir`, a file of its own (`create_new`): named
+/// `vss_restore_<unix time>` as upstream names it, with a suffix when a file of that name is there
+/// already, which is then neither written to nor removed. Returns its name.
+fn new_log_file(dir: &Path) -> Result<String, Error> {
+    let name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
+    for n in 0..100 {
+        let candidate = match n {
+            0 => name.clone(),
+            n => format!("{name}_{n}"),
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&candidate))
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::IO {
+        details: format!("no free name for the restore log next to {name}"),
+    })
 }
 
 async fn restore_logged(
@@ -3144,6 +3192,59 @@ mod tests {
                 .collect();
             let expected: &[&str] = if existing { &["rgb_lib_db"] } else { &[] };
             assert_eq!(left, expected);
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_removes_only_what_it_made() {
+        // no backup on the server: the restore fails once its log is set up
+        let server = VssScript::start(vec![]);
+        let key = test_signing_key();
+
+        // a target reached through a directory that is not there and "..", naming one that is
+        // (and is empty): the one the restore made goes, the one that was there stays
+        let root = tempfile::tempdir().unwrap();
+        let there = root.path().join("there");
+        fs::create_dir(&there).unwrap();
+        let target = root.path().join("missing").join("..").join("there");
+        assert!(restore(config(&server, key), &target, Some(EXPECTED)).is_err());
+        assert!(there.is_dir());
+        assert!(!root.path().join("missing").exists());
+        assert_eq!(tree(root.path()), ["there"]);
+
+        // a target that cannot be made (a file on its way): what was made on the way goes too
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"a file").unwrap();
+        let target = root.path().join("new").join("..").join("file").join("data");
+        let result = restore(config(&server, key), &target, Some(EXPECTED));
+        assert!(matches!(result, Err(Error::IO { .. })), "{result:?}");
+        assert_eq!(tree(root.path()), ["file"]);
+
+        // files of the restore log's names already in the target: neither written to nor removed
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        fs::create_dir(&target).unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let names: Vec<String> = (0..3)
+            .flat_map(|i| {
+                let name = format!("vss_restore_{}", now + i);
+                [name.clone(), format!("{name}_1")]
+            })
+            .collect();
+        for name in &names {
+            fs::write(target.join(name), b"someone else's file").unwrap();
+        }
+        assert!(restore(config(&server, key), &target, Some(EXPECTED)).is_err());
+        let mut left: Vec<String> = fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(left, expected);
+        for name in &names {
+            assert_eq!(fs::read(target.join(name)).unwrap(), b"someone else's file");
         }
     }
 }
