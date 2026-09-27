@@ -48,9 +48,21 @@ pub trait WalletOnline: WalletOffline {
             .and_then(|online_data| online_data.forwarder.as_ref())
     }
 
-    // ERA fork: every RGB proxy client is built here, so the forwarder carries all proxy traffic
+    // ERA fork: wallet code reaches an RGB proxy or a reject list only through the three helpers
+    // below, which take the route from the wallet's own online data, so no call site chooses it.
+    // era.yml fails on any other construction of these clients or of the proxy check.
     fn proxy_client(&self, proxy_url: &str) -> Result<ProxyClient, Error> {
         ProxyClient::new_routed(proxy_url, self.forwarder())
+    }
+
+    // ERA fork: see proxy_client
+    fn reject_list_client(&self, reject_list_url: &str) -> Result<RejectListClient, Error> {
+        RejectListClient::new_routed(reject_list_url, self.forwarder())
+    }
+
+    // ERA fork: see proxy_client; utils::check_proxy on this wallet's route
+    fn check_proxy_endpoint(&self, proxy_url: &str) -> Result<(), Error> {
+        check_proxy_routed(proxy_url, self.forwarder())
     }
 
     fn check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
@@ -955,7 +967,7 @@ pub trait WalletOnline: WalletOffline {
         &self,
         reject_list_url: &str,
     ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
-        let reject_list_client = RejectListClient::new_routed(reject_list_url, self.forwarder())?;
+        let reject_list_client = self.reject_list_client(reject_list_url)?;
         let list = reject_list_client.get_reject_list()?;
         let reject_list = list.trim();
         let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
@@ -3823,7 +3835,8 @@ pub trait WalletOnline: WalletOffline {
                             used: false,
                             usable: false,
                         };
-                        if check_proxy_routed(&transport_endpoint.endpoint, self.forwarder())
+                        if self
+                            .check_proxy_endpoint(&transport_endpoint.endpoint)
                             .is_ok()
                         {
                             local_transport_endpoint.usable = true;
