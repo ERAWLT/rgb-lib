@@ -47,10 +47,11 @@ pub struct Forwarder {
     logger: Option<Logger>,
 }
 
+// the path is the session's secret: it is left out
 impl std::fmt::Debug for Forwarder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Forwarder")
-            .field("url", &self.url)
+            .field("origin", &self.url.origin().ascii_serialization())
             .finish_non_exhaustive()
     }
 }
@@ -1060,6 +1061,19 @@ pub(crate) mod tests {
             answer.assert();
         }
         direct.assert();
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn the_debug_form_of_a_forwarder_leaves_its_path_out() {
+        let forwarder = Forwarder::new("http://127.0.0.1:8080/session-6c1f0e/rgb").unwrap();
+        let debug = format!("{forwarder:?}");
+        assert_eq!(
+            debug,
+            r#"Forwarder { origin: "http://127.0.0.1:8080", .. }"#
+        );
+        let pretty = format!("{forwarder:#?}");
+        assert!(!pretty.contains("session-6c1f0e"), "{pretty}");
     }
 
     #[test]
