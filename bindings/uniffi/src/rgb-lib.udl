@@ -184,6 +184,11 @@ interface RgbLibError {
   UnsupportedSchema(AssetSchema asset_schema);
   UnsupportedTransportType();
   UnsupportedWalletManifestVersion(string version);
+  VssAuth(string details);
+  VssBackupNotFound();
+  VssBackupUnencrypted();
+  VssError(string details);
+  VssVersionConflict(string details);
   WalletDirAlreadyExists(string path);
   WalletSettingMismatch(string setting, string expected, string provided);
   WatchOnly();
