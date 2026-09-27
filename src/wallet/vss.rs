@@ -1365,14 +1365,51 @@ async fn restore_from_vss_impl(
     {
         return Err(Error::InvalidFingerprint);
     }
+
+    // ERA fork: a restore that fails leaves nothing behind: not its log, and not the target
+    // directory (nor a parent of it) if it made it. These are the ones it makes, deepest first.
+    let target_dir_path = PathBuf::from(target_dir);
+    let created: Vec<PathBuf> = target_dir_path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    let log_name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
+    let result = match fs::create_dir_all(target_dir)
+        .map_err(Error::from)
+        .and_then(|()| setup_logger(&target_dir_path, Some(&log_name)))
+    {
+        Ok((logger, logger_guard)) => {
+            let result =
+                restore_logged(config, &target_dir_path, expected_fingerprint, &logger).await;
+            // (the log is complete and closed once both are gone)
+            drop(logger);
+            drop(logger_guard);
+            if result.is_err() {
+                let _ = fs::remove_file(target_dir_path.join(&log_name));
+            }
+            result
+        }
+        Err(e) => Err(e),
+    };
+    if result.is_err() {
+        // remove_dir leaves one that is not empty
+        for dir in &created {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+    result
+}
+
+async fn restore_logged(
+    config: VssBackupConfig,
+    target_dir_path: &Path,
+    expected_fingerprint: Option<&str>,
+    logger: &Logger,
+) -> Result<PathBuf, Error> {
     // ERA fork: with encryption on, only an encrypted backup is taken: decrypting is what
     // authenticates a backup, and a server could otherwise hand over any plaintext it likes
     let require_encrypted = config.encryption_enabled;
-
-    fs::create_dir_all(target_dir)?;
-    let log_dir = Path::new(target_dir);
-    let log_name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
-    let (logger, _logger_guard) = setup_logger(log_dir, Some(&log_name))?;
 
     // ERA fork: neither the server URL (a host's route to it may carry a session secret) nor the
     // store ID goes into the log file
@@ -1402,7 +1439,6 @@ async fn restore_from_vss_impl(
     }
     info!(logger, "Wallet fingerprint: {}", fingerprint);
 
-    let target_dir_path = PathBuf::from(target_dir);
     let wallet_dir = target_dir_path.join(&fingerprint);
 
     // Check if wallet already exists
@@ -1438,8 +1474,8 @@ async fn restore_from_vss_impl(
     // ERA fork: only the wallet directory, into a staging directory renamed into place once the
     // extraction is complete
     info!(logger, "Extracting backup to {:?}", wallet_dir);
-    let staging = Staging::new(&target_dir_path, &fingerprint)?;
-    if unzip_wallet_dir(&backup_data, &dir_in_zip, staging.path(), &logger)? == 0 {
+    let staging = Staging::new(target_dir_path, &fingerprint)?;
+    if unzip_wallet_dir(&backup_data, &dir_in_zip, staging.path(), logger)? == 0 {
         return Err(Error::VssError {
             details: "the backup holds no file of the wallet".to_string(),
         });
@@ -2026,20 +2062,66 @@ mod tests {
 
     #[test]
     fn the_restore_log_names_neither_the_server_nor_the_store() {
-        // no backup on the server: the restore stops at the manifest, after its first log lines
-        let server = VssScript::start(vec![]);
+        // a restore that completes keeps its log in the target directory, as upstream
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
         let dir = tempfile::tempdir().unwrap();
         let store_id = "store-6c1f0e";
         let server_url = format!("{}/session-secret/vss", server.url());
-        let config =
-            VssBackupConfig::new(server_url.clone(), store_id.to_string(), test_signing_key());
-        assert!(block_on(restore_from_vss(config, dir.path().to_str().unwrap())).is_err());
-        // (retried, as the client retries a server error)
-        assert!(server.reads(BACKUP_KEY_MANIFEST) > 0);
+        let config = VssBackupConfig::new(server_url.clone(), store_id.to_string(), key);
+        restore(config, dir.path(), None).unwrap();
         let logs = restore_logs(dir.path());
-        assert!(logs.contains("Starting VSS restore"), "{logs}");
+        assert!(logs.contains("VSS restore completed"), "{logs}");
         for secret in [server_url.as_str(), "session-secret", store_id] {
             assert!(!logs.contains(secret), "{secret} in {logs}");
+        }
+    }
+
+    // ERA fork: a restore that fails leaves nothing behind: not its log, and not the target
+    // directory if it made it
+
+    /// What a refused restore leaves under a root that held nothing.
+    const NOTHING: [&str; 0] = [];
+
+    #[test]
+    fn a_failed_restore_leaves_nothing_behind() {
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        // the server names another wallet
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![b"deadbeef".to_vec()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        for expected in [Some(EXPECTED), None] {
+            // a target the restore makes, parents included: all of it goes
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("a").join("b").join("data");
+            let result = restore(config(&server, key), &target, expected);
+            assert!(result.is_err(), "{expected:?}: {result:?}");
+            assert!(
+                fs::read_dir(root.path()).unwrap().next().is_none(),
+                "{expected:?}"
+            );
+
+            // a target that was there, holding another wallet: that is all it holds after
+            let root = tempfile::tempdir().unwrap();
+            let target = target_with_another_wallet(root.path());
+            let result = restore(config(&server, key), &target, expected);
+            assert!(result.is_err(), "{expected:?}: {result:?}");
+            assert_eq!(restore_logs(&target), "");
+            let left: Vec<String> = fs::read_dir(&target)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(left, ["deadbeef"], "{expected:?}");
         }
     }
     // ERA fork: restore_from_vss(_expecting) against a server whose answers change between reads
@@ -2190,7 +2272,7 @@ mod tests {
             );
             // nothing of the backup was fetched or written, in the target or next to it
             assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
-            assert_eq!(tree(root.path()), ["data"]);
+            assert_eq!(tree(root.path()), NOTHING);
         }
     }
 
@@ -2221,7 +2303,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
-        assert_eq!(tree(root.path()), ["data"]);
+        assert_eq!(tree(root.path()), NOTHING);
 
         // a host that has encryption off restores it, as upstream would
         let target = root.path().join("plain");
@@ -2257,7 +2339,7 @@ mod tests {
                 matches!(result, Err(Error::VssBackupUnencrypted)),
                 "{expected:?}: {result:?}"
             );
-            assert!(!target.join(EXPECTED).exists());
+            assert!(!target.exists());
         }
         assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
         // a config with encryption off takes it, as upstream did
@@ -2397,7 +2479,7 @@ mod tests {
                 let target = root.path().join("data");
                 let result = restore(config(&server, key), &target, expected);
                 assert!(result.is_err(), "{name}, {expected:?}: {result:?}");
-                assert!(!target.join(EXPECTED).exists(), "{name}, {expected:?}");
+                assert!(!target.exists(), "{name}, {expected:?}");
             }
         }
     }
@@ -2420,7 +2502,7 @@ mod tests {
             matches!(result, Err(Error::FingerprintMismatch)),
             "{result:?}"
         );
-        assert_eq!(tree(root.path()), ["data"]);
+        assert_eq!(tree(root.path()), NOTHING);
     }
 
     #[test]
@@ -2445,7 +2527,7 @@ mod tests {
                 "{named:?}: {result:?}"
             );
             assert_eq!(server.reads(BACKUP_KEY_DATA), 0, "{named:?}");
-            assert_eq!(tree(root.path()), ["data"], "{named:?}");
+            assert_eq!(tree(root.path()), NOTHING, "{named:?}");
         }
     }
 
@@ -2605,7 +2687,7 @@ mod tests {
             matches!(result, Err(Error::FingerprintMismatch)),
             "{result:?}"
         );
-        assert_eq!(tree(root.path()), ["data"]);
+        assert_eq!(tree(root.path()), NOTHING);
     }
 
     #[test]
@@ -2657,7 +2739,7 @@ mod tests {
             );
             assert!(result.is_err(), "{name}: {result:?}");
             // no wallet directory, whole or partial, and no staging directory
-            assert_eq!(tree(root.path()), ["data"], "{name}");
+            assert_eq!(tree(root.path()), NOTHING, "{name}");
         }
     }
 
@@ -2723,7 +2805,7 @@ mod tests {
                 matches!(result, Err(Error::VssError { .. })),
                 "{metadata}: {result:?}"
             );
-            assert!(!target.join(EXPECTED).exists());
+            assert!(!target.exists());
         }
         // nor does the short nonce panic the public helpers
         let short = VssEncryptionMetadata {
