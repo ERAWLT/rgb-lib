@@ -139,6 +139,19 @@ impl Forwarder {
             .header(FORWARD_KIND_HEADER, kind))
     }
 
+    /// `e`, from a request to the forwarder meant for `target`, naming `target` instead of the
+    /// forwarder. reqwest puts the URL it requested in the text of an error, rgb-lib returns that
+    /// text and logs some of it, and the forwarder's path may be a per-session secret.
+    pub(crate) fn scrub(e: reqwest::Error, target: &str) -> reqwest::Error {
+        if e.url().is_none() {
+            return e;
+        }
+        match Url::parse(target) {
+            Ok(target) => e.with_url(target),
+            Err(_) => e.without_url(),
+        }
+    }
+
     /// The forwarder's refusal of a request meant for `target`, if `response` is one: status 403
     /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason. Anything else
     /// is the target's answer or the forwarder failing, and the caller reads it as it would read
@@ -551,6 +564,48 @@ pub(crate) mod tests {
         let client = RejectListClient::new_routed(&format!("{}/list", issuer.url()), None).unwrap();
         assert_eq!(client.get_reject_list().unwrap(), "x");
         list.assert();
+    }
+
+    #[test]
+    fn request_errors_name_the_target_not_the_forwarder() {
+        // the forwarder's path may be a per-session secret, and rgb-lib returns the text of a
+        // request error and logs some of it
+        let target = "https://proxy.example.com/json-rpc";
+        let details = |result: Result<(), Error>| match result {
+            Err(Error::Proxy { details } | Error::RejectListService { details }) => details,
+            other => panic!("{other:?}"),
+        };
+
+        // nothing listening
+        let closed = Forwarder::new("http://127.0.0.1:1/session-secret/rgb").unwrap();
+        let client = ProxyClient::new_routed(target, Some(&closed)).unwrap();
+        let reject = RejectListClient::new_routed(target, Some(&closed)).unwrap();
+        for text in [
+            details(client.get_info().map(|_| ())),
+            details(reject.get_reject_list().map(|_| ())),
+        ] {
+            assert!(!text.contains("session-secret"), "{text}");
+            assert!(text.contains(target), "{text}");
+        }
+
+        // an answer that is not what the client reads (reqwest 0.13 puts no URL in a body or
+        // decoding error, but that is its choice to change)
+        let mut fwd = Server::new();
+        let _answers = ["POST", "GET"].map(|method| {
+            fwd.mock(method, "/session-secret/rgb")
+                .with_header("content-length", "100")
+                .with_body("not JSON-RPC, and shorter than announced")
+                .create()
+        });
+        let secret = Forwarder::new(&format!("{}/session-secret/rgb", fwd.url())).unwrap();
+        let client = ProxyClient::new_routed(target, Some(&secret)).unwrap();
+        let reject = RejectListClient::new_routed(target, Some(&secret)).unwrap();
+        for text in [
+            details(client.get_info().map(|_| ())),
+            details(reject.get_reject_list().map(|_| ())),
+        ] {
+            assert!(!text.contains("session-secret"), "{text}");
+        }
     }
 
     #[test]
