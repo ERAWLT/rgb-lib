@@ -1209,6 +1209,55 @@ fn go_offline_drops_the_online_state_and_the_route() {
 
 #[test]
 #[serial(forwarder)]
+fn a_nack_that_meets_an_ack_fails_the_receive_and_says_so() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+
+    let get = services.expect_rpc(
+        &target,
+        "consignment.get",
+        json!({"recipient_id": proxy_rid}),
+        json!({"consignment": "not base64!", "txid": FAKE_TXID, "vout": 1, "validated": null}),
+    );
+    // the proxy's own answer, relayed: an ACK is already there, in a JSON-RPC error
+    let nack = services
+        .forwarder
+        .mock("POST", FORWARDER_PATH)
+        .match_header(FORWARD_TARGET_HEADER, target.as_str())
+        .match_body(Matcher::PartialJson(json!({
+            "method": "ack.post",
+            "params": {"recipient_id": proxy_rid, "ack": false},
+        })))
+        .with_body(
+            json!({"jsonrpc": "2.0", "id": null, "result": null,
+                "error": {"code": -32000, "message": "Cannot change ACK"}})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let result = wallet.refresh(online, None, vec![], true).unwrap();
+    // failed, as upstream fails it
+    assert_eq!(
+        result[&transfer.batch_transfer_idx],
+        RefreshedTransfer {
+            updated_status: Some(TransferStatus::Failed),
+            failure: None,
+        }
+    );
+    get.assert();
+    nack.assert();
+    // and the log says why (the wallet's logger is flushed when the wallet goes)
+    let log = wallet.get_wallet_dir().join(crate::utils::LOG_FILE);
+    drop(wallet);
+    let log = fs::read_to_string(log).unwrap();
+    assert!(log.contains("Found an ACK when trying NACK"), "{log}");
+}
+
+#[test]
+#[serial(forwarder)]
 fn a_refusal_reason_is_never_read_as_the_proxys_answer() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
