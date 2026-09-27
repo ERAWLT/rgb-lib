@@ -148,6 +148,7 @@ interface RgbLibError {
   UnsupportedWalletManifestVersion(string version);
   VssAuth(string details);
   VssBackupNotFound();
+  VssBackupUnencrypted();
   VssError(string details);
   VssVersionConflict(string details);
   WalletDirAlreadyExists(string path);

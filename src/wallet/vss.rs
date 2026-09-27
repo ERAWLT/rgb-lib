@@ -495,12 +495,20 @@ impl VssBackupClient {
     pub async fn download_backup(&self) -> Result<Vec<u8>, Error> {
         // First get the manifest
         let manifest = self.get_manifest().await?;
+        self.download_backup_with(&manifest).await
+    }
 
+    /// ERA fork: [`Self::download_backup`] by a manifest the caller read, so a caller that also
+    /// acts on the manifest acts on the same answer the download followed.
+    pub(crate) async fn download_backup_with(
+        &self,
+        manifest: &BackupManifest,
+    ) -> Result<Vec<u8>, Error> {
         // Download the raw data
         let raw_data = if manifest.chunk_count == 1 {
             self.download_single().await?
         } else {
-            self.download_chunked(&manifest).await?
+            self.download_chunked(manifest).await?
         };
 
         // Decrypt if the backup was encrypted
@@ -1135,8 +1143,60 @@ fn unzip_wallet_from_bytes(data: &[u8], target_dir: &Path, logger: &Logger) -> R
 /// For plaintext backups, the fingerprint is fetched from a separate server key
 /// and the sanitized "wallet/" directory is renamed to the actual fingerprint.
 ///
+/// ERA fork: the manifest is read once, so the decryption and the rename follow the same answer,
+/// and the name the server gives the wallet is used as a directory name only if it is a wallet
+/// fingerprint (8 hex characters); anything else is [`Error::VssError`] before any of the backup
+/// is written. [`restore_from_vss_expecting`] also checks whose wallet it is.
+///
 /// Returns the path to the restored wallet directory.
 pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Result<PathBuf, Error> {
+    restore_from_vss_impl(config, target_dir, None).await
+}
+
+/// ERA fork: [`restore_from_vss`] for a host that knows which wallet it restores.
+///
+/// `expected_fingerprint` is that wallet's master fingerprint as rgb-lib names its directory: 8
+/// lowercase hex characters, anything else being [`Error::InvalidFingerprint`] before anything is
+/// written or requested. The server's word is checked against it, not trusted, before any of the
+/// backup reaches the disk:
+/// - the wallet the server names (`backup/fingerprint`) must be this one, else
+///   [`Error::FingerprintMismatch`]; the directory is named after `expected_fingerprint`;
+/// - with encryption enabled in `config` (the default), a backup the manifest marks as
+///   unencrypted is [`Error::VssBackupUnencrypted`]: decrypting is what authenticates a backup,
+///   and a server could otherwise hand over any plaintext it likes;
+/// - an encrypted backup names its wallet inside, where the server cannot change it: that must be
+///   this one too, else [`Error::FingerprintMismatch`].
+///
+/// Each of those is read once, so a server cannot pass a check with one answer and have the
+/// restore act on another.
+pub async fn restore_from_vss_expecting(
+    config: VssBackupConfig,
+    target_dir: &str,
+    expected_fingerprint: &str,
+) -> Result<PathBuf, Error> {
+    restore_from_vss_impl(config, target_dir, Some(expected_fingerprint)).await
+}
+
+/// ERA fork: whether `name` is a wallet fingerprint, as `zip_wallet_to_bytes` and the server name
+/// it: 8 hex characters, so it can be a directory name and nothing else.
+fn is_fingerprint(name: &str) -> bool {
+    name.len() == 8 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn restore_from_vss_impl(
+    config: VssBackupConfig,
+    target_dir: &str,
+    expected_fingerprint: Option<&str>,
+) -> Result<PathBuf, Error> {
+    // ERA fork: the expected fingerprint names a directory, so it is checked before anything
+    if let Some(expected) = expected_fingerprint
+        && !(is_fingerprint(expected) && expected.bytes().all(|b| !b.is_ascii_uppercase()))
+    {
+        return Err(Error::InvalidFingerprint);
+    }
+    // ERA fork: a host that names the wallet does not take a plaintext backup when it encrypts
+    let require_encrypted = expected_fingerprint.is_some() && config.encryption_enabled;
+
     fs::create_dir_all(target_dir)?;
     let log_dir = Path::new(target_dir);
     let log_name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
@@ -1150,20 +1210,41 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
     let client = VssBackupClient::new(config)?;
 
     // Check manifest to determine if backup is encrypted
+    // ERA fork: read once; the download below decrypts by this same answer
     let manifest = client.get_manifest().await?;
+    if require_encrypted && !manifest.encrypted {
+        return Err(Error::VssBackupUnencrypted);
+    }
+
+    // Get fingerprint from server (stored during upload)
+    // ERA fork: before the download, and checked before it is used as a directory name
+    let fingerprint = client.get_fingerprint().await?;
+    match expected_fingerprint {
+        Some(expected) if fingerprint != expected => return Err(Error::FingerprintMismatch),
+        None if !is_fingerprint(&fingerprint) => {
+            return Err(Error::VssError {
+                details: "the backup on the server names no wallet fingerprint".to_string(),
+            });
+        }
+        _ => {}
+    }
+    info!(logger, "Wallet fingerprint: {}", fingerprint);
 
     info!(logger, "Downloading backup from VSS server...");
-    let backup_data = client.download_backup().await?;
+    let backup_data = client.download_backup_with(&manifest).await?;
     info!(
         logger,
         "Downloaded {} bytes ({:.2} MB)",
         backup_data.len(),
         backup_data.len() as f64 / 1_000_000.0
     );
-
-    // Get fingerprint from server (stored during upload)
-    let fingerprint = client.get_fingerprint().await?;
-    info!(logger, "Wallet fingerprint: {}", fingerprint);
+    // ERA fork: an encrypted backup names its wallet inside, where the server cannot change it
+    if manifest.encrypted
+        && let Some(expected) = expected_fingerprint
+        && get_fingerprint_from_zip_bytes(&backup_data)? != expected
+    {
+        return Err(Error::FingerprintMismatch);
+    }
 
     let target_dir_path = PathBuf::from(target_dir);
     let wallet_dir = target_dir_path.join(&fingerprint);
@@ -1695,5 +1776,249 @@ mod tests {
         for secret in [server_url.as_str(), "session-secret", store_id] {
             assert!(!logs.contains(secret), "{secret} in {logs}");
         }
+    }
+    // ERA fork: restore_from_vss(_expecting) against a server whose answers change between reads
+    // (restore TOCTOU): the host reads the fingerprint and the manifest first and is told the truth,
+    // rgb-lib's own reads are told something else.
+
+    const EXPECTED: &str = "a1b2c3d4";
+
+    fn manifest_json(encrypted: bool, data: &[u8]) -> Vec<u8> {
+        serde_json::to_vec(&BackupManifest {
+            chunk_count: 1,
+            total_size: data.len(),
+            encrypted,
+            version: VSS_BACKUP_VERSION,
+        })
+        .unwrap()
+    }
+
+    /// What the server holds for a backup of `fingerprint`'s wallet uploaded as rgb-lib uploads
+    /// it: (manifest, data, encryption metadata), encrypted with `key` or sanitized plaintext.
+    fn uploaded(fingerprint: &str, key: &SecretKey, encrypted: bool) -> [Vec<u8>; 3] {
+        let zip = create_test_zip(fingerprint);
+        if encrypted {
+            let metadata = VssEncryptionMetadata::new();
+            let data = encrypt_data(&zip, key, &metadata, None).unwrap();
+            [
+                manifest_json(true, &data),
+                data,
+                serde_json::to_vec(&metadata).unwrap(),
+            ]
+        } else {
+            let (data, _) = sanitize_zip_for_plaintext(&zip).unwrap();
+            [manifest_json(false, &data), data, vec![]]
+        }
+    }
+
+    fn config(server: &VssScript, key: SecretKey) -> VssBackupConfig {
+        VssBackupConfig::new(server.url(), "store".to_string(), key)
+    }
+
+    /// Every entry under `root`, relative, restore logs left out.
+    fn tree(root: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|path| !path.contains("vss_restore_"))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    fn restore(
+        config: VssBackupConfig,
+        target: &Path,
+        expected: Option<&str>,
+    ) -> Result<PathBuf, Error> {
+        let target = target.to_str().unwrap();
+        block_on(async {
+            match expected {
+                Some(expected) => restore_from_vss_expecting(config, target, expected).await,
+                None => restore_from_vss(config, target).await,
+            }
+        })
+    }
+
+    #[test]
+    fn restore_expecting_refuses_an_expected_fingerprint_that_is_not_one() {
+        let server = VssScript::start(vec![]);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        for expected in [
+            "",
+            "a1b2c3d",
+            "a1b2c3d4e",
+            "A1B2C3D4",
+            "../a1b2c",
+            "a1b2/c3d",
+            "a1b2c3dz",
+        ] {
+            let result = restore(config(&server, test_signing_key()), &target, Some(expected));
+            assert!(
+                matches!(result, Err(Error::InvalidFingerprint)),
+                "{expected:?}: {result:?}"
+            );
+        }
+        // nothing asked of the server, nothing written
+        assert_eq!(server.reads(BACKUP_KEY_MANIFEST), 0);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_expecting_restores_the_expected_wallet() {
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let restored = restore(config(&server, key), &target, Some(EXPECTED)).unwrap();
+        assert_eq!(restored, target.join(EXPECTED));
+        assert!(restored.join("some_file.txt").is_file());
+        // one read each: nothing is decided by one answer and done by another
+        assert_eq!(server.reads(BACKUP_KEY_MANIFEST), 1);
+        assert_eq!(server.reads(BACKUP_KEY_FINGERPRINT), 1);
+    }
+
+    #[test]
+    fn restore_expecting_refuses_another_wallet_named_on_the_second_read() {
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        for second in ["../escape", "deadbeef"] {
+            let server = VssScript::start(vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
+                (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into(), second.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+                (BACKUP_KEY_METADATA, vec![metadata.clone()]),
+            ]);
+            // the host's own read is told the expected wallet
+            let host = VssBackupClient::new(config(&server, key)).unwrap();
+            assert_eq!(block_on(host.get_fingerprint()).unwrap(), EXPECTED);
+            drop(host);
+
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(
+                matches!(result, Err(Error::FingerprintMismatch)),
+                "{second}: {result:?}"
+            );
+            // nothing of the backup was fetched or written, in the target or next to it
+            assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
+            assert_eq!(tree(root.path()), ["data"]);
+        }
+    }
+
+    #[test]
+    fn restore_expecting_refuses_a_backup_marked_plaintext_on_the_second_read() {
+        let key = test_signing_key();
+        let [encrypted_manifest, _, _] = uploaded(EXPECTED, &key, true);
+        // a plaintext "backup" of the server's making, with the wallet's name on it
+        let [plaintext_manifest, plaintext, _] = uploaded(EXPECTED, &key, false);
+        let server = VssScript::start(vec![
+            (
+                BACKUP_KEY_MANIFEST,
+                vec![encrypted_manifest, plaintext_manifest],
+            ),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![plaintext]),
+        ]);
+        // the host's own read is told the backup is encrypted
+        let host = VssBackupClient::new(config(&server, key)).unwrap();
+        assert!(block_on(host.get_manifest()).unwrap().encrypted);
+        drop(host);
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let result = restore(config(&server, key), &target, Some(EXPECTED));
+        assert!(
+            matches!(result, Err(Error::VssBackupUnencrypted)),
+            "{result:?}"
+        );
+        assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
+        assert_eq!(tree(root.path()), ["data"]);
+
+        // a host that has encryption off restores it, as upstream would
+        let target = root.path().join("plain");
+        let restored = restore(
+            config(&server, key).with_encryption(false),
+            &target,
+            Some(EXPECTED),
+        )
+        .unwrap();
+        assert_eq!(restored, target.join(EXPECTED));
+    }
+
+    #[test]
+    fn restore_expecting_refuses_an_encrypted_backup_of_another_wallet() {
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded("deadbeef", &key, true);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            // the server names the expected wallet, the backup is another one
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let result = restore(config(&server, key), &target, Some(EXPECTED));
+        assert!(
+            matches!(result, Err(Error::FingerprintMismatch)),
+            "{result:?}"
+        );
+        assert_eq!(tree(root.path()), ["data"]);
+    }
+
+    #[test]
+    fn restore_refuses_a_server_fingerprint_that_is_not_one() {
+        // upstream's restore_from_vss: the name the server gives the wallet became a directory
+        // name as it came, so "../escape" put the restored wallet next to the target
+        let key = test_signing_key();
+        let [manifest, data, _] = uploaded(EXPECTED, &key, false);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![b"../escape".to_vec()]),
+            (BACKUP_KEY_DATA, vec![data]),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let result = restore(config(&server, key).with_encryption(false), &target, None);
+        assert!(matches!(result, Err(Error::VssError { .. })), "{result:?}");
+        assert_eq!(tree(root.path()), ["data"]);
+    }
+
+    #[test]
+    fn restore_reads_the_manifest_once() {
+        // upstream's restore_from_vss read the manifest twice, deciding the rename by the first
+        // answer and the decryption by the second
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        let [plaintext_manifest, _, _] = uploaded(EXPECTED, &key, false);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest, plaintext_manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let restored = restore(config(&server, key), &target, None).unwrap();
+        assert!(restored.join("some_file.txt").is_file());
+        assert_eq!(server.reads(BACKUP_KEY_MANIFEST), 1);
     }
 }

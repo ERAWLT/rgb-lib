@@ -735,6 +735,12 @@ pub enum Error {
     #[error("VSS backup not found")]
     VssBackupNotFound,
 
+    /// ERA fork: the VSS server marks the backup as unencrypted, and the restore expects an
+    /// encrypted one (`restore_from_vss_expecting` with encryption enabled in the config). Only
+    /// decrypting authenticates a backup: an unencrypted one could be anything the server likes.
+    #[error("The VSS backup is not encrypted")]
+    VssBackupUnencrypted,
+
     /// VSS server communication error
     #[error("VSS error: {details}")]
     VssError {
