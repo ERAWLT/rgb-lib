@@ -844,13 +844,19 @@ pub trait WalletOnline: WalletOffline {
         if let ReceiveMode::Proxy { proxy_url } = mode {
             let proxy_client = self.proxy_client(proxy_url)?;
             match proxy_client.post_ack(&recipient_id, false) {
+                // ERA fork: the proxy says an ACK is already there in a JSON-RPC error, which
+                // arrives as an answer. Upstream looked for it in the text of an Err instead, where
+                // it never arrives, except inside a forwarder's refusal reason (which the reason's
+                // author chooses). Either way the transfer is failed, as upstream fails it.
+                Ok(r)
+                    if r.error
+                        .as_ref()
+                        .is_some_and(|e| e.message.contains("Cannot change ACK")) =>
+                {
+                    warn!(self.logger(), "Found an ACK when trying NACK");
+                }
                 Ok(r) => {
                     debug!(self.logger(), "Consignment NACK response: {:?}", r);
-                }
-                // ERA fork: the proxy's own words only (upstream matched the text of any error, and
-                // a forwarder's refusal carries a reason of the forwarder's choosing)
-                Err(Error::Proxy { ref details }) if details.contains("Cannot change ACK") => {
-                    warn!(self.logger(), "Found an ACK when trying NACK");
                 }
                 Err(e) => {
                     error!(self.logger(), "Failed to post NACK: {e}");
