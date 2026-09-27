@@ -1040,35 +1040,151 @@ fn send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment() {
     direct.assert();
 }
 
+/// A session of the host's forwarder: its Esplora route and its proxy route on one port, under one
+/// secret, as the ERA app serves them.
+struct Session {
+    server: ServerGuard,
+    _genesis: Mock,
+}
+
+impl Session {
+    fn start(secret: &str) -> Self {
+        let mut server = Server::new();
+        let genesis = server
+            .mock("GET", format!("/{secret}/esplora/block-height/0").as_str())
+            .with_body(REGTEST_GENESIS)
+            .create();
+        Self {
+            server,
+            _genesis: genesis,
+        }
+    }
+
+    fn options(&self, secret: &str) -> OnlineOptions {
+        OnlineOptions {
+            indexer_url: format!("{}/{secret}/esplora", self.server.url()),
+            skip_consistency_check: true,
+            vanilla_sync_lookback: 1,
+            forwarder_url: Some(format!("{}/{secret}/rgb", self.server.url())),
+        }
+    }
+}
+
+fn assert_offline<T: std::fmt::Debug>(result: Result<T, Error>) {
+    assert!(matches!(result, Err(Error::Offline)), "{result:?}");
+}
+
 #[test]
 #[serial(forwarder)]
-fn a_go_online_whose_new_indexer_fails_still_moves_the_forwarder() {
+fn a_go_online_whose_new_indexer_fails_goes_offline() {
     let mut services = Services::start();
-    let mut last_session = Server::new();
+    let mut last = Session::start("last-secret");
     let mut wallet = get_test_wallet(false, None);
-    let online = wallet
-        .go_online(services.options(Some(last_session.url())))
-        .unwrap();
-    let (_, transfer) = receive(&mut wallet, &services.endpoint());
-    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+    let online = wallet.go_online(last.options("last-secret")).unwrap();
+    receive(&mut wallet, &services.endpoint());
 
-    // a new session: the indexer route and the forwarder moved, and the probe of the new indexer
-    // URL fails (nothing listens on port 1)
-    let mut options = services.options(services.forwarder_url());
-    options.indexer_url = s!("http://127.0.0.1:1");
+    // the next session: new port, new secret for both routes, and its Esplora route does not
+    // answer yet (nothing listens on port 1)
+    let mut next = Server::new();
+    let mut options = OnlineOptions {
+        indexer_url: s!("http://127.0.0.1:1/next-secret/esplora"),
+        ..last.options("last-secret")
+    };
+    options.forwarder_url = Some(format!("{}/next-secret/rgb", next.url()));
     let result = wallet.go_online(options);
     assert!(
         matches!(result, Err(Error::InvalidIndexer { .. })),
         "{result:?}"
     );
 
-    // the wallet stays online on its last indexer, as upstream, but its proxy traffic already
-    // goes to the new forwarder, not to the last session's port
-    let stale = Untouchable::on(&mut last_session);
+    // offline: the last handle is refused, and nothing goes to the last session's port (neither
+    // indexer nor proxy traffic), to the next forwarder or to the proxy
+    let stale = Untouchable::on(&mut last.server);
+    let untouched = [
+        Untouchable::on(&mut next),
+        Untouchable::on(&mut services.proxy),
+    ];
+    assert_offline(wallet.get_fee_estimation(online, 6));
+    assert_offline(wallet.refresh(online, None, vec![], true));
+    stale.assert();
+    untouched.iter().for_each(Untouchable::assert);
+
+    // the same when the call drops the forwarder: the last indexer URL is still a route of it
+    let mut other = Session::start("other-secret");
+    let mut wallet = get_test_wallet(false, None);
+    let online = wallet.go_online(other.options("other-secret")).unwrap();
+    let result = wallet.go_online(OnlineOptions {
+        indexer_url: s!("http://127.0.0.1:1/esplora"),
+        forwarder_url: None,
+        ..other.options("other-secret")
+    });
+    assert!(
+        matches!(result, Err(Error::InvalidIndexer { .. })),
+        "{result:?}"
+    );
+    let stale = Untouchable::on(&mut other.server);
+    assert_offline(wallet.get_fee_estimation(online, 6));
+    stale.assert();
+}
+
+#[test]
+#[serial(forwarder)]
+fn without_a_forwarder_a_failed_go_online_keeps_the_last_indexer() {
+    // upstream behaviour, unchanged: the wallet stays online on the indexer it had
+    let mut services = Services::start();
+    let mut wallet = get_test_wallet(false, None);
+    let online = wallet.go_online(services.options(None)).unwrap();
+    let result = wallet.go_online(OnlineOptions {
+        indexer_url: s!("http://127.0.0.1:1"),
+        ..services.options(None)
+    });
+    assert!(
+        matches!(result, Err(Error::InvalidIndexer { .. })),
+        "{result:?}"
+    );
+    let fees = services
+        .esplora
+        .mock("GET", "/fee-estimates")
+        .with_body(r#"{"1": 2.0, "6": 1.5}"#)
+        .expect(1)
+        .create();
+    assert_eq!(wallet.get_fee_estimation(online, 6).unwrap(), 1.5);
+    fees.assert();
+}
+
+#[test]
+#[serial(forwarder)]
+fn go_offline_drops_the_online_state_and_the_route() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+
+    wallet.go_offline();
+    let untouched = [
+        Untouchable::on(&mut services.forwarder),
+        Untouchable::on(&mut services.esplora),
+        Untouchable::on(&mut services.proxy),
+    ];
+    assert_offline(wallet.refresh(online, None, vec![], true));
+    assert_offline(wallet.get_fee_estimation(online, 6));
+    // twice is not an error
+    wallet.go_offline();
+    untouched.iter().for_each(Untouchable::assert);
+    untouched.iter().for_each(Untouchable::remove);
+
+    // the next go_online builds a new state, with a new handle, and the traffic follows it
+    let next = wallet
+        .go_online(services.options(services.forwarder_url()))
+        .unwrap();
+    assert_ne!(next, online);
+    assert!(matches!(
+        wallet.refresh(online, None, vec![], true),
+        Err(Error::CannotChangeOnline)
+    ));
     let direct = Untouchable::on(&mut services.proxy);
     let forwarded = services.expect_forwarded(&proxy_rid, 1);
-    refresh(&mut wallet, online);
+    refresh(&mut wallet, next);
     forwarded.assert();
-    stale.assert();
     direct.assert();
 }
