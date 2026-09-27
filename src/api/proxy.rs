@@ -457,13 +457,7 @@ impl ProxyClient {
             id: None,
             params,
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .map_err(Self::req_err)
+        self.send(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     fn call_multipart<R: serde::de::DeserializeOwned>(
@@ -478,12 +472,22 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params_json)
             .part("file", file);
-        self.post()?
-            .multipart(form)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .map_err(Self::req_err)
+        self.send(self.post()?.multipart(form))
+    }
+
+    // ERA fork: every request is sent and read here. Through a forwarder, its refusal is
+    // Error::ForwarderRefused; any other answer is read as the proxy's, as upstream reads it.
+    fn send<R: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        let response = request.send().map_err(Self::req_err)?;
+        if self.forwarder.is_some()
+            && let Some(refusal) = Forwarder::refusal(&response, &self.base_url)
+        {
+            return Err(refusal);
+        }
+        response.json::<JsonRpcResponse<R>>().map_err(Self::req_err)
     }
 
     pub(crate) fn get_info(&self) -> Result<JsonRpcResponse<ServerInfoResponse>, Error> {

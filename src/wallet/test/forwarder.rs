@@ -26,14 +26,19 @@
 //! consignment has validated against a chain. Their tests call the wallet method that holds the
 //! call site, on a wallet online through a forwarder. `refresh` always runs with `skip_sync`, and
 //! `send_begin` on a wallet with no allocations stops at input selection, after its probe.
+//!
+//! A refusal of the forwarder (403 with `X-Era-Forward-Refused`) must come out as
+//! `Error::ForwarderRefused` where rgb-lib would otherwise report a proxy out of reach, and must
+//! change nothing where it reads a failed request as something else (`consignment.get`: no
+//! consignment yet). A forwarder that is down keeps today's errors.
 
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value as Json, json};
 
 use super::*;
 use crate::api::forwarder::{
-    FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST, FORWARD_KIND_RGB_PROXY, FORWARD_TARGET_HEADER,
-    tests::Untouchable,
+    FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST, FORWARD_KIND_RGB_PROXY, FORWARD_REFUSED_HEADER,
+    FORWARD_TARGET_HEADER, tests::Untouchable,
 };
 use crate::utils::{append_recipient_nonce, derive_proxy_recipient_id};
 
@@ -167,6 +172,22 @@ impl Services {
             .create()
     }
 
+    /// The proxy request `method` arriving at the forwarder, meant for `target`, refused by it
+    /// with `reason`.
+    fn expect_refusal(&mut self, target: &str, method: &str, reason: &str) -> Mock {
+        self.forwarder
+            .mock("POST", FORWARDER_PATH)
+            .match_header(FORWARD_TARGET_HEADER, target)
+            .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_RGB_PROXY)
+            // in a JSON-RPC body and in a multipart one alike
+            .match_body(Matcher::Regex(regex::escape(method)))
+            .with_status(403)
+            .with_header(FORWARD_REFUSED_HEADER, reason)
+            .with_body("refused")
+            .expect(1)
+            .create()
+    }
+
     /// `consignment.get` for `proxy_rid` arriving at the forwarder, meant for the proxy.
     fn expect_forwarded(&mut self, proxy_rid: &str, hits: usize) -> Mock {
         let target = self.target();
@@ -250,7 +271,7 @@ fn asset_in_db(wallet: &Wallet) -> String {
 
 /// A send as `send_end` leaves it: waiting for the recipient's ACK, with `endpoint` (an invoice
 /// endpoint, recipient nonce included) as the one the consignment was posted to.
-fn send_waiting_for_ack(wallet: &Wallet, recipient_id: &str, endpoint: &str) {
+fn send_waiting_for_ack(wallet: &Wallet, recipient_id: &str, endpoint: &str) -> i32 {
     let now = now().unix_timestamp();
     let txn = wallet.database().begin_transaction().unwrap();
     let batch_transfer_idx = txn
@@ -292,6 +313,130 @@ fn send_waiting_for_ack(wallet: &Wallet, recipient_id: &str, endpoint: &str) {
         )
         .unwrap();
     txn.commit().unwrap();
+    batch_transfer_idx
+}
+
+/// The invoice of another wallet's witness receive on `endpoints`.
+fn invoice_on(endpoints: &[String]) -> InvoiceData {
+    let mut recipient = get_test_wallet(false, None);
+    let receive_data = recipient
+        .witness_receive(
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            endpoints.to_vec(),
+            MIN_CONFIRMATIONS,
+        )
+        .unwrap();
+    Invoice::new(receive_data.invoice).unwrap().invoice_data()
+}
+
+/// What `send_begin` probes for the `n`th endpoint of `invoice`: the endpoint as rgb-lib reads
+/// it, recipient nonce included.
+fn probed(invoice: &InvoiceData, n: usize) -> String {
+    TransportEndpoint::new(invoice.transport_endpoints[n].clone())
+        .unwrap()
+        .endpoint
+}
+
+fn server_info() -> Json {
+    json!({"protocol_version": "0.2", "version": "0.2.1", "uptime": 1})
+}
+
+/// `send_begin` of the asset to `invoice`, the recipient built from the invoice as the app does.
+fn send_begin_to(
+    wallet: &mut Wallet,
+    online: Online,
+    asset_id: &str,
+    invoice: &InvoiceData,
+) -> Result<SendBeginResult, Error> {
+    let recipient_map = HashMap::from([(
+        asset_id.to_string(),
+        vec![Recipient {
+            recipient_id: invoice.recipient_id.clone(),
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(AMOUNT),
+            transport_endpoints: invoice.transport_endpoints.clone(),
+        }],
+    )]);
+    wallet.send_begin(
+        online,
+        recipient_map,
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        false,
+        None,
+    )
+}
+
+const CONSIGNMENT_BYTES: &str = "consignment bytes";
+const MEDIA_BYTES: &str = "media bytes";
+
+/// What `send_end` hands to `post_transfer_data`: the consignment it wrote, the asset's media and
+/// a recipient whose invoice endpoint (on `target`, with a recipient nonce) passed the probe in
+/// `send_begin`.
+struct SendEndInputs {
+    recipients: Vec<LocalRecipient>,
+    asset_transfer_dir: PathBuf,
+    media: Media,
+    // the routing id the recipient nonce derives, which the consignment is posted under
+    proxy_rid: String,
+}
+
+impl SendEndInputs {
+    fn new(wallet: &Wallet, target: &str) -> Self {
+        let asset_transfer_dir = wallet.get_transfer_dir("forwarder").join("asset");
+        let consignment_path = wallet.get_send_consignment_path_impl(&asset_transfer_dir);
+        fs::create_dir_all(consignment_path.parent().unwrap()).unwrap();
+        fs::write(&consignment_path, CONSIGNMENT_BYTES).unwrap();
+        let digest = hash_bytes_hex(MEDIA_BYTES.as_bytes());
+        let media_path = wallet.get_media_dir().join(&digest);
+        fs::write(&media_path, MEDIA_BYTES).unwrap();
+        let recipient_id = s!("recipient");
+        let nonce = [0x5a; 8];
+        Self {
+            recipients: vec![LocalRecipient {
+                recipient_id: recipient_id.clone(),
+                local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                    amount_sat: 1000,
+                    blinding: None,
+                    vout: 1,
+                }),
+                assignment: Assignment::Fungible(AMOUNT),
+                transport_endpoints: vec![LocalTransportEndpoint {
+                    transport_type: TransportType::JsonRpc,
+                    endpoint: append_recipient_nonce(target, &nonce),
+                    used: false,
+                    usable: true,
+                }],
+            }],
+            asset_transfer_dir,
+            media: Media {
+                file_path: media_path.to_string_lossy().to_string(),
+                digest,
+                mime: s!("text/plain"),
+            },
+            proxy_rid: derive_proxy_recipient_id(&recipient_id, &nonce),
+        }
+    }
+
+    fn post(&mut self, wallet: &Wallet) -> Result<(), Error> {
+        wallet.post_transfer_data(
+            &mut self.recipients,
+            self.asset_transfer_dir.clone(),
+            FAKE_TXID.to_string(),
+            HashSet::from([self.media.clone()]),
+        )
+    }
+
+    fn posted(&self) -> bool {
+        self.recipients[0].transport_endpoints[0].used
+    }
 }
 
 #[test]
@@ -348,45 +493,17 @@ fn send_begin_probes_the_recipient_proxy_through_the_forwarder() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
     let asset_id = asset_in_db(&wallet);
-    // the invoice of another wallet, on the same proxy
-    let mut recipient = get_test_wallet(false, None);
-    let (receive_data, _) = receive(&mut recipient, &services.endpoint());
-    let invoice_data = Invoice::new(receive_data.invoice).unwrap().invoice_data();
-    // what send_begin probes: the invoice endpoint as rgb-lib reads it, recipient nonce included
-    let probed = TransportEndpoint::new(invoice_data.transport_endpoints[0].clone())
-        .unwrap()
-        .endpoint;
-    assert!(probed.starts_with(&services.target()));
+    let invoice = invoice_on(&[services.endpoint()]);
+    assert!(probed(&invoice, 0).starts_with(&services.target()));
 
     let direct = Untouchable::on(&mut services.proxy);
     let probe = services.expect_rpc(
-        &probed,
+        &probed(&invoice, 0),
         "server.info",
         Json::Null,
-        json!({"protocol_version": "0.2", "version": "0.2.1", "uptime": 1}),
+        server_info(),
     );
-    let recipient_map = HashMap::from([(
-        asset_id,
-        vec![Recipient {
-            recipient_id: invoice_data.recipient_id,
-            witness_data: Some(WitnessData {
-                amount_sat: 1000,
-                blinding: None,
-            }),
-            assignment: Assignment::Fungible(AMOUNT),
-            transport_endpoints: invoice_data.transport_endpoints,
-        }],
-    )]);
-    let result = wallet.send_begin(
-        online,
-        recipient_map,
-        false,
-        FEE_RATE,
-        MIN_CONFIRMATIONS,
-        default_send_expiration(),
-        false,
-        None,
-    );
+    let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
     // the endpoint passed its probe, so send_begin went on to input selection and stopped there,
     // as it does for a wallet that holds none of the asset
     assert!(
@@ -403,67 +520,30 @@ fn send_end_posts_the_consignment_and_media_through_the_forwarder() {
     let mut services = Services::start();
     let (wallet, _online) = services.online_wallet();
     let target = services.target();
-
-    // what send_end hands to post_transfer_data: the consignment it wrote, the asset's media and a
-    // recipient whose invoice endpoint passed the probe in send_begin
-    let asset_transfer_dir = wallet.get_transfer_dir("forwarder").join("asset");
-    let consignment_path = wallet.get_send_consignment_path_impl(&asset_transfer_dir);
-    fs::create_dir_all(consignment_path.parent().unwrap()).unwrap();
-    fs::write(&consignment_path, "consignment bytes").unwrap();
-    let media_bytes = "media bytes";
-    let digest = hash_bytes_hex(media_bytes.as_bytes());
-    let media_path = wallet.get_media_dir().join(&digest);
-    fs::write(&media_path, media_bytes).unwrap();
-    let media = Media {
-        file_path: media_path.to_string_lossy().to_string(),
-        digest: digest.clone(),
-        mime: s!("text/plain"),
-    };
-    let recipient_id = s!("recipient");
-    let nonce = [0x5a; 8];
-    let mut recipients = vec![LocalRecipient {
-        recipient_id: recipient_id.clone(),
-        local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
-            amount_sat: 1000,
-            blinding: None,
-            vout: 1,
-        }),
-        assignment: Assignment::Fungible(AMOUNT),
-        transport_endpoints: vec![LocalTransportEndpoint {
-            transport_type: TransportType::JsonRpc,
-            endpoint: append_recipient_nonce(&target, &nonce),
-            used: false,
-            usable: true,
-        }],
-    }];
+    let mut inputs = SendEndInputs::new(&wallet, &target);
 
     let direct = Untouchable::on(&mut services.proxy);
     // posted to the proxy URL without the nonce, under the routing id the nonce derives
-    let proxy_rid = derive_proxy_recipient_id(&recipient_id, &nonce);
     let consignment = services.expect_upload(
         &target,
         "consignment.post",
-        &format!(r#"{{"recipient_id":"{proxy_rid}","txid":"{FAKE_TXID}","vout":1}}"#),
-        b"consignment bytes",
+        &format!(
+            r#"{{"recipient_id":"{}","txid":"{FAKE_TXID}","vout":1}}"#,
+            inputs.proxy_rid
+        ),
+        CONSIGNMENT_BYTES.as_bytes(),
     );
     let media_post = services.expect_upload(
         &target,
         "media.post",
-        &format!(r#"{{"attachment_id":"{digest}"}}"#),
-        media_bytes.as_bytes(),
+        &format!(r#"{{"attachment_id":"{}"}}"#, inputs.media.digest),
+        MEDIA_BYTES.as_bytes(),
     );
-    wallet
-        .post_transfer_data(
-            &mut recipients,
-            asset_transfer_dir,
-            FAKE_TXID.to_string(),
-            HashSet::from([media]),
-        )
-        .unwrap();
+    inputs.post(&wallet).unwrap();
     consignment.assert();
     media_post.assert();
     direct.assert();
-    assert!(recipients[0].transport_endpoints[0].used);
+    assert!(inputs.posted());
 }
 
 #[test]
@@ -730,5 +810,183 @@ fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
         answer.assert();
         answer.remove();
     }
+    direct.assert();
+}
+
+#[test]
+#[parallel]
+fn send_begin_reports_the_forwarders_refusal() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let asset_id = asset_in_db(&wallet);
+    let invoice = invoice_on(&[services.endpoint()]);
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&probed(&invoice, 0), "server.info", "unknown-proxy");
+    let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+    // not "no valid transport endpoints", which reads as a proxy out of reach
+    assert_eq!(
+        result.unwrap_err(),
+        Error::ForwarderRefused {
+            target: probed(&invoice, 0),
+            reason: s!("unknown-proxy"),
+        }
+    );
+    refusal.assert();
+    direct.assert();
+}
+
+#[test]
+#[parallel]
+fn send_begin_goes_on_with_a_usable_endpoint_next_to_a_refused_one() {
+    let mut services = Services::start();
+    let mut unknown = Server::new();
+    let unknown_endpoint = format!("rpc://{}/json-rpc", unknown.host_with_port());
+    let (mut wallet, online) = services.online_wallet();
+    let asset_id = asset_in_db(&wallet);
+    let invoice = invoice_on(&[unknown_endpoint, services.endpoint()]);
+
+    let direct = [
+        Untouchable::on(&mut unknown),
+        Untouchable::on(&mut services.proxy),
+    ];
+    let refusal = services.expect_refusal(&probed(&invoice, 0), "server.info", "unknown-proxy");
+    let probe = services.expect_rpc(
+        &probed(&invoice, 1),
+        "server.info",
+        Json::Null,
+        server_info(),
+    );
+    let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+    // one endpoint is usable, so the refusal of the other is no error: send_begin goes on to
+    // input selection
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { .. })),
+        "{result:?}"
+    );
+    refusal.assert();
+    probe.assert();
+    direct.iter().for_each(Untouchable::assert);
+}
+
+#[test]
+#[parallel]
+fn send_begin_keeps_todays_error_when_the_forwarder_is_down() {
+    let mut services = Services::start();
+    let mut wallet = get_test_wallet(false, None);
+    // nothing listens on port 1
+    let online = wallet
+        .go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .unwrap();
+    let asset_id = asset_in_db(&wallet);
+    let invoice = invoice_on(&[services.endpoint()]);
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+    assert_eq!(
+        result.unwrap_err(),
+        Error::InvalidTransportEndpoints {
+            details: s!("no valid transport endpoints"),
+        }
+    );
+    direct.assert();
+}
+
+#[test]
+#[parallel]
+fn send_end_reports_the_forwarders_refusal() {
+    let mut services = Services::start();
+    let (wallet, _online) = services.online_wallet();
+    let target = services.target();
+    let mut inputs = SendEndInputs::new(&wallet, &target);
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&target, "consignment.post", "consent-expired");
+    // not NoValidTransportEndpoint, which reads as a proxy out of reach
+    assert_eq!(
+        inputs.post(&wallet).unwrap_err(),
+        Error::ForwarderRefused {
+            target: target.clone(),
+            reason: s!("consent-expired"),
+        }
+    );
+    assert!(!inputs.posted());
+    refusal.assert();
+
+    // a forwarder that is down: the error of today
+    let mut down = get_test_wallet(false, None);
+    down.go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .unwrap();
+    let mut inputs = SendEndInputs::new(&down, &target);
+    assert_eq!(
+        inputs.post(&down).unwrap_err(),
+        Error::NoValidTransportEndpoint
+    );
+    direct.assert();
+}
+
+#[test]
+#[parallel]
+fn a_refused_ack_poll_is_the_sends_refresh_failure() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let batch_transfer_idx = send_waiting_for_ack(&wallet, "recipient", &target);
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&target, "ack.get", "consent-expired");
+    let result = wallet.refresh(online, None, vec![], true).unwrap();
+    // where a proxy out of reach would be Error::Proxy
+    assert_eq!(
+        result[&batch_transfer_idx].failure,
+        Some(Error::ForwarderRefused {
+            target,
+            reason: s!("consent-expired"),
+        })
+    );
+    refusal.assert();
+    direct.assert();
+}
+
+#[test]
+#[parallel]
+fn a_refused_consignment_download_leaves_the_receive_waiting() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let idx = transfer.batch_transfer_idx;
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&target, "consignment.get", "not-allowlisted");
+    // read as "no consignment yet", like every failure of consignment.get upstream: no error in
+    // the refresh result and the receive keeps waiting
+    let result = wallet.refresh(online, None, vec![], true).unwrap();
+    assert_eq!(
+        result[&idx],
+        RefreshedTransfer {
+            updated_status: None,
+            failure: None,
+        }
+    );
+    refusal.assert();
+    refusal.remove();
+    // which keeps it failable: fail_transfers refreshes a transfer before failing it, and an
+    // error there would stop it
+    let refusal = services.expect_refusal(&target, "consignment.get", "not-allowlisted");
+    assert!(
+        wallet
+            .fail_transfers(online, Some(idx), false, true)
+            .unwrap()
+    );
+    let status = wallet
+        .list_transfers(AssetFilter::AnyOrNone, None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.batch_transfer_idx == idx)
+        .unwrap()
+        .status;
+    assert_eq!(status, TransferStatus::Failed);
+    refusal.assert();
     direct.assert();
 }

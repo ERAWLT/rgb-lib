@@ -5917,6 +5917,8 @@ pub trait WalletOnline: WalletOffline {
             let mut found_valid = false;
             // the error of the last endpoint that refused to create the transfer, if any
             let mut refusal = None;
+            // ERA fork: the forwarder's first refusal, the error if no endpoint takes the post
+            let mut refused = None;
             for transport_endpoint in recipient.transport_endpoints.iter_mut() {
                 if transport_endpoint.transport_type != TransportType::JsonRpc
                     || !transport_endpoint.usable
@@ -5937,8 +5939,12 @@ pub trait WalletOnline: WalletOffline {
                 // skip a proxy that would refuse some of the media after the consignment is posted,
                 // or that doesn't tell how many it accepts (unreachable or invalid max_media)
                 if media_count > 0 {
-                    let max_media = proxy_client
-                        .get_info()
+                    let info = proxy_client.get_info();
+                    // ERA fork
+                    if let Err(e @ Error::ForwarderRefused { .. }) = &info {
+                        refused.get_or_insert_with(|| e.clone());
+                    }
+                    let max_media = info
                         .ok()
                         .and_then(|res| res.result)
                         .as_ref()
@@ -5971,6 +5977,11 @@ pub trait WalletOnline: WalletOffline {
                         continue;
                     }
                     Err(e @ Error::ProxyCannotChange { .. }) => return Err(e),
+                    // ERA fork
+                    Err(e @ Error::ForwarderRefused { .. }) => {
+                        refused.get_or_insert(e);
+                        continue;
+                    }
                     Err(_) => continue,
                 }
 
@@ -6016,7 +6027,11 @@ pub trait WalletOnline: WalletOffline {
                 break;
             }
             if !found_valid {
-                return Err(refusal.unwrap_or(Error::NoValidTransportEndpoint));
+                // ERA fork: a forwarder's refusal says why no endpoint took the consignment (it is
+                // what can change: the forwarder's allowlist, the user's consent)
+                return Err(refused
+                    .or(refusal)
+                    .unwrap_or(Error::NoValidTransportEndpoint));
             }
         }
 
@@ -6737,19 +6752,37 @@ pub trait WalletOnline: WalletOffline {
     /// usable, contacting each distinct endpoint once, however many recipients share it, and refuse
     /// a proxy recipient with none.
     fn check_recipients_transport_endpoints<'a>(
+        &self,
         recipients: impl IntoIterator<Item = &'a mut LocalRecipient>,
     ) -> Result<(), Error> {
         let mut usable_endpoints: HashMap<String, bool> = HashMap::new();
+        // ERA fork: the forwarder's refusal of an endpoint, by endpoint
+        let mut refusals: HashMap<String, Error> = HashMap::new();
         for local_recipient in recipients {
             if local_recipient.transport_endpoints.is_empty() {
                 continue;
             }
             for transport_endpoint in &mut local_recipient.transport_endpoints {
-                transport_endpoint.usable = *usable_endpoints
-                    .entry(transport_endpoint.endpoint.clone())
-                    .or_insert_with(|| self.check_proxy_endpoint(&transport_endpoint.endpoint).is_ok());
+                let endpoint = transport_endpoint.endpoint.clone();
+                transport_endpoint.usable =
+                    *usable_endpoints.entry(endpoint.clone()).or_insert_with(|| {
+                        let probe = self.check_proxy_endpoint(&endpoint);
+                        // ERA fork
+                        if let Err(e @ Error::ForwarderRefused { .. }) = &probe {
+                            refusals.insert(endpoint.clone(), e.clone());
+                        }
+                        probe.is_ok()
+                    });
             }
             if !local_recipient.transport_endpoints.iter().any(|t| t.usable) {
+                // ERA fork: a forwarder's refusal says why no endpoint is usable (the first)
+                if let Some(refused) = local_recipient
+                    .transport_endpoints
+                    .iter()
+                    .find_map(|t| refusals.get(&t.endpoint))
+                {
+                    return Err(refused.clone());
+                }
                 return Err(Error::InvalidTransportEndpoints {
                     details: s!("no valid transport endpoints"),
                 });
@@ -7086,7 +7119,7 @@ pub trait WalletOnline: WalletOffline {
 
         // whether the transport endpoints are usable is checked once all the recipients have
         // passed the checks that need no network
-        Self::check_recipients_transport_endpoints(local_recipients.values_mut().flatten())?;
+        self.check_recipients_transport_endpoints(local_recipients.values_mut().flatten())?;
 
         let receive_ids: Vec<String> = recipient_map
             .values()
@@ -8069,7 +8102,7 @@ pub trait WalletOnline: WalletOffline {
             self.parse_recipient(&recipient, schema, chainnet, 1, &operation_sk, now_ts, true)?;
         witness_recipients.extend(witness_output);
         local_recipients.push(local_recipient);
-        Self::check_recipients_transport_endpoints(&mut local_recipients)?;
+        self.check_recipients_transport_endpoints(&mut local_recipients)?;
 
         // the lock commits to this operation's ID, so it can only be included after the latest
         // external chain block: refuse a block to commit to (see RGB_METADATA_BEFORE_BLOCK)
