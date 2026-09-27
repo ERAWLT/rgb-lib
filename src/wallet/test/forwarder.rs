@@ -1190,3 +1190,39 @@ fn go_offline_drops_the_online_state_and_the_route() {
     forwarded.assert();
     direct.assert();
 }
+
+#[test]
+#[serial(forwarder)]
+fn a_refusal_reason_is_never_read_as_the_proxys_answer() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+
+    let direct = Untouchable::on(&mut services.proxy);
+    // a consignment the wallet refuses, and a NACK the forwarder refuses with a reason that reads
+    // like the proxy's "an ACK is already there"
+    let get = services.expect_rpc(
+        &target,
+        "consignment.get",
+        json!({"recipient_id": proxy_rid}),
+        json!({"consignment": "not base64!", "txid": FAKE_TXID, "vout": 1, "validated": null}),
+    );
+    let nack = services.expect_refusal(&target, "ack.post", "Cannot change ACK");
+    let result = wallet.refresh(online, None, vec![], true).unwrap();
+    // the refusal, not a transfer failed as if the NACK had met an ACK
+    assert_eq!(
+        result[&transfer.batch_transfer_idx],
+        RefreshedTransfer {
+            updated_status: None,
+            failure: Some(Error::ForwarderRefused {
+                target,
+                reason: s!("Cannot change ACK"),
+            }),
+        }
+    );
+    get.assert();
+    nack.assert();
+    direct.assert();
+}
