@@ -508,15 +508,19 @@ pub(crate) mod tests {
         let mut fwd = Server::new();
         let target = format!("{}/lists/usdt.txt", issuer.url());
         let direct = untouchable(&mut issuer);
+        let body = format!(
+            "{}\n",
+            Opout::new(rgbstd::OpId::from([1u8; 32]), OS_ASSET, 0)
+        );
         let list = fwd
             .mock("GET", "/")
             .match_header(FORWARD_TARGET_HEADER, target.as_str())
             .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
-            .with_body("opout-1\n")
+            .with_body(&body)
             .expect(1)
             .create();
         let client = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
-        assert_eq!(client.get_reject_list().unwrap(), "opout-1\n");
+        assert_eq!(client.get_reject_list().unwrap(), body);
         list.assert();
         direct.assert();
     }
@@ -528,15 +532,19 @@ pub(crate) mod tests {
         let target = format!("{}/lists/usdt.txt", issuer.url());
         let direct = untouchable(&mut issuer);
         // read as a list, an error page holds no opout, which would validate the asset against
-        // an empty list: whatever the body, only a 2xx is a list
-        for status in [403, 503, 404, 500, 307] {
+        // an empty list: whatever the body, only a 200 is a list, not even another 2xx
+        for status in [403, 503, 404, 500, 307, 203, 204, 206] {
             let mut fwd = Server::new();
             let answer = fwd
                 .mock("GET", "/")
                 .match_header(FORWARD_TARGET_HEADER, target.as_str())
                 .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
                 .with_status(status)
-                .with_body("<html>not a reject list</html>\n")
+                .with_body(if status == 204 {
+                    ""
+                } else {
+                    "<html>not a reject list</html>\n"
+                })
                 .expect(1)
                 .create();
             let client = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
@@ -546,6 +554,39 @@ pub(crate) mod tests {
                     if details.contains(&status.to_string())),
                 "{status}: {result:?}"
             );
+            answer.assert();
+        }
+        direct.assert();
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn a_forwarded_200_is_a_list_only_if_empty_or_holding_an_opout() {
+        let mut issuer = Server::new();
+        let target = format!("{}/lists/usdt.txt", issuer.url());
+        let direct = untouchable(&mut issuer);
+        let opout = Opout::new(rgbstd::OpId::from([1u8; 32]), OS_ASSET, 0);
+        for (body, list) in [
+            (s!(""), true),
+            (s!("\n"), true),
+            (format!("{opout}\n"), true),
+            (format!("not an opout\n!{opout}\n"), true),
+            (s!("<html>captive portal</html>"), false),
+            (s!(r#"{"error":"upstream timeout"}"#), false),
+            (s!("line one\nline two\n"), false),
+        ] {
+            let mut fwd = Server::new();
+            let answer = fwd.mock("GET", "/").with_body(&body).expect(1).create();
+            let client = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+            let result = client.get_reject_list();
+            if list {
+                assert_eq!(result.unwrap(), body);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::RejectListService { .. })),
+                    "{body:?}: {result:?}"
+                );
+            }
             answer.assert();
         }
         direct.assert();
