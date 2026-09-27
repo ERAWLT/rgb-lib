@@ -642,14 +642,18 @@ pub trait WalletOnline: WalletOffline {
                         continue;
                     }
                 }
-                transfers_changed = true;
-                match self.try_fail_batch_transfer(txn, batch_transfer, &db_data) {
-                    // ERA fork: a transfer the forwarder's policy keeps from refreshing (a receive,
-                    // see try_fail_batch_transfer) is left as it is, and does not keep the others
-                    // from failing: the call would otherwise roll all of them back
+                // ERA fork: each attempt in a savepoint of its own. A transfer the forwarder's
+                // policy keeps from refreshing (see try_fail_batch_transfer) is left as it was,
+                // with nothing of its attempt kept (a receive's refresh marks the endpoint it got
+                // the consignment from as used, or stores the asset it receives, before its ACK is
+                // refused), and does not keep the others from failing: the call would otherwise
+                // roll all of them back. Only a transfer failed or refreshed is a change.
+                let attempt = txn.savepoint()?;
+                match self.try_fail_batch_transfer(&attempt, batch_transfer, &db_data) {
                     Err(
                         e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
                     ) => {
+                        drop(attempt);
                         warn!(
                             self.logger(),
                             "Not failing batch transfer {}: {e}", batch_transfer.idx
@@ -657,6 +661,8 @@ pub trait WalletOnline: WalletOffline {
                     }
                     other => {
                         other?;
+                        attempt.commit()?;
+                        transfers_changed = true;
                     }
                 }
             }

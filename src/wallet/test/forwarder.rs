@@ -1414,8 +1414,11 @@ fn a_refused_send_whose_tx_the_indexer_knows_or_cannot_tell_is_not_failed() {
             TransferStatus::WaitingCounterparty,
             "{state:?}"
         );
-        // failing every expired transfer skips it
-        wallet.fail_transfers(online, None, false, true).unwrap();
+        // failing every expired transfer skips it, and reports no change
+        assert!(
+            !wallet.fail_transfers(online, None, false, true).unwrap(),
+            "{state:?}"
+        );
         assert_eq!(
             status_of(&wallet, send),
             TransferStatus::WaitingCounterparty,
@@ -1588,6 +1591,9 @@ fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
         status_of(&wallet, blocked),
         TransferStatus::WaitingCounterparty
     );
+    // and nothing of the receive's attempt was kept: its refresh had marked the endpoint it got
+    // the consignment from as used before the NACK was refused
+    assert!(!endpoint_used(&wallet, transfer.idx));
     // failing that one receive still reports why it cannot be failed
     let result = wallet.fail_transfers(online, Some(blocked), false, true);
     assert!(
@@ -1602,6 +1608,57 @@ fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
         mock.assert();
     }
     direct.assert();
+}
+
+/// Whether the transport endpoint of the transfer `transfer_idx` is marked as used.
+fn endpoint_used(wallet: &Wallet, transfer_idx: i32) -> bool {
+    let txn = wallet.database().begin_transaction().unwrap();
+    let endpoints = txn
+        .get_transfer_transport_endpoints_data(transfer_idx)
+        .unwrap();
+    assert_eq!(endpoints.len(), 1);
+    endpoints[0].0.used
+}
+
+/// The wallet's last-operation timestamp, which marks a backup as needed.
+fn last_operation(wallet: &Wallet) -> String {
+    let txn = wallet.database().begin_transaction().unwrap();
+    txn.get_backup_info()
+        .unwrap()
+        .unwrap()
+        .last_operation_timestamp
+}
+
+#[test]
+#[serial(forwarder)]
+fn failing_every_expired_transfer_when_all_are_skipped_changes_nothing() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    // the only expired transfer: a receive whose refused consignment the forwarder will not let
+    // it NACK
+    let (_, transfer) = receive(&mut wallet, &services.endpoint());
+    let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+    expire(&wallet, transfer.batch_transfer_idx);
+    let get = services.expect_rpc(
+        &target,
+        "consignment.get",
+        json!({"recipient_id": proxy_rid}),
+        json!({"consignment": "not base64!", "txid": FAKE_TXID, "vout": 1, "validated": null}),
+    );
+    let nack = services.expect_refusal(&target, "ack.post", "not-allowlisted");
+    let before = last_operation(&wallet);
+
+    // no transfer changed: false, nothing of the attempt kept, no backup marked as needed
+    assert!(!wallet.fail_transfers(online, None, false, true).unwrap());
+    assert_eq!(
+        status_of(&wallet, transfer.batch_transfer_idx),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(!endpoint_used(&wallet, transfer.idx));
+    assert_eq!(last_operation(&wallet), before);
+    get.assert();
+    nack.assert();
 }
 
 #[test]

@@ -269,6 +269,15 @@ impl DbTxn {
         Ok(block_on(txn.commit())?)
     }
 
+    /// ERA fork: a savepoint in this transaction, used as a transaction of its own: what is written
+    /// through it joins this transaction on [`Self::commit`] and is undone if it is dropped. This
+    /// transaction is not to be used while the savepoint is open.
+    pub(crate) fn savepoint(&self) -> Result<DbTxn, Error> {
+        Ok(DbTxn {
+            txn: Some(block_on(self.inner().begin())?),
+        })
+    }
+
     pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, Error> {
         let res = block_on(Asset::insert(asset).exec(self.inner()))?;
         Ok(res.last_insert_id)
