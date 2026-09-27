@@ -114,10 +114,12 @@ pub struct OnlineOptions {
     /// connection, redirects are not followed, and no error names this URL. Indexer traffic is
     /// not affected: point `indexer_url` at the forwarder for that.
     ///
-    /// Every `go_online` call applies the value as soon as it has been validated, so a call that
-    /// then fails on a new indexer URL has still moved the proxy traffic. `None` (the default,
-    /// and what a missing field deserializes to) contacts those services directly, as upstream
-    /// rgb-lib does. The contract is described in the fork's `ERA.md`.
+    /// Every `go_online` call applies the value. A call whose new `indexer_url` fails its probe
+    /// while a forwarder is set before or by the call leaves the wallet offline: the last indexer
+    /// URL is a route of the forwarder's last session. `Wallet::go_offline` drops the route when a
+    /// session ends. `None` (the default, and what a missing field deserializes to) contacts
+    /// those services directly, as upstream rgb-lib does. The contract is described in the fork's
+    /// `ERA.md`.
     #[serde(default)]
     pub forwarder_url: Option<String>,
 }

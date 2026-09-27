@@ -832,6 +832,20 @@ impl Wallet {
         Ok(online)
     }
 
+    /// ERA fork: go offline, dropping the online state [`go_online`](Wallet::go_online) built:
+    /// the indexer and resolver clients and the route of `OnlineOptions::forwarder_url`.
+    ///
+    /// Every [`Online`] handle of this wallet then gets [`Error::Offline`], so no request can go
+    /// out until the next `go_online`, which builds a new state and returns a new handle. A host
+    /// whose routes live only for a session (a loopback forwarder, whose port may belong to
+    /// another app once the session ends) calls this when the session ends. Going offline twice
+    /// is not an error.
+    pub fn go_offline(&mut self) {
+        info!(self.logger(), "Going offline...");
+        self.go_offline_impl();
+        info!(self.logger(), "Go offline completed");
+    }
+
     /// Send bitcoin funds to the provided address.
     ///
     /// This calls [`drain_to_begin`](Wallet::drain_to_begin), signs the resulting PSBT and finally

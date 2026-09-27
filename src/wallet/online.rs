@@ -698,6 +698,12 @@ pub trait WalletOnline: WalletOffline {
         Ok((online, online_data))
     }
 
+    // ERA fork: drop the online state (indexer, resolver, forwarder, hub client) and with it every
+    // Online handle, which then gets Error::Offline
+    fn go_offline_impl(&mut self) {
+        *self.online_data_mut() = None;
+    }
+
     fn go_online_impl(&mut self, online_options: &OnlineOptions) -> Result<Online, Error> {
         // ERA fork: validated before anything changes, so a refused URL leaves the wallet as it was
         let forwarder = online_options
@@ -705,17 +711,24 @@ pub trait WalletOnline: WalletOffline {
             .as_deref()
             .map(Forwarder::new)
             .transpose()?;
-        // ERA fork: and in force before anything below can fail (the probe of a new indexer URL,
-        // the consistency check). A host's forwarder gets a new loopback port per session, and
-        // the port of the last one may belong to another app by now.
-        if let Some(online_data) = self.online_data_mut().as_mut() {
-            online_data.forwarder = forwarder.clone();
-        }
+        // ERA fork: a forwarder before or after this call (see the probe of a new indexer URL)
+        let routed = forwarder.is_some() || self.forwarder().is_some();
         let indexer_url = &online_options.indexer_url;
         let online = if let Some(online_data) = self.online_data().as_ref() {
             let online = Online { id: online_data.id };
             if online_data.indexer_url != *indexer_url {
-                let (online, online_data) = self.get_online_data(online_options)?;
+                let (online, online_data) = match self.get_online_data(online_options) {
+                    Ok(online_data) => online_data,
+                    // ERA fork: where a forwarder carries the traffic, the last indexer URL is a
+                    // route of the forwarder's last session, whose port may belong to another
+                    // app by now. Rather than stay online on it, as upstream does, go offline:
+                    // the last Online handle then gets Error::Offline.
+                    Err(e) if routed => {
+                        *self.online_data_mut() = None;
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                };
                 *self.online_data_mut() = Some(online_data);
                 info!(self.logger(), "Went online with new indexer URL");
                 online
@@ -728,8 +741,8 @@ pub trait WalletOnline: WalletOffline {
             *self.online_data_mut() = Some(online_data);
             online
         };
-        // ERA fork: every branch above leaves online data in place; online data built for the
-        // first call or a new indexer URL starts without the forwarder
+        // ERA fork: every branch above that did not return leaves online data in place, and the
+        // forwarder follows the latest call, including one that keeps the indexer
         self.online_data_mut()
             .as_mut()
             .expect("online data was set above")
