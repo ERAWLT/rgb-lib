@@ -489,6 +489,9 @@ mod new;
 mod refresh;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod rust_only;
+// ERA fork: a chain for offline wallet tests
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) mod scripted_chain;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod send;
 #[cfg(feature = "electrum")]
