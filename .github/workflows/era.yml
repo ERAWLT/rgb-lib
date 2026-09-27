@@ -216,8 +216,10 @@ jobs:
       # keychain-layout patch extends. The forwarder ones run against local
       # mock servers (indexer, RGB proxy, reject-list host, forwarder), the VSS
       # ones against a scripted VSS server. The VSS and file backup ones also
-      # restore backups an older rev wrote (src/wallet/test/fixtures).
-      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets)
+      # restore backups an older rev wrote (src/wallet/test/fixtures). The
+      # scripted-chain ones fund, issue, send and settle on an in-memory chain
+      # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs).
+      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets, scripted chain)
         env:
           SKIP_INIT: "1"
         run: >
@@ -226,6 +228,7 @@ jobs:
           api::forwarder:: wallet::test::forwarder:: wallet::vss::tests::
           wallet::backup::tests::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
+          wallet::test::scripted_chain::
 
       - name: Migration crate with its CLI (the authoring binary still builds)
         run: cargo test --locked -p rgb-lib-migration
