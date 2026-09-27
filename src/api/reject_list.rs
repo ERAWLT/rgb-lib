@@ -60,7 +60,8 @@ impl RejectListClient {
     /// The caller reads the body as the list and skips every line that is not an opout, so any
     /// answer that is not the list itself (a forwarder refusing the host, an upstream that is
     /// down, an error page) would validate the asset against an empty list. Only a 2xx answer is
-    /// read as the list; anything else is [`Error::RejectListService`] with the status.
+    /// read as the list. The forwarder's refusal is [`Error::ForwarderRefused`], anything else is
+    /// [`Error::RejectListService`] with the status.
     fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
         let response = forwarder
             .request(
@@ -72,6 +73,9 @@ impl RejectListClient {
             .map_err(Self::req_err)?
             .send()
             .map_err(Self::req_err)?;
+        if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {
+            return Err(refusal);
+        }
         let status = response.status();
         if !status.is_success() {
             return Err(Error::RejectListService {

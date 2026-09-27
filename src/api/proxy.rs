@@ -120,6 +120,21 @@ impl ProxyClient {
         }
     }
 
+    // ERA fork: every request is sent and read here. Through a forwarder, its refusal is
+    // Error::ForwarderRefused; any other answer is read as the proxy's, as upstream reads it.
+    fn call<R: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        let response = request.send().map_err(Self::req_err)?;
+        if self.forwarder.is_some()
+            && let Some(refusal) = Forwarder::refusal(&response, &self.base_url)
+        {
+            return Err(refusal);
+        }
+        response.json::<JsonRpcResponse<R>>().map_err(Self::req_err)
+    }
+
     fn req_err(e: impl std::fmt::Display) -> Error {
         Error::Proxy {
             details: e.to_string(),
@@ -133,13 +148,7 @@ impl ProxyClient {
             id: None,
             params: None,
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<ServerInfoResponse>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     pub(crate) fn get_ack(&self, recipient_id: &str) -> Result<JsonRpcResponse<bool>, Error> {
@@ -151,13 +160,7 @@ impl ProxyClient {
                 recipient_id: recipient_id.to_string(),
             }),
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<bool>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     pub(crate) fn get_consignment(
@@ -172,13 +175,7 @@ impl ProxyClient {
                 recipient_id: recipient_id.to_string(),
             }),
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<GetConsignmentResponse>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     pub(crate) fn get_media(&self, attachment_id: &str) -> Result<JsonRpcResponse<String>, Error> {
@@ -190,13 +187,7 @@ impl ProxyClient {
                 attachment_id: attachment_id.to_string(),
             }),
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<String>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     pub(crate) fn post_ack(
@@ -213,13 +204,7 @@ impl ProxyClient {
                 ack,
             }),
         };
-        self.post()?
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<bool>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.header(CONTENT_TYPE, JSON).json(&body))
     }
 
     pub(crate) fn post_consignment<P: AsRef<Path>>(
@@ -249,12 +234,7 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params)
             .file("file", consignment_path)?;
-        self.post()?
-            .multipart(form)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<bool>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.multipart(form))
     }
 
     pub(crate) fn post_media<P: AsRef<Path>>(
@@ -272,12 +252,7 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params)
             .file("file", media_path)?;
-        self.post()?
-            .multipart(form)
-            .send()
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<bool>>()
-            .map_err(Self::req_err)
+        self.call(self.post()?.multipart(form))
     }
 }
 

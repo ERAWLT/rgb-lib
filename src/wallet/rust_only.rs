@@ -107,8 +107,9 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 /// ERA fork: [`check_proxy_url`] through a loopback forwarder, as a wallet online with
 /// [`OnlineOptions::forwarder_url`] checks a recipient's proxy.
 ///
-/// An error is raised if `forwarder_url` is not a valid forwarder URL, and otherwise as for
-/// [`check_proxy_url`]. The proxy is never contacted directly.
+/// An error is raised if `forwarder_url` is not a valid forwarder URL, if the forwarder refuses
+/// the request ([`Error::ForwarderRefused`]), and otherwise as for [`check_proxy_url`]. The proxy
+/// is never contacted directly.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub fn check_proxy_url_via_forwarder(proxy_url: &str, forwarder_url: &str) -> Result<(), Error> {
     let forwarder = Forwarder::new(forwarder_url)?;

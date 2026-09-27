@@ -126,6 +126,19 @@ pub enum Error {
     #[error("Fingerprint mismatch")]
     FingerprintMismatch,
 
+    /// ERA fork: the forwarder of `OnlineOptions::forwarder_url` refused to carry a request
+    /// (status 403 with an `X-Era-Forward-Refused` header).
+    ///
+    /// This is the forwarder's policy speaking, not the target: the same request gets the same
+    /// answer until something changes on the forwarder's side (its allowlist, a user's consent).
+    #[error("Forwarder refused the request for {target}: {reason}")]
+    ForwarderRefused {
+        /// The URL the request was meant for, as sent in `X-Era-Forward-Target`
+        target: String,
+        /// The value of the forwarder's `X-Era-Forward-Refused` header
+        reason: String,
+    },
+
     /// An I/O error has been encountered
     #[error("I/O error: {details}")]
     IO {

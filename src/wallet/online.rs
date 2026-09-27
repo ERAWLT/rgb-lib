@@ -3190,6 +3190,8 @@ pub trait WalletOnline: WalletOffline {
                 continue;
             }
             let mut found_valid = false;
+            // ERA fork: the forwarder's first refusal, the error if no endpoint takes the post
+            let mut refused = None;
             for transport_endpoint in recipient.transport_endpoints.iter_mut() {
                 if transport_endpoint.transport_type != TransportType::JsonRpc
                     || !transport_endpoint.usable
@@ -3229,6 +3231,11 @@ pub trait WalletOnline: WalletOffline {
                     Err(Error::RecipientIDAlreadyUsed) => {
                         return Err(Error::RecipientIDAlreadyUsed);
                     }
+                    // ERA fork
+                    Err(e @ Error::ForwarderRefused { .. }) => {
+                        refused.get_or_insert(e);
+                        continue;
+                    }
                     Err(_) => continue,
                     Ok(()) => {}
                 }
@@ -3247,7 +3254,8 @@ pub trait WalletOnline: WalletOffline {
                 break;
             }
             if !found_valid {
-                return Err(Error::NoValidTransportEndpoint);
+                // ERA fork: a forwarder's refusal says why no endpoint took the consignment
+                return Err(refused.unwrap_or(Error::NoValidTransportEndpoint));
             }
         }
 
@@ -3819,6 +3827,8 @@ pub trait WalletOnline: WalletOffline {
                 }
                 let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
                 let mut found_valid = false;
+                // ERA fork: the forwarder's first refusal, the error if no endpoint is usable
+                let mut refused = None;
                 if out_of_band {
                     if !self.supports_out_of_band_exchange() {
                         return Err(Error::UnsupportedTransportType);
@@ -3835,10 +3845,12 @@ pub trait WalletOnline: WalletOffline {
                             used: false,
                             usable: false,
                         };
-                        if self
-                            .check_proxy_endpoint(&transport_endpoint.endpoint)
-                            .is_ok()
-                        {
+                        let probe = self.check_proxy_endpoint(&transport_endpoint.endpoint);
+                        // ERA fork
+                        if let Err(e @ Error::ForwarderRefused { .. }) = &probe {
+                            refused.get_or_insert_with(|| e.clone());
+                        }
+                        if probe.is_ok() {
                             local_transport_endpoint.usable = true;
                             found_valid = true;
                         }
@@ -3846,6 +3858,10 @@ pub trait WalletOnline: WalletOffline {
                     }
                 }
 
+                // ERA fork: a forwarder's refusal says why no endpoint is usable
+                if !found_valid && let Some(refused) = refused {
+                    return Err(refused);
+                }
                 if !found_valid {
                     return Err(Error::InvalidTransportEndpoints {
                         details: s!("no valid transport endpoints"),

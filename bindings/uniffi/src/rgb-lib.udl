@@ -50,6 +50,7 @@ interface RgbLibError {
   FailedIssuance(string details);
   FileAlreadyExists(string path);
   FingerprintMismatch();
+  ForwarderRefused(string target, string reason);
   IO(string details);
   Inconsistency(string details);
   Indexer(string details);
