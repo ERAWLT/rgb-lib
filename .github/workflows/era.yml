@@ -197,14 +197,15 @@ jobs:
       # regtest services. The wallet ones create SQLite wallets (migrations on
       # the TLS-less tokio runtime) and exercise the manifest checks the
       # keychain-layout patch extends. The forwarder ones run against local
-      # mock servers (indexer, RGB proxy, reject-list host, forwarder).
-      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, offline wallets)
+      # mock servers (indexer, RGB proxy, reject-list host, forwarder), the VSS
+      # ones against a scripted VSS server.
+      - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, offline wallets)
         env:
           SKIP_INIT: "1"
         run: >
           cargo test --locked --lib --features esplora,vss --
           tests_keychain_layout tests_rest_client_tls
-          api::forwarder:: wallet::test::forwarder::
+          api::forwarder:: wallet::test::forwarder:: wallet::vss::tests::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
 
       - name: Migration crate with its CLI (the authoring binary still builds)

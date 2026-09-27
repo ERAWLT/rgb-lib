@@ -1142,9 +1142,9 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
     let log_name = format!("vss_restore_{}", OffsetDateTime::now_utc().unix_timestamp());
     let (logger, _logger_guard) = setup_logger(log_dir, Some(&log_name))?;
 
+    // ERA fork: neither the server URL (a host's route to it may carry a session secret) nor the
+    // store ID goes into the log file
     info!(logger, "Starting VSS restore...");
-    info!(logger, "Server URL: {}", config.server_url);
-    info!(logger, "Store ID: {}", config.store_id);
 
     // Create VSS client and download backup
     let client = VssBackupClient::new(config)?;
@@ -1586,6 +1586,114 @@ mod tests {
             assert!(!content.contains("tpubLeakCorrupt"));
             assert!(!content.contains("tpubLeakRecovering"));
             assert!(!content.contains(fingerprint));
+        }
+    }
+    /// ERA fork: a VSS server whose getObject answers follow a script: the n-th read of a key
+    /// gets the n-th value listed for it (the last one again after that), so a server that
+    /// answers two reads of one key differently can be played. A key with no values is not
+    /// there (HTTP 500). Every read is counted.
+    struct VssScript {
+        server: mockito::ServerGuard,
+        reads: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+        _mock: mockito::Mock,
+    }
+
+    impl VssScript {
+        fn start(answers: Vec<(&str, Vec<Vec<u8>>)>) -> Self {
+            use vss_client::prost::Message;
+            use vss_client::types::GetObjectResponse;
+            let key_of = |request: &mockito::Request| {
+                GetObjectRequest::decode(&request.body().unwrap()[..])
+                    .map(|r| r.key)
+                    .unwrap_or_default()
+            };
+            let answers: Arc<HashMap<String, Vec<Vec<u8>>>> = Arc::new(
+                answers
+                    .into_iter()
+                    .map(|(key, values)| (key.to_string(), values))
+                    .collect(),
+            );
+            let reads = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let (known, counter) = (answers.clone(), reads.clone());
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", mockito::Matcher::Regex("/getObject$".to_string()))
+                .with_status_code_from_request(move |request| {
+                    if known.get(&key_of(request)).is_some_and(|v| !v.is_empty()) {
+                        200
+                    } else {
+                        500
+                    }
+                })
+                .with_body_from_request(move |request| {
+                    let key = key_of(request);
+                    let mut reads = counter.lock().unwrap();
+                    let n = reads.entry(key.clone()).or_insert(0);
+                    *n += 1;
+                    match answers.get(&key) {
+                        Some(values) if !values.is_empty() => GetObjectResponse {
+                            value: Some(KeyValue {
+                                key,
+                                version: 1,
+                                value: values[(*n - 1).min(values.len() - 1)].clone(),
+                            }),
+                        }
+                        .encode_to_vec(),
+                        _ => vec![],
+                    }
+                })
+                .create();
+            Self {
+                server,
+                reads,
+                _mock: mock,
+            }
+        }
+
+        fn url(&self) -> String {
+            self.server.url()
+        }
+
+        fn reads(&self, key: &str) -> usize {
+            self.reads.lock().unwrap().get(key).copied().unwrap_or(0)
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    /// The text of every restore log in `dir`.
+    fn restore_logs(dir: &Path) -> String {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("vss_restore_")
+            })
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_restore_log_names_neither_the_server_nor_the_store() {
+        // no backup on the server: the restore stops at the manifest, after its first log lines
+        let server = VssScript::start(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let store_id = "store-6c1f0e";
+        let server_url = format!("{}/session-secret/vss", server.url());
+        let config =
+            VssBackupConfig::new(server_url.clone(), store_id.to_string(), test_signing_key());
+        assert!(block_on(restore_from_vss(config, dir.path().to_str().unwrap())).is_err());
+        // (retried, as the client retries a server error)
+        assert!(server.reads(BACKUP_KEY_MANIFEST) > 0);
+        let logs = restore_logs(dir.path());
+        assert!(logs.contains("Starting VSS restore"), "{logs}");
+        for secret in [server_url.as_str(), "session-secret", store_id] {
+            assert!(!logs.contains(secret), "{secret} in {logs}");
         }
     }
 }
