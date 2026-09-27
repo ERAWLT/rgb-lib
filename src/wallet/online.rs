@@ -496,6 +496,15 @@ pub trait WalletOnline: WalletOffline {
         txn.update_batch_transfer(&mut updated_batch_transfer)
     }
 
+    // ERA fork: whether the indexer knows the TX of `batch_transfer`, in its mempool or in a block
+    // (a batch transfer without a TXID has nothing that could be on chain)
+    fn batch_tx_known(&self, batch_transfer: &DbBatchTransfer) -> Result<bool, Error> {
+        let Some(txid) = &batch_transfer.txid else {
+            return Ok(false);
+        };
+        Ok(self.indexer().get_tx_confirmations(txid)?.is_some())
+    }
+
     fn try_fail_batch_transfer(
         &mut self,
         txn: &DbTxn,
@@ -507,16 +516,40 @@ pub trait WalletOnline: WalletOffline {
                 Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
                     Ok(None)
                 }
-                // ERA fork: a send still waiting for its ACKs has broadcast nothing, so failing it
-                // gives nothing away, and a forwarder that no longer lets its ACK poll through (the
-                // user's consent for the recipient's proxy gone, a target it may not be given)
-                // would otherwise keep it from ever failing. Not a receive: a donation's witness
-                // may already be on chain.
-                Err(Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. })
+                // ERA fork: a forwarder that no longer lets a send's ACK poll through (the user's
+                // consent for the recipient's proxy gone, a target it may not be given) would
+                // otherwise keep the send from ever failing. A send waiting for its ACKs has
+                // normally broadcast nothing, but not always: a backup taken before the broadcast
+                // and restored, or a kill between the broadcast in try_complete_batch and the
+                // commit of its refresh, leaves it waiting with its TX on chain, and failing that
+                // one would stop crediting its change. So it is failed only if the indexer does not
+                // know its TX; a lookup that fails keeps it too. Not a receive: a donation's
+                // witness may already be on chain.
+                Err(e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }))
                     if !batch_transfer.incoming
                         && batch_transfer.status == TransferStatus::WaitingCounterparty =>
                 {
-                    Ok(None)
+                    match self.batch_tx_known(batch_transfer) {
+                        Ok(false) => Ok(None),
+                        Ok(true) => {
+                            warn!(
+                                self.logger(),
+                                "Not failing batch transfer {}: the indexer knows its TX",
+                                batch_transfer.idx
+                            );
+                            Err(e)
+                        }
+                        // (the lookup's error unsaid: it can name the indexer's URL, which carries
+                        // the forwarder's session secret in the app)
+                        Err(_) => {
+                            warn!(
+                                self.logger(),
+                                "Not failing batch transfer {}: its TX could not be looked up",
+                                batch_transfer.idx
+                            );
+                            Err(e)
+                        }
+                    }
                 }
                 Err(e) => Err(e),
                 Ok(v) => Ok(v),
