@@ -795,7 +795,7 @@ fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
     let (wallet, _online) = services.online_wallet();
     let direct = Untouchable::on(&mut services.issuer);
 
-    // a 2xx answer is the list, parsed as upstream parses it
+    // a 200 answer holding opouts is the list, parsed as upstream parses it
     let (rejected, allowed) = (opout(1), opout(2));
     let list = services.expect_reject_list(200, &format!("{rejected}\n!{allowed}\nnot an opout\n"));
     let (reject_opouts, allow_opouts) = wallet.get_reject_list(&list_url).unwrap();
@@ -803,14 +803,24 @@ fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
     assert_eq!(allow_opouts, HashSet::from([allowed]));
     list.assert();
     list.remove();
+    // an empty 200 is an empty list
+    let list = services.expect_reject_list(200, "");
+    let (reject_opouts, allow_opouts) = wallet.get_reject_list(&list_url).unwrap();
+    assert!(reject_opouts.is_empty() && allow_opouts.is_empty());
+    list.assert();
+    list.remove();
 
     // anything else is an error, never an empty list the consignment would pass against
-    for status in [403, 503] {
-        let answer = services.expect_reject_list(status, "<html>error page</html>\n");
+    for (status, body) in [
+        (403, "<html>error page</html>\n"),
+        (503, "<html>error page</html>\n"),
+        (204, ""),
+        (200, "<html>captive portal</html>\n"),
+    ] {
+        let answer = services.expect_reject_list(status, body);
         let result = wallet.get_reject_list(&list_url);
         assert!(
-            matches!(&result, Err(Error::RejectListService { details })
-                if details.contains(&status.to_string())),
+            matches!(&result, Err(Error::RejectListService { .. })),
             "{status}: {result:?}"
         );
         answer.assert();

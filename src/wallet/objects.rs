@@ -109,11 +109,11 @@ pub struct OnlineOptions {
     /// in `X-Era-Forward-Kind` (`rgb-proxy` or `reject-list`). An endpoint with userinfo or a
     /// fragment is not requested at all ([`Error::InvalidForwardTarget`]). A 403 answer with an
     /// `X-Era-Forward-Refused` header and, when this URL has a path, an `X-Era-Forward-Session`
-    /// header naming the path is the forwarder's refusal ([`Error::ForwarderRefused`]),
-    /// and a reject list is read only from a 2xx answer. Invoices and the transport endpoints
-    /// stored with transfers keep the real endpoints. There is no fallback to a direct
-    /// connection, redirects are not followed, and no error names this URL. Indexer traffic is
-    /// not affected: point `indexer_url` at the forwarder for that.
+    /// header naming the path is the forwarder's refusal ([`Error::ForwarderRefused`]), and a
+    /// reject list is read only from a 200 answer that is empty or holds an opout. Invoices and
+    /// the transport endpoints stored with transfers keep the real endpoints. There is no
+    /// fallback to a direct connection, redirects are not followed, and no error names this URL.
+    /// Indexer traffic is not affected: point `indexer_url` at the forwarder for that.
     ///
     /// Every `go_online` call applies the value. A call whose new `indexer_url` fails its probe
     /// while a forwarder is set before or by the call leaves the wallet offline: the last indexer

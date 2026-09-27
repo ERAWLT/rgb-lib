@@ -59,9 +59,9 @@ impl RejectListClient {
     ///
     /// The caller reads the body as the list and skips every line that is not an opout, so any
     /// answer that is not the list itself (a forwarder refusing the host, an upstream that is
-    /// down, an error page) would validate the asset against an empty list. Only a 2xx answer is
-    /// read as the list. The forwarder's refusal is [`Error::ForwarderRefused`], anything else is
-    /// [`Error::RejectListService`] with the status.
+    /// down, an error page) would validate the asset against an empty list. Only a 200 answer
+    /// that is empty or holds at least one opout is read as the list. The forwarder's refusal is
+    /// [`Error::ForwarderRefused`], anything else is [`Error::RejectListService`].
     fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
         // an error names the list, not the forwarder (see Forwarder::scrub)
         let scrubbed = |e: reqwest::Error| Self::req_err(Forwarder::scrub(e, &self.base_url));
@@ -79,12 +79,26 @@ impl RejectListClient {
             return Err(refusal);
         }
         let status = response.status();
-        if !status.is_success() {
+        // only a 200 is the list: a 203, 204 or 206 is not the list as its issuer serves it
+        if status != reqwest::StatusCode::OK {
             return Err(Error::RejectListService {
                 details: format!("HTTP {status} from the forwarder"),
             });
         }
-        response.text().map_err(scrubbed)
+        let list = response.text().map_err(scrubbed)?;
+        // and text that holds no opout at all is not a list either (an error page passed on with
+        // a 200); an empty answer is an empty list
+        let lines = list.trim();
+        if !lines.is_empty()
+            && !lines
+                .lines()
+                .any(|line| Opout::from_str(line.strip_prefix('!').unwrap_or(line)).is_ok())
+        {
+            return Err(Error::RejectListService {
+                details: s!("the forwarded answer holds no opout"),
+            });
+        }
+        Ok(list)
     }
 }
 
