@@ -574,6 +574,7 @@ use crate::wallet::utils::{check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "_online")]
 use crate::{
     api::{
+        forwarder::Forwarder,
         multisig_hub::{
             FileMetadata, FileSource, FileType, InfoResponse, MultisigHubClient,
             OPERATION_TYPES_REQUIRING_SEED, OperationResponse, OperationStatus, OperationType,
@@ -599,7 +600,7 @@ use crate::{
     },
     no_wallet::script_buf_from_recipient_id,
     wallet::utils::{
-        check_proxy, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
+        check_proxy, check_proxy_routed, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
         proxy_retention_grace,
     },
     wallet::{AssignmentsCollection, multisig::RespondToOperation},

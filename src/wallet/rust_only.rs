@@ -38,6 +38,17 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     check_proxy(proxy_url).map(|_| ())
 }
 
+/// ERA fork: [`check_proxy_url`] through a loopback forwarder, as a wallet online with
+/// [`OnlineOptions::forwarder_url`] checks a recipient's proxy.
+///
+/// An error is raised if `forwarder_url` is not a valid forwarder URL, and otherwise as for
+/// [`check_proxy_url`]. The proxy is never contacted directly.
+#[cfg(feature = "_online")]
+pub fn check_proxy_url_via_forwarder(proxy_url: &str, forwarder_url: &str) -> Result<(), Error> {
+    let forwarder = Forwarder::new(forwarder_url)?;
+    check_proxy_routed(proxy_url, Some(&forwarder))
+}
+
 /// Load an RGB fascia from the file at the provided path.
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use

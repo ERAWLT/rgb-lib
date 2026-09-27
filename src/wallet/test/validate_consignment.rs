@@ -466,6 +466,7 @@ fn mint() {
     let reject_list_resolver = RemoteRejectListResolver {
         evm_rpc_urls: &evm_rpc_urls,
         evm_chains_checked: false,
+        forwarder: None,
     };
     let validate_with_resolvers =
         |claim_resolver: Option<&MockClaimResolver>,

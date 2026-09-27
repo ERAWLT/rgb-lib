@@ -88,6 +88,8 @@ pub struct OnlineData {
     // Ed25519 keys authenticating calls to proxies with proxy-level authentication enabled, by
     // proxy URL (see OnlineOptions::proxy_auth_keys)
     pub(crate) proxy_auth_keys: HashMap<String, ed25519_dalek::SigningKey>,
+    // ERA fork: set by go_online from OnlineOptions::forwarder_url
+    pub(crate) forwarder: Option<Forwarder>,
 }
 
 #[cfg(feature = "_online")]
@@ -167,6 +169,22 @@ pub struct OnlineOptions {
     ///
     /// Only used when the wallet supports the [`AssetSchema::Bfa`] schema.
     pub evm_chains: HashMap<u64, EvmChain>,
+    /// ERA fork: URL of a loopback HTTP forwarder that carries every RGB proxy and reject-list
+    /// request this wallet makes while online (`http://` to `127.0.0.0/8` or `[::1]`, optionally
+    /// with a path).
+    ///
+    /// Each request is sent to this URL instead of the endpoint it is meant for, unchanged
+    /// otherwise, and names that endpoint in the `X-Era-Forward-Target` header (an absolute
+    /// `https://` URL for an `rpcs://` transport endpoint, `http://` for `rpc://`) and the service
+    /// in `X-Era-Forward-Kind` (`rgb-proxy` or `reject-list`). Invoices and the transport
+    /// endpoints stored with transfers keep the real endpoints. A forwarder that is down or
+    /// refuses is an error; there is no fallback to a direct connection, and redirects are not
+    /// followed. Indexer traffic is not affected: point `indexer_url` at the forwarder for that.
+    ///
+    /// `None` (the default, and what a missing field deserializes to) contacts those services
+    /// directly, as upstream rgb-lib does. The contract is described in the fork's `ERA.md`.
+    #[serde(default)]
+    pub forwarder_url: Option<String>,
 }
 
 /// An EVM chain mint operations use, see [`OnlineOptions::evm_chains`].

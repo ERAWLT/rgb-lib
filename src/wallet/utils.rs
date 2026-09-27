@@ -482,7 +482,16 @@ pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
 /// Check that the proxy at `proxy_url` runs the supported protocol version, returning its info.
 #[cfg(feature = "_online")]
 pub(crate) fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
-    let proxy_client = ProxyClient::new(proxy_url)?;
+    check_proxy_routed(proxy_url, None)
+}
+
+/// ERA fork: [`check_proxy`], through `forwarder` when one is given.
+#[cfg(feature = "_online")]
+pub(crate) fn check_proxy_routed(
+    proxy_url: &str,
+    forwarder: Option<&Forwarder>,
+) -> Result<ServerInfoResponse, Error> {
+    let proxy_client = ProxyClient::new_routed(proxy_url, forwarder)?;
     let server_info = proxy_client.get_info()?;
     if let Some(info) = server_info.result {
         if info.protocol_version == *PROXY_PROTOCOL_VERSION {

@@ -100,7 +100,7 @@ fn get_ack_signed(
 /// List the transfers to an invoice on a recipient proxy (`transfer.list`), signing the request
 /// with the recipient key.
 fn list_invoice_transfers(
-    proxy_url: &str,
+    proxy_client: &ProxyClient,
     invoice_id: &str,
     recipient_seed: &[u8],
 ) -> Result<JsonRpcResponse<HashMap<String, ProxyTransferState>>, Error> {
@@ -111,7 +111,7 @@ fn list_invoice_transfers(
     let timestamp = now().unix_timestamp().to_string();
     let digest = sha256_digest(list_transfers_message(invoice_id, &timestamp).as_bytes());
     let signature = hex::encode(sign_ed25519(&sk, &digest));
-    ProxyClient::new(proxy_url)?.list_transfers(invoice_id, &signature, &timestamp)
+    proxy_client.list_transfers(invoice_id, &signature, &timestamp)
 }
 
 /// Whether the sender proxy knows the operation of `transfer_ids`, registered with the operation
@@ -211,12 +211,12 @@ fn incoming_expired(batch_transfer: &DbBatchTransfer, now: i64) -> bool {
 /// The retention grace advertised by a sender proxy (`retention_grace_secs`), i.e. how long
 /// after an operation expiration it keeps a released signed TX available to the recipients. A
 /// proxy not advertising it is considered to grant none.
-fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
+fn sender_proxy_retention_grace(proxy_client: &ProxyClient) -> Result<u32, Error> {
     #[cfg(test)]
     if let Some(grace) = mock_retention_grace() {
         return Ok(grace);
     }
-    let res = ProxyClient::new(proxy_url)?.get_info()?;
+    let res = proxy_client.get_info()?;
     if let Some(err) = res.error {
         return Err(map_proxy_error(err));
     }
@@ -1030,7 +1030,7 @@ pub trait WalletOnline: WalletOffline {
         let sk = ed25519_from_seed(&seed);
         let digest = sha256_digest(transfer_ids.concat().as_bytes());
         let sig = hex::encode(sign_ed25519(&sk, &digest));
-        let proxy_client = ProxyClient::new(&sender_proxy)?;
+        let proxy_client = self.proxy_client(&sender_proxy)?;
         let res = proxy_client.clean_ack(&transfer_ids, &sig)?;
         clean_ack_outcome(res.error)
     }
@@ -1462,12 +1462,20 @@ pub trait WalletOnline: WalletOffline {
             vanilla_sync_lookback: online_options.vanilla_sync_lookback,
             failed_witness_receive_grace_secs: online_options.failed_witness_receive_grace_secs,
             proxy_auth_keys,
+            // ERA fork: set by go_online_impl
+            forwarder: None,
         };
 
         Ok((online, online_data))
     }
 
     fn go_online_impl(&mut self, online_options: &OnlineOptions) -> Result<Online, Error> {
+        // ERA fork: validated before anything changes, so a refused URL leaves the wallet as it was
+        let forwarder = online_options
+            .forwarder_url
+            .as_deref()
+            .map(Forwarder::new)
+            .transpose()?;
         let online = if let Some(online_data) = self.online_data().as_ref() {
             let online = Online { id: online_data.id };
             if online_data.indexer_config != online_options.indexer_config {
@@ -1486,6 +1494,7 @@ pub trait WalletOnline: WalletOffline {
                     failed_witness_receive_grace_secs,
                     proxy_auth_keys,
                     evm_chains: _, // checked and returned by check_evm_chains below
+                    forwarder_url: _, // ERA fork: validated above, applied after every branch
                 } = online_options;
                 let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
                 let evm_chains = self.check_evm_chains(online_options)?;
@@ -1502,6 +1511,12 @@ pub trait WalletOnline: WalletOffline {
             *self.online_data_mut() = Some(online_data);
             online
         };
+        // ERA fork: every branch above leaves online data in place, and the forwarder always
+        // follows the latest call, including one that keeps the indexer
+        self.online_data_mut()
+            .as_mut()
+            .expect("online data was set above")
+            .forwarder = forwarder;
 
         if !online_options.skip_consistency_check {
             let txn = self.database().begin_transaction()?;
@@ -1710,7 +1725,7 @@ pub trait WalletOnline: WalletOffline {
         let sk = ed25519_from_seed(&seed);
         let digest = Self::ack_digest(transfer_id, ack, consignment_hash);
         let sig = hex::encode(sign_ed25519(&sk, &digest));
-        let proxy_client = ProxyClient::new(sender_proxy)?;
+        let proxy_client = self.proxy_client(sender_proxy)?;
         let res = proxy_client.post_ack(transfer_id, ack, &sig)?;
         if let Some(err) = res.error {
             return Err(map_proxy_error(err));
@@ -1874,7 +1889,7 @@ pub trait WalletOnline: WalletOffline {
             }
             match mode {
                 ReceiveMode::Proxy(data) => {
-                    let proxy_client = ProxyClient::new(&data.proxy_url)?;
+                    let proxy_client = self.proxy_client(&data.proxy_url)?;
                     let media_id = proxy_derived
                         .as_ref()
                         .expect("proxy mode always derives the shared secret")
@@ -1937,7 +1952,7 @@ pub trait WalletOnline: WalletOffline {
         proxy_url: &str,
         transfer_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
-        let proxy_client = ProxyClient::new(proxy_url)?;
+        let proxy_client = self.proxy_client(proxy_url)?;
         let consignment_res = proxy_client.get_consignment(&transfer_id);
         if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
             debug!(
@@ -2160,6 +2175,8 @@ pub trait WalletOnline: WalletOffline {
             inner: RemoteRejectListResolver {
                 evm_rpc_urls: self.evm_rpc_urls(),
                 evm_chains_checked: true,
+                // ERA fork: every reject list the wallet reads goes through its forwarder
+                forwarder: self.forwarder(),
             },
             logger: self.logger(),
         }
@@ -2361,7 +2378,7 @@ pub trait WalletOnline: WalletOffline {
             && donation_tx.is_none()
             && !mint_consignment
         {
-            let grace = sender_proxy_retention_grace(&data.sender_proxy)?;
+            let grace = sender_proxy_retention_grace(&self.proxy_client(&data.sender_proxy)?)?;
             if grace < min_sender_retention_grace() {
                 warn!(
                     self.logger(),
@@ -2731,7 +2748,7 @@ pub trait WalletOnline: WalletOffline {
         invoice_id: &str,
         recipient_seed: &[u8],
     ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
-        let transfers = match list_invoice_transfers(proxy_url, invoice_id, recipient_seed) {
+        let transfers = match list_invoice_transfers(&self.proxy_client(proxy_url)?, invoice_id, recipient_seed) {
             Ok(res) => match (res.result, res.error) {
                 (Some(transfers), None) => transfers,
                 (_, err) => {
@@ -2812,7 +2829,7 @@ pub trait WalletOnline: WalletOffline {
             if tte.kind != TransportEndpointKind::RecipientProxy {
                 continue;
             }
-            let res = list_invoice_transfers(&te.endpoint, &invoice_id, recipient_seed);
+            let res = list_invoice_transfers(&self.proxy_client(&te.endpoint)?, &invoice_id, recipient_seed);
             let nothing_pending = match res {
                 Ok(res) => match (res.result, res.error) {
                     (Some(transfers), None) => transfers
@@ -2843,7 +2860,7 @@ pub trait WalletOnline: WalletOffline {
         let sk = ed25519_from_seed(&seed);
         let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
         let signature = hex::encode(sign_ed25519(&sk, &digest));
-        let res = ProxyClient::new(proxy_url)
+        let res = self.proxy_client(proxy_url)
             .and_then(|client| client.transfer_retrieved(transfer_id, &signature));
         match res {
             Ok(r) if r.error.is_none() => {}
@@ -4006,7 +4023,7 @@ pub trait WalletOnline: WalletOffline {
                 details: s!("invalid operation secret key"),
             })?;
         let sk = ed25519_from_seed(&seed);
-        let proxy_client = ProxyClient::new(&sender_proxy)?;
+        let proxy_client = self.proxy_client(&sender_proxy)?;
         let ack_res = get_ack_signed(&proxy_client, &transfer_ids, &sk)?;
         debug!(self.logger(), "ACK get response: {:?}", ack_res);
         if let Some(err) = ack_res.error {
@@ -4739,7 +4756,7 @@ pub trait WalletOnline: WalletOffline {
         if batch_transfer.broadcast_deadline.is_none()
             && let Some(deadline) = broadcast_deadline(
                 res.expires_at.as_deref(),
-                sender_proxy_retention_grace(&sender_proxy)?,
+                sender_proxy_retention_grace(&self.proxy_client(&sender_proxy)?)?,
                 batch_transfer.expiration,
             )
         {
@@ -5915,7 +5932,7 @@ pub trait WalletOnline: WalletOffline {
                     self.logger(),
                     "Posting consignment for recipient ID: {recipient_id}"
                 );
-                let proxy_client = ProxyClient::new(&proxy_url)?;
+                let proxy_client = self.proxy_client(&proxy_url)?;
 
                 // skip a proxy that would refuse some of the media after the consignment is posted,
                 // or that doesn't tell how many it accepts (unreachable or invalid max_media)
@@ -6730,7 +6747,7 @@ pub trait WalletOnline: WalletOffline {
             for transport_endpoint in &mut local_recipient.transport_endpoints {
                 transport_endpoint.usable = *usable_endpoints
                     .entry(transport_endpoint.endpoint.clone())
-                    .or_insert_with(|| check_proxy(&transport_endpoint.endpoint).is_ok());
+                    .or_insert_with(|| check_proxy_routed(&transport_endpoint.endpoint, self.forwarder()).is_ok());
             }
             if !local_recipient.transport_endpoints.iter().any(|t| t.usable) {
                 return Err(Error::InvalidTransportEndpoints {
@@ -7141,7 +7158,7 @@ pub trait WalletOnline: WalletOffline {
                         for lte in lr.transport_endpoints.iter().filter(|e| e.usable) {
                             // a proxy that cannot be asked is skipped, as another one may still
                             // have the invoice available
-                            let result = match ProxyClient::new(&lte.endpoint)
+                            let result = match self.proxy_client(&lte.endpoint)
                                 .and_then(|c| c.check_invoices(std::slice::from_ref(&invoice_id)))
                             {
                                 Ok(res) => res.result,
@@ -7323,9 +7340,9 @@ pub trait WalletOnline: WalletOffline {
                     })?;
             let sender_proxy_url =
                 self.convert_transport_endpoint_url(sender_transport_endpoint)?;
-            let retention_grace = sender_proxy_retention_grace(&sender_proxy_url)?;
+            let retention_grace = sender_proxy_retention_grace(&self.proxy_client(&sender_proxy_url)?)?;
             broadcast_deadline = Some(expiration.saturating_add(i64::from(retention_grace)));
-            let proxy_client = ProxyClient::new(&sender_proxy_url)?;
+            let proxy_client = self.proxy_client(&sender_proxy_url)?;
             let transfer_ids: Vec<String> = transfer_data.keys().cloned().collect();
             let expiration = expiration.to_string();
             // only needed by proxies with proxy-level authentication enabled
