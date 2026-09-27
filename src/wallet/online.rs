@@ -1112,6 +1112,24 @@ pub trait WalletOnline: WalletOffline {
         {
             return Ok(TryFailBatchTransferOutcome::Refreshed);
         }
+        // ERA fork: nor an outgoing transfer still Initiated whose TX the indexer knows. A
+        // donation, inflation, burn or link broadcasts in its *_end before the commit that records
+        // it, so a kill in between, or a backup taken before and restored, leaves it Initiated with
+        // its TX on chain: failing it would report as undone a transfer that happened and stop
+        // crediting its change. It is not completed here: calling its *_end again with the signed
+        // PSBT completes it (the broadcast repeats harmlessly). A lookup that fails returns its
+        // error, so nothing is failed.
+        if !batch_transfer.incoming
+            && batch_transfer.status == TransferStatus::Initiated
+            && let Some(txid) = &batch_transfer.txid
+            && self.indexer().get_tx_confirmations(txid)?.is_some()
+        {
+            info!(
+                self.logger(),
+                "TX of an initiated transfer found on-chain, fail denied"
+            );
+            return Ok(TryFailBatchTransferOutcome::Denied);
+        }
         // an outgoing transfer every recipient ACKed has had its TX released: if it's still waiting
         // for the counterparty (e.g. its TX is not broadcast as an invoice has expired) it can only
         // be failed after spending one of the TX inputs (v1.0-changes-spec.md 6.1), which is not
@@ -1320,12 +1338,27 @@ pub trait WalletOnline: WalletOffline {
                 match txn.with_savepoint(|attempt| {
                     self.try_fail_batch_transfer(attempt, batch_transfer, &db_data, false)
                 }) {
+                    // a lookup the indexer fails is skipped too (56e6186; UTEXO's v0.3.0-beta.43-bfa
+                    // skips indexer and network errors here as well)
                     Err(
-                        e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
+                        e @ (Error::ForwarderRefused { .. }
+                        | Error::InvalidForwardTarget { .. }
+                        | Error::Indexer { .. }
+                        | Error::Network { .. }),
                     ) => {
                         warn!(
                             self.logger(),
                             "Not failing batch transfer {}: {e}", batch_transfer.idx
+                        );
+                    }
+                    // (the error unsaid: it can name the indexer's URL, which carries the
+                    // forwarder's session secret in the app)
+                    Err(Error::Indexer { .. } | Error::Network { .. }) => {
+                        drop(attempt);
+                        warn!(
+                            self.logger(),
+                            "Not failing batch transfer {}: the indexer or the network failed",
+                            batch_transfer.idx
                         );
                     }
                     other => {
@@ -4194,7 +4227,14 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         transfers: &[DbTransfer],
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        // ERA fork: a NACK fails the batch, unless its TX is on chain already (a kill between the
+        // broadcast below and the commit of its refresh, and a proxy that answers the next poll
+        // with a NACK): the transfer happened, and completes as beta.8 completes one whose TX a
+        // recipient broadcast. A lookup that fails fails this refresh.
         if transfers.iter().any(|t| t.ack == Some(false)) {
+            if let Some(updated) = self.complete_batch_if_tx_on_chain(txn, batch_transfer)? {
+                return Ok(Some(updated));
+            }
             return Ok(Some(
                 self.fail_batch_transfer(txn, batch_transfer)
                     .map_err(|e| match e {
