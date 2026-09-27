@@ -120,11 +120,16 @@ jobs:
       # panics with "No provider set" when no process-wide CryptoProvider is
       # installed, and otherwise verifies through rustls-platform-verifier,
       # which on Android fails the handshake unless the app initialised it
-      # over JNI. This is a grep, not a type check: an alias such as
-      # `use reqwest::blocking::Client as Http; Http::new()` escapes it.
+      # over JNI. The pattern takes a construction by its path
+      # (RestClient::, reqwest::[blocking::]Client:: or ClientBuilder::,
+      # blocking::Client::) and bare (Client::new, Client::builder,
+      # ClientBuilder::new, as after `use reqwest::blocking::Client;`), and
+      # reqwest's get, called or imported. This is a grep, not a type check:
+      # an alias such as `use reqwest::blocking::Client as Http; Http::new()`
+      # still escapes it.
       - name: HTTP clients only through api::rest_client_builder
         run: |
-          pattern='RestClient::(new|builder|default)|reqwest::(blocking::)?(Client|ClientBuilder)::|reqwest::(blocking::)?get\('
+          pattern='RestClient::(new|builder|default)|reqwest::(blocking::)?(Client|ClientBuilder)::|reqwest::(blocking::)?get([^[:alnum:]_]|$)|reqwest::(blocking::)?\{([^}]*[^[:alnum:]_])?get([^[:alnum:]_]|$)|(^|[^[:alnum:]_:])(blocking::)?(Client|ClientBuilder)::(new|builder|default)|(^|[^[:alnum:]_:])blocking::get\('
           if found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/api/mod.rs'); then
             echo "::error::an HTTP client is built outside api::rest_client_builder; route it through the builder (ERA.md, dependency diet)"
             printf '%s\n' "$found"
@@ -146,11 +151,14 @@ jobs:
       # fine and picks its own route: ProxyClient::new, RejectListClient::new,
       # check_proxy and rust_only::check_proxy_url go direct, and the _routed
       # forms and check_proxy_url_via_forwarder take whatever forwarder their
-      # caller passes, None included. So the step lists every construction
-      # and every call of those checks outside the clients' own files and the
-      # tests, and fails unless it is exactly this set: the three helpers,
-      # upstream's check_proxy (definition, body, test), rust_only's
-      # check_proxy_url (no wallet, so no forwarder) and
+      # caller passes, None included. So the step lists every use of the two
+      # clients' associated functions (any ProxyClient:: or RejectListClient::
+      # path, <ProxyClient>:: included, called or taken as a value) and every
+      # mention of those checks in code (called, taken as a value or
+      # imported; comment lines are left out) outside the clients' own files
+      # and the tests, and fails unless it is exactly this set: the three
+      # helpers, upstream's check_proxy (definition, body, test, import),
+      # rust_only's check_proxy_url (no wallet, so no forwarder) and
       # check_proxy_url_via_forwarder (given one explicitly), with their
       # definitions, and the TLS tests in src/api/mod.rs. A new call site,
       # upstream's or ours, or a second copy of a helper's line changes the
@@ -158,9 +166,10 @@ jobs:
       # escapes it.
       - name: Proxy and reject-list clients only through the wallet's route
         run: |
-          pattern='(ProxyClient|RejectListClient)::new(_routed)?\(|check_proxy(_routed|_url|_url_via_forwarder)?\('
+          pattern='(ProxyClient|RejectListClient)>?::|check_proxy(_routed|_url|_url_via_forwarder)?([^[:alnum:]_]|$)'
           found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/wallet/test/' \
               ':!src/api/proxy.rs' ':!src/api/reject_list.rs' ':!src/api/forwarder.rs' \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
             | sed -E 's/^([^:]+):[0-9]+:[[:space:]]*/\1: /' | LC_ALL=C sort || true)
           expected=(
             'src/wallet/online.rs: ProxyClient::new_routed(proxy_url, self.forwarder())'
@@ -171,6 +180,7 @@ jobs:
             'src/utils.rs: pub(crate) fn check_proxy_routed('
             'src/utils.rs: let proxy_client = ProxyClient::new_routed(proxy_url, forwarder)?;'
             'src/utils.rs: let result = check_proxy(&server.url());'
+            'src/lib.rs: INDEXER_STOP_GAP, OffchainResolver, check_proxy, check_proxy_routed,'
             'src/wallet/rust_only.rs: check_proxy(proxy_url)'
             'src/wallet/rust_only.rs: check_proxy_routed(proxy_url, Some(&forwarder))'
             'src/wallet/rust_only.rs: pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {'
