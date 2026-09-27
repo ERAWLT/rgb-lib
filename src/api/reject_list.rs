@@ -63,18 +63,20 @@ impl RejectListClient {
 
     pub(crate) fn get_reject_list(&self) -> Result<String, Error> {
         // ERA fork: through the forwarder when one is set
-        let request = match &self.forwarder {
-            None => self.client.get(&self.base_url),
-            Some(forwarder) => forwarder
-                .request(
-                    &self.client,
-                    reqwest::Method::GET,
-                    &self.base_url,
-                    FORWARD_KIND_REJECT_LIST,
-                )
-                .map_err(Self::req_err)?,
-        };
-        let resp = request.send().map_err(Self::req_err)?;
+        if let Some(forwarder) = &self.forwarder {
+            return self.get_forwarded(forwarder);
+        }
+        let resp = self
+            .client
+            .get(&self.base_url)
+            .send()
+            .map_err(Self::req_err)?;
+        Self::read_list(resp)
+    }
+
+    /// The reject list in `resp`, refused when it's not one (upstream's checks, shared by the
+    /// direct and the forwarded request).
+    fn read_list(resp: Response) -> Result<String, Error> {
         // an error page (or a redirect, not followed) is not a reject list: taking it as one would
         // make every opout look allowed
         let status = resp.status();
@@ -99,6 +101,32 @@ impl RejectListClient {
             return Err(Self::req_err("reject list is not ASCII"));
         }
         Ok(String::from_utf8(body).expect("ASCII is valid UTF-8"))
+    }
+
+    /// ERA fork: [`Self::get_reject_list`] through `forwarder`, failing closed.
+    ///
+    /// The caller reads the body as the list and skips every line that is not an opout, so any
+    /// answer that is not the list itself (a forwarder refusing the host, an upstream that is
+    /// down, an error page) would validate the asset against an empty list. Only a 2xx answer is
+    /// read as the list; anything else is [`Error::RejectListService`] with the status.
+    fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
+        let response = forwarder
+            .request(
+                &self.client,
+                reqwest::Method::GET,
+                &self.base_url,
+                FORWARD_KIND_REJECT_LIST,
+            )
+            .map_err(Self::req_err)?
+            .send()
+            .map_err(Self::req_err)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::RejectListService {
+                details: format!("HTTP {status} from the forwarder"),
+            });
+        }
+        Self::read_list(response)
     }
 }
 
