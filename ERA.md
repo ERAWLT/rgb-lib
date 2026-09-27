@@ -427,9 +427,12 @@ rgb_lib::wallet::rust_only::check_proxy_url_via_forwarder(proxy_url, forwarder_u
   pause), since the forwarder's port and secret end with the session. Going offline twice is not
   an error. Two things it does not do:
   - **It does not interrupt a call.** It takes `&mut self`, so behind the host's lock it waits
-    for a call already running, and that call may still be sending on the old route: the
-    forwarder must keep the previous session's port bound, answering 503 (or still relaying),
-    until `go_offline` has returned.
+    for a call already running, and rgb-lib cannot cancel one: left alone it runs to its
+    client's timeout (120 s for a proxy request; 10 s per indexer or VSS request, each retried
+    as its client does). So **before calling `go_offline` the host has the forwarder fail every
+    request of the session still in flight** (drop the connection, or answer as for its own
+    failures, [below](#the-forwarders-side)), and the forwarder keeps the port bound, failing
+    new requests the same way, until `go_offline` has returned.
   - **It does not touch VSS.** The VSS client (`configure_vss_backup`) is not online state: an
     auto-backup already uploading goes on, and an operation that changes the wallet while offline
     can start one, to the server URL the client was configured with. A host whose VSS route ends
@@ -565,18 +568,38 @@ decision D7 as amended by the project lead on 2026-09-27:
   reason is a short token of the app's choosing (for example `not-allowlisted`,
   `user-declined`, `consent-expired`) that the app maps to its own message; it is never shown
   raw.
-- **Relay the target's status and body as they came, framed.** Never answer with a 3xx. Send a
-  relayed body with a `Content-Length` or chunked, never ended by closing the connection, and
-  when the upstream body is cut short, abort the response (reset the connection, or end a
-  chunked body without its last chunk) rather than finish it: rgb-lib then sees an error, not a
-  shorter body. For a failure of its own (the backend is down, the target cannot be reached, a
-  pending call is cut short on lock) answer a non-2xx status **without** the refusal headers, for
-  example 503 (never a 200: for a reject list a 200 is the list), and within rgb-lib's timeouts
-  (10 s to connect, 120 s per request): rgb-lib then behaves as for a proxy that is down, and the
-  call can be retried.
-- **Keep the previous session's port bound until `go_offline` has returned**, answering 503
-  (or still relaying): a call running when the session ends finishes on the old route
-  ([above](#what-the-app-calls)).
+- **Relay the target's status and body as they came, framed.** Send a relayed body with a
+  `Content-Length` or chunked, never ended by closing the connection, and when the upstream body
+  is cut short, abort the response (reset the connection, or end a chunked body without its last
+  chunk) rather than finish it: rgb-lib then sees an error, not a shorter body.
+- **Never answer with, follow or relay a 3xx, on every route**: the Esplora route, VSS, the RGB
+  proxy and the reject list alike, in the forwarder and in any backend relay. An upstream 3xx
+  becomes a `502`. rgb-lib's own proxy and reject-list clients do not follow a redirect through
+  the forwarder, but its Esplora client (esplora-client over minreq) and its VSS client
+  (vss-client-ng over bitreq) follow 301, 302, 303 and 307 to any host, resolved through the
+  system's DNS, leaving the forwarder behind: in the review of `era_rgb` a 302 moved 44 indexer
+  requests of one call to another host, and a 307 re-sent a signed VSS POST, its `Authorization`
+  header included, to another host. rgb-lib cannot switch that off in either client
+  ([below](#what-does-not-change-1)); this rule is what holds instead.
+- **Its own failures** (the backend is down, the target cannot be reached, the session is
+  suspended or ending) are answered with neither a 2xx nor the refusal headers (never a 200: for
+  a reject list a 200 is the list), within rgb-lib's timeouts, and with a status that suits each
+  route's client:
+  - **Esplora route: `502`, or drop the connection.** esplora-client retries a 429, 500 or 503
+    (three more times with rgb-lib's settings, waiting 256, 512 and 1024 ms: about 1.8 s per
+    request), and fails at once on a 502, any other status or a broken connection. Timeout: 10 s
+    per request.
+  - **VSS route: `502`, or drop the connection.** vss-client-ng retries every error whatever
+    the status (three attempts, 100 and 200 ms apart, within 5 s), so a dropped connection is the
+    quickest failure. Timeout: 10 s per request.
+  - **RGB proxy: `502`** (any non-2xx without the refusal headers): reqwest does not retry, and
+    rgb-lib reads it as a proxy that is down, which a later call can retry. Timeouts: 10 s to
+    connect, 120 s per request.
+  - **Reject list: `502`** (any non-200): `RejectListService`. Timeouts as for the proxy.
+- **Keep the previous session's port bound until `go_offline` has returned**, failing its
+  requests as above; before the host calls `go_offline`, fail every request of the session still
+  in flight ([above](#what-the-app-calls)): rgb-lib cannot cancel a call, and `go_offline` waits
+  for it.
 - **Relay the Esplora route's TX lookups as the indexer answers them**: an unknown TX gets
   `200 {"confirmed":false}` on `GET /tx/<txid>/status` and `404` on `GET /tx/<txid>/raw`, as
   electrs answers. rgb-lib looks an outgoing transfer's TX up before it fails it
@@ -680,6 +703,25 @@ decision D7 as amended by the project lead on 2026-09-27:
   On the `-bfa` bases, `OnlineOptions::eth_rpc_url` (BFA validation reads an Ethereum
   RPC) is the same kind of host-chosen URL: point it at the forwarder too. The errors of those
   clients are theirs and have not been checked for URLs.
+- **The Esplora and VSS clients follow redirects, and the Esplora one reads a proxy from the
+  environment; rgb-lib cannot switch either off** (checked 2026-09-27, no change made):
+  - esplora-client 0.12.3, used for the indexer (`bdk_esplora`) and the resolver (`rgb-ops`'s
+    `esplora_blocking`), builds each minreq request inside its own methods. Its `Builder` offers
+    a proxy, a timeout, headers and retries, nothing for redirects, and minreq's
+    `with_follow_redirects` / `with_max_redirects` are set per request (default: follow, up to
+    100). Its `blocking` feature turns on minreq's `proxy` feature, which reads `http_proxy`,
+    `https_proxy` / `HTTPS_PROXY` and `all_proxy` / `ALL_PROXY` for every request that names no
+    proxy, and rgb-lib names none (`NO_PROXY` is not read).
+  - vss-client-ng (`ad63805`) builds each bitreq request inside `post_request`; bitreq follows
+    301, 302, 303 (as a GET) and 307, up to a per-request `max_redirects` (100) that `VssClient`
+    gives no way to set, and keeps the request's headers. bitreq's `proxy` feature is not on in
+    this graph, so VSS reads no proxy from the environment.
+
+  Turning either off needs a fork of esplora-client (or minreq) and of vss-client-ng. What holds
+  instead: the forwarder and the backend never emit a 3xx on those routes
+  ([The forwarder's side](#the-forwarders-side)), and **the host does not set `http_proxy`,
+  `https_proxy`, `HTTPS_PROXY`, `all_proxy` or `ALL_PROXY` in its process** (a mobile app's
+  process has none of them unless it sets them itself).
 
 ### Public API the host adapts to
 
