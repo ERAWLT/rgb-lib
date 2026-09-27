@@ -406,10 +406,14 @@ impl VssBackupClient {
     /// Upload a chunked backup for large data
     ///
     /// Each chunk is uploaded in a separate request to avoid sending the entire
-    /// backup in a single HTTP body. The manifest is uploaded last so that a
-    /// partial failure leaves the previous manifest (and thus the previous
-    /// valid backup) intact. Orphaned chunks from a failed partial upload are
-    /// harmlessly overwritten on the next backup attempt.
+    /// backup in a single HTTP body. The manifest is uploaded last.
+    ///
+    /// ERA fork: that does not keep the previous backup. The chunks are written
+    /// under the same keys as the previous backup's (`backup/chunk/<i>`), so an
+    /// upload that stops after its first chunk leaves the previous manifest and
+    /// metadata describing chunks that are no longer all theirs: that backup no
+    /// longer restores (its decryption fails) until an upload completes. Not
+    /// changed here; the upload layout is the host's to settle (ERA.md, section 5).
     async fn upload_chunked(
         &self,
         data: Vec<u8>,
