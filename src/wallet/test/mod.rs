@@ -441,9 +441,9 @@ mod delete_transfers;
 mod drain_to;
 #[cfg(feature = "electrum")]
 mod fail_transfers;
-// ERA fork: OnlineOptions::forwarder_url
 #[cfg(feature = "electrum")]
 mod finalize_psbt;
+// ERA fork: OnlineOptions::forwarder_url
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod forwarder;
 mod get_address;
