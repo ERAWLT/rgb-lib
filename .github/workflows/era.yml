@@ -218,7 +218,8 @@ jobs:
       # ones against a scripted VSS server. The VSS and file backup ones also
       # restore backups an older rev wrote (src/wallet/test/fixtures). The
       # scripted-chain ones fund, issue, send and settle on an in-memory chain
-      # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs).
+      # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs),
+      # and so do the CC-99 ones (unrecorded spends).
       - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets, scripted chain)
         env:
           SKIP_INIT: "1"
@@ -228,7 +229,7 @@ jobs:
           api::forwarder:: wallet::test::forwarder:: wallet::vss::tests::
           wallet::backup::tests::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
-          wallet::test::scripted_chain::
+          wallet::test::scripted_chain:: wallet::test::unrecorded_spends::
 
       - name: Migration crate with its CLI (the authoring binary still builds)
         run: cargo test --locked -p rgb-lib-migration
