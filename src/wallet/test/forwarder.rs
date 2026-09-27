@@ -179,6 +179,11 @@ impl Services {
     /// The proxy request `method` arriving at the forwarder, meant for `target`, refused by it
     /// with `reason`.
     fn expect_refusal(&mut self, target: &str, method: &str, reason: &str) -> Mock {
+        self.expect_refusals(target, method, reason, 1)
+    }
+
+    /// [`Self::expect_refusal`], `hits` times.
+    fn expect_refusals(&mut self, target: &str, method: &str, reason: &str, hits: usize) -> Mock {
         self.forwarder
             .mock("POST", FORWARDER_PATH)
             .match_header(FORWARD_TARGET_HEADER, target)
@@ -190,7 +195,7 @@ impl Services {
             // the forwarder's path, which only the forwarder knows
             .with_header(FORWARD_SESSION_HEADER, FORWARDER_PATH)
             .with_body("refused")
-            .expect(1)
+            .expect(hits)
             .create()
     }
 
@@ -1263,15 +1268,93 @@ fn status_of(wallet: &Wallet, batch_transfer_idx: i32) -> TransferStatus {
         .status
 }
 
+/// What the indexer knows of the TX of [`send_waiting_for_ack`] ([`FAKE_TXID`]).
+#[derive(Clone, Copy, Debug)]
+enum OnChain {
+    /// nothing: not in its mempool, not in a block
+    Unknown,
+    /// in its mempool
+    Mempool,
+    /// in a block
+    Confirmed,
+    /// the lookup fails (a 400: esplora-client does not retry it)
+    Unreachable,
+}
+
+impl Services {
+    /// The indexer answering a lookup of [`FAKE_TXID`] as `state` says (every request of it).
+    fn tx_lookup(&mut self, state: OnChain) -> Vec<Mock> {
+        let status = format!("/tx/{FAKE_TXID}/status");
+        let raw = format!("/tx/{FAKE_TXID}/raw");
+        let unconfirmed = |esplora: &mut ServerGuard| {
+            esplora
+                .mock("GET", status.as_str())
+                .with_body(r#"{"confirmed":false}"#)
+                .expect_at_least(1)
+                .create()
+        };
+        match state {
+            OnChain::Unknown => vec![
+                unconfirmed(&mut self.esplora),
+                self.esplora
+                    .mock("GET", raw.as_str())
+                    .with_status(404)
+                    .expect_at_least(1)
+                    .create(),
+            ],
+            OnChain::Mempool => {
+                let tx = bdk_wallet::bitcoin::Transaction {
+                    version: bdk_wallet::bitcoin::transaction::Version::TWO,
+                    lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                    input: vec![bdk_wallet::bitcoin::TxIn::default()],
+                    output: vec![bdk_wallet::bitcoin::TxOut {
+                        value: bdk_wallet::bitcoin::Amount::from_sat(1000),
+                        script_pubkey: bdk_wallet::bitcoin::ScriptBuf::new(),
+                    }],
+                };
+                vec![
+                    unconfirmed(&mut self.esplora),
+                    self.esplora
+                        .mock("GET", raw.as_str())
+                        .with_body(bdk_wallet::bitcoin::consensus::serialize(&tx))
+                        .expect_at_least(1)
+                        .create(),
+                ]
+            }
+            OnChain::Confirmed => vec![
+                self.esplora
+                    .mock("GET", status.as_str())
+                    .with_body(r#"{"confirmed":true,"block_height":100}"#)
+                    .expect_at_least(1)
+                    .create(),
+                self.esplora
+                    .mock("GET", "/blocks/tip/height")
+                    .with_body("105")
+                    .expect_at_least(1)
+                    .create(),
+            ],
+            OnChain::Unreachable => vec![
+                self.esplora
+                    .mock("GET", status.as_str())
+                    .with_status(400)
+                    .expect_at_least(1)
+                    .create(),
+            ],
+        }
+    }
+}
+
 #[test]
 #[serial(forwarder)]
 fn a_send_the_forwarder_no_longer_carries_can_be_failed() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
     let target = services.target();
+    // its TX is not on chain: nothing was broadcast
+    let lookup = services.tx_lookup(OnChain::Unknown);
 
-    // its ACK poll refused (the user's consent for the recipient's proxy is gone): nothing was
-    // broadcast, so the send can be failed
+    // its ACK poll refused (the user's consent for the recipient's proxy is gone): the send can
+    // be failed
     let refused = send_waiting_for_ack(&wallet, "recipient", &target);
     expire(&wallet, refused);
     let direct = Untouchable::on(&mut services.proxy);
@@ -1300,6 +1383,47 @@ fn a_send_the_forwarder_no_longer_carries_can_be_failed() {
     assert_eq!(status_of(&wallet, unroutable), TransferStatus::Failed);
     never.assert();
     direct.assert();
+    // the indexer was asked, both times
+    lookup.iter().for_each(Mock::assert);
+}
+
+#[test]
+#[serial(forwarder)]
+fn a_refused_send_whose_tx_the_indexer_knows_or_cannot_tell_is_not_failed() {
+    // the DB can say "waiting for ACKs" with the TX on chain: a backup from before the broadcast,
+    // restored, or a kill between the broadcast and the commit of its refresh
+    for state in [OnChain::Mempool, OnChain::Confirmed, OnChain::Unreachable] {
+        let mut services = Services::start();
+        let (mut wallet, online) = services.online_wallet();
+        let target = services.target();
+        let send = send_waiting_for_ack(&wallet, "recipient", &target);
+        expire(&wallet, send);
+        let lookup = services.tx_lookup(state);
+        let direct = Untouchable::on(&mut services.proxy);
+        let refusal = services.expect_refusals(&target, "ack.get", "consent-expired", 2);
+
+        // failing it alone reports the refusal, and the send keeps waiting
+        let result = wallet.fail_transfers(online, Some(send), false, true);
+        assert!(
+            matches!(result, Err(Error::ForwarderRefused { .. })),
+            "{state:?}: {result:?}"
+        );
+        assert_eq!(
+            status_of(&wallet, send),
+            TransferStatus::WaitingCounterparty,
+            "{state:?}"
+        );
+        // failing every expired transfer skips it
+        wallet.fail_transfers(online, None, false, true).unwrap();
+        assert_eq!(
+            status_of(&wallet, send),
+            TransferStatus::WaitingCounterparty,
+            "{state:?}"
+        );
+        refusal.assert();
+        lookup.iter().for_each(Mock::assert);
+        direct.assert();
+    }
 }
 
 #[test]
@@ -1375,6 +1499,8 @@ fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
         .expect(2)
         .create();
     let refusal = services.expect_refusal(&refused_target, "ack.get", "consent-expired");
+    // (the refused send's TX, which the indexer does not know)
+    let lookup = services.tx_lookup(OnChain::Unknown);
     let no_ack = services.expect_rpc(
         &quiet_target,
         "ack.get",
@@ -1401,7 +1527,7 @@ fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
         status_of(&wallet, blocked),
         TransferStatus::WaitingCounterparty
     );
-    for mock in [consignment, nack, refusal, no_ack] {
+    for mock in [consignment, nack, refusal, no_ack].iter().chain(&lookup) {
         mock.assert();
     }
     direct.assert();
