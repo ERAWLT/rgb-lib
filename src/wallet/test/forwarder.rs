@@ -807,7 +807,7 @@ fn a_forwarder_that_is_down_fails_the_request_without_a_fallback() {
     let mut wallet = get_test_wallet(false, None);
     // nothing listens on port 1
     let online = wallet
-        .go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .go_online(services.options(Some(s!("http://127.0.0.1:1/session/rgb"))))
         .unwrap();
     let (_, transfer) = receive(&mut wallet, &endpoint);
     let direct = Untouchable::on(&mut services.proxy);
@@ -934,7 +934,7 @@ fn send_begin_keeps_todays_error_when_the_forwarder_is_down() {
     let mut wallet = get_test_wallet(false, None);
     // nothing listens on port 1
     let online = wallet
-        .go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .go_online(services.options(Some(s!("http://127.0.0.1:1/session/rgb"))))
         .unwrap();
     let asset_id = asset_in_db(&wallet);
     let invoice = invoice_on(&[services.endpoint()]);
@@ -973,7 +973,7 @@ fn send_end_reports_the_forwarders_refusal() {
 
     // a forwarder that is down: the error of today
     let mut down = get_test_wallet(false, None);
-    down.go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+    down.go_online(services.options(Some(s!("http://127.0.0.1:1/session/rgb"))))
         .unwrap();
     let mut inputs = SendEndInputs::new(&down, &target);
     assert_eq!(
@@ -1294,6 +1294,36 @@ fn a_nack_that_meets_an_ack_fails_the_receive_and_says_so() {
 
 #[test]
 #[serial(forwarder)]
+fn a_refusal_without_the_session_echo_is_in_the_wallet_log() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let target = services.target();
+    let send = send_waiting_for_ack(&wallet, "recipient", &target);
+    // the refusal of a forwarder that does not echo its path
+    let refusal = services
+        .forwarder
+        .mock("POST", FORWARDER_PATH)
+        .with_status(403)
+        .with_header(FORWARD_REFUSED_HEADER, "not-allowlisted")
+        .expect(1)
+        .create();
+    let result = wallet.refresh(online, None, vec![], true).unwrap();
+    // read as the proxy's answer, which is not JSON-RPC: what an outage looks like
+    assert!(
+        matches!(result[&send].failure, Some(Error::Proxy { .. })),
+        "{result:?}"
+    );
+    refusal.assert();
+    // the wallet's log says why, and never names the forwarder's path
+    let log = wallet.get_wallet_dir().join(crate::utils::LOG_FILE);
+    drop(wallet);
+    let log = fs::read_to_string(log).unwrap();
+    assert!(log.contains(FORWARD_SESSION_HEADER), "{log}");
+    assert!(!log.contains(&FORWARDER_PATH[1..]), "{log}");
+}
+
+#[test]
+#[serial(forwarder)]
 fn a_refusal_reason_is_never_read_as_the_proxys_answer() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -1593,7 +1623,7 @@ fn an_outage_still_keeps_a_send_from_failing() {
     let mut wallet = get_test_wallet(false, None);
     // nothing listens on port 1
     let online = wallet
-        .go_online(services.options(Some(s!("http://127.0.0.1:1"))))
+        .go_online(services.options(Some(s!("http://127.0.0.1:1/session/rgb"))))
         .unwrap();
     let send = send_waiting_for_ack(&wallet, "recipient", &services.target());
     expire(&wallet, send);

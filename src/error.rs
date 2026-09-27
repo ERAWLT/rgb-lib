@@ -127,8 +127,8 @@ pub enum Error {
     FingerprintMismatch,
 
     /// ERA fork: the forwarder of `OnlineOptions::forwarder_url` refused to carry a request
-    /// (status 403 with an `X-Era-Forward-Refused` header and, when the forwarder's URL has a
-    /// path, an `X-Era-Forward-Session` header naming it).
+    /// (status 403 with an `X-Era-Forward-Refused` header and an `X-Era-Forward-Session` header
+    /// naming the path of the forwarder's URL).
     ///
     /// This is the forwarder's policy speaking, not the target: the same request gets the same
     /// answer until something changes on the forwarder's side (its allowlist, a user's consent).
@@ -451,7 +451,8 @@ pub enum Error {
         details: String,
     },
 
-    /// The provided forwarder URL is invalid (it must be plain http to a loopback IP literal)
+    /// The provided forwarder URL is invalid (it must be plain http to a loopback IP literal, with
+    /// a path)
     #[error("Invalid forwarder URL: {details}")]
     InvalidForwarderUrl {
         /// Error details

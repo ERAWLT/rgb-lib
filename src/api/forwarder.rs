@@ -10,9 +10,9 @@
 //! is not sent at all ([`Error::InvalidForwardTarget`]). Invoices, stored transport endpoints and
 //! everything else rgb-lib shows keep the real URL. `ERA.md` spells the contract out.
 //!
-//! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`] (and, when
-//! its URL has a path, [`FORWARD_SESSION_HEADER`] echoing it), and the clients report
-//! [`Error::ForwarderRefused`]; any other answer is read as the target's.
+//! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`] and
+//! [`FORWARD_SESSION_HEADER`] echoing the path of its URL (which holds the session's secret), and
+//! the clients report [`Error::ForwarderRefused`]; any other answer is read as the target's.
 //!
 //! Without a forwarder the clients behave as upstream: the same client configuration, the same
 //! requests, no extra header.
@@ -36,13 +36,23 @@ pub(crate) const FORWARD_SESSION_HEADER: &str = "x-era-forward-session";
 /// The longest refusal reason kept, in characters.
 const MAX_REFUSAL_REASON: usize = 256;
 
-/// A validated forwarder URL: plain `http` to a loopback IP literal.
+/// A validated forwarder URL: plain `http` to a loopback IP literal, with a path.
 ///
 /// `pub` like [`ProxyClient`]: the `api` module is crate-private, so this is not public API, but
 /// `WalletOnline` (a supertrait of a public trait) returns it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Forwarder {
     url: Url,
+    // where a refusal that fails its check is reported (the wallet's log), if anywhere
+    logger: Option<Logger>,
+}
+
+impl std::fmt::Debug for Forwarder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forwarder")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Forwarder {
@@ -51,8 +61,10 @@ impl Forwarder {
     /// The forwarder has to be on this device: requests to it carry consignments and ACKs in the
     /// clear, and TLS to the real host is its job. So the scheme is `http`, the host a loopback
     /// IP literal (`127.0.0.0/8` or `::1`; not `localhost`, whose resolution rgb-lib does not
-    /// control), with no credentials, query or fragment. A path is allowed; requests are sent to
-    /// the URL as given, nothing is appended to it.
+    /// control), with no credentials, query or fragment. A path is required: it holds the
+    /// session's secret, which tells rgb-lib's requests from another app's (a loopback port is
+    /// open to every app on the device) and authenticates the forwarder's refusals
+    /// ([`Self::refusal`]). Requests are sent to the URL as given, nothing is appended to it.
     pub(crate) fn new(forwarder_url: &str) -> Result<Self, Error> {
         let invalid = |details: String| Error::InvalidForwarderUrl { details };
         let url = Url::parse(forwarder_url).map_err(|e| invalid(e.to_string()))?;
@@ -81,7 +93,18 @@ impl Forwarder {
         if url.query().is_some() || url.fragment().is_some() {
             return Err(invalid(s!("a query or a fragment is not allowed")));
         }
-        Ok(Self { url })
+        if url.path() == "/" {
+            return Err(invalid(s!(
+                "a path is required (the forwarder session's secret)"
+            )));
+        }
+        Ok(Self { url, logger: None })
+    }
+
+    /// This forwarder, reporting a refusal that fails its check ([`Self::refusal`]) to `logger`.
+    pub(crate) fn with_logger(mut self, logger: Logger) -> Self {
+        self.logger = Some(logger);
+        self
     }
 
     /// The client for requests to this forwarder: rgb-lib's usual builder and timeouts, plus no
@@ -156,14 +179,16 @@ impl Forwarder {
     }
 
     /// The forwarder's refusal of a request meant for `target`, if `response` is one: status 403
-    /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason, and, when the
-    /// forwarder's URL has a path, [`FORWARD_SESSION_HEADER`] naming that path exactly. Anything
-    /// else is the target's answer or the forwarder failing, and the caller reads it as it would
-    /// read the target's own answer.
+    /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason, and
+    /// [`FORWARD_SESSION_HEADER`] naming the path of the forwarder's URL exactly. Anything else is
+    /// the target's answer or the forwarder failing, and the caller reads it as it would read the
+    /// target's own answer.
     ///
     /// A target's answer relayed with its headers could carry a refusal header of its own
     /// making; it cannot carry the path, which holds the session's secret and never leaves the
-    /// device. A forwarder at the root has no path to echo, and its refusals go unchecked.
+    /// device. A refusal header without the path is logged (without the path): it is a forwarder
+    /// that does not echo its path, or one that relays a target's headers, and either turns every
+    /// refusal into what reads as an outage.
     pub(crate) fn refusal(
         &self,
         response: &reqwest::blocking::Response,
@@ -173,14 +198,20 @@ impl Forwarder {
             return None;
         }
         let reason = response.headers().get(FORWARD_REFUSED_HEADER)?;
-        let path = self.url.path();
-        if path != "/"
-            && response
-                .headers()
-                .get(FORWARD_SESSION_HEADER)
-                .map(|echo| echo.as_bytes())
-                != Some(path.as_bytes())
+        if response
+            .headers()
+            .get(FORWARD_SESSION_HEADER)
+            .map(|echo| echo.as_bytes())
+            != Some(self.url.path().as_bytes())
         {
+            if let Some(logger) = &self.logger {
+                warn!(
+                    logger,
+                    "A 403 with {FORWARD_REFUSED_HEADER} came without this forwarder session's \
+                     {FORWARD_SESSION_HEADER}; read as the target's answer (the forwarder must \
+                     echo its path on its refusals and strip those headers from relayed answers)"
+                );
+            }
             return None;
         }
         Some(Error::ForwarderRefused {
@@ -210,9 +241,16 @@ pub(crate) mod tests {
     use super::*;
 
     const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":null,"result":true,"error":null}"#;
+    // the path of the forwarder's URL in these tests (the session's secret in the app)
+    const FWD_PATH: &str = "/session-6c1f0e/rgb";
+
+    /// The URL of a forwarder on `server`.
+    fn forwarder_url(server: &ServerGuard) -> String {
+        format!("{}{FWD_PATH}", server.url())
+    }
 
     fn forwarder(server: &ServerGuard) -> Forwarder {
-        Forwarder::new(&server.url()).unwrap()
+        Forwarder::new(&forwarder_url(server)).unwrap()
     }
 
     /// Catch-all mocks for the two methods rgb-lib's clients use (POST for the proxy, GET for
@@ -255,7 +293,7 @@ pub(crate) mod tests {
         result: serde_json::Value,
     ) -> mockito::Mock {
         server
-            .mock("POST", "/")
+            .mock("POST", FWD_PATH)
             .match_header(FORWARD_TARGET_HEADER, target)
             .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_RGB_PROXY)
             .match_header("content-type", JSON)
@@ -271,7 +309,7 @@ pub(crate) mod tests {
     /// A forwarder route for one multipart method meant for `target`.
     fn forwarded_multipart(server: &mut ServerGuard, target: &str, method: &str) -> mockito::Mock {
         server
-            .mock("POST", "/")
+            .mock("POST", FWD_PATH)
             .match_header(FORWARD_TARGET_HEADER, target)
             .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_RGB_PROXY)
             .match_header(
@@ -291,15 +329,19 @@ pub(crate) mod tests {
     #[serial(forwarder)]
     fn accepts_loopback_http_only() {
         for ok in [
-            "http://127.0.0.1:8080",
-            "http://127.0.0.1:8080/",
+            "http://127.0.0.1:8080/6c1f0e/rgb",
             "http://127.1.2.3:1/rgb/proxy",
             "http://[::1]:8080/rgb",
-            "http://127.0.0.1",
+            "http://127.0.0.1/s",
+            "http://127.0.0.1:8080//",
         ] {
             assert!(Forwarder::new(ok).is_ok(), "{ok} should be accepted");
         }
         for bad in [
+            // no path: nothing to tell rgb-lib from another app, or to authenticate a refusal
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/",
+            "http://127.0.0.1",
             "",
             "127.0.0.1:8080",
             "https://127.0.0.1:8080",
@@ -470,7 +512,7 @@ pub(crate) mod tests {
             ));
             refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
                 target,
-                &fwd.url(),
+                &forwarder_url(&fwd),
             ));
             let reject = RejectListClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
             refused(reject.get_reject_list().map(|_| ()));
@@ -497,7 +539,8 @@ pub(crate) mod tests {
             // the protocol version rgb-lib requires (utils::PROXY_PROTOCOL_VERSION)
             json!({"protocol_version": "0.2", "version": "x", "uptime": 1}),
         );
-        crate::wallet::rust_only::check_proxy_url_via_forwarder(&target, &fwd.url()).unwrap();
+        crate::wallet::rust_only::check_proxy_url_via_forwarder(&target, &forwarder_url(&fwd))
+            .unwrap();
         info.assert();
         direct.assert();
 
@@ -519,7 +562,7 @@ pub(crate) mod tests {
             Opout::new(rgbstd::OpId::from([1u8; 32]), OS_ASSET, 0)
         );
         let list = fwd
-            .mock("GET", "/")
+            .mock("GET", FWD_PATH)
             .match_header(FORWARD_TARGET_HEADER, target.as_str())
             .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
             .with_body(&body)
@@ -542,7 +585,7 @@ pub(crate) mod tests {
         for status in [403, 503, 404, 500, 307, 203, 204, 206] {
             let mut fwd = Server::new();
             let answer = fwd
-                .mock("GET", "/")
+                .mock("GET", FWD_PATH)
                 .match_header(FORWARD_TARGET_HEADER, target.as_str())
                 .match_header(FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST)
                 .with_status(status)
@@ -582,7 +625,11 @@ pub(crate) mod tests {
             (s!("line one\nline two\n"), false),
         ] {
             let mut fwd = Server::new();
-            let answer = fwd.mock("GET", "/").with_body(&body).expect(1).create();
+            let answer = fwd
+                .mock("GET", FWD_PATH)
+                .with_body(&body)
+                .expect(1)
+                .create();
             let client = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
             let result = client.get_reject_list();
             if list {
@@ -698,7 +745,7 @@ pub(crate) mod tests {
         let direct = untouchable(&mut proxy);
 
         // nothing listening
-        let closed = Forwarder::new("http://127.0.0.1:1").unwrap();
+        let closed = Forwarder::new("http://127.0.0.1:1/session/rgb").unwrap();
         let client = ProxyClient::new_routed(&target, Some(&closed)).unwrap();
         assert_matches!(client.get_info(), Err(Error::Proxy { .. }));
         assert_matches!(client.post_ack("rid", true), Err(Error::Proxy { .. }));
@@ -715,7 +762,7 @@ pub(crate) mod tests {
         // a forwarder answering with a redirect to the real proxy is not followed
         let mut fwd = Server::new();
         let redirect = fwd
-            .mock("POST", "/")
+            .mock("POST", FWD_PATH)
             .with_status(307)
             .with_header("location", &target)
             .expect(1)
@@ -726,7 +773,11 @@ pub(crate) mod tests {
 
         // a 403 without the refusal header is not a refusal: an error like a proxy that is down
         let mut fwd = Server::new();
-        let forbidden = fwd.mock("POST", "/").with_status(403).expect(1).create();
+        let forbidden = fwd
+            .mock("POST", FWD_PATH)
+            .with_status(403)
+            .expect(1)
+            .create();
         let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
         assert_matches!(client.get_consignment("rid"), Err(Error::Proxy { .. }));
         forbidden.assert();
@@ -734,13 +785,16 @@ pub(crate) mod tests {
         direct.assert();
     }
 
-    /// A forwarder answering every request with `status` and, if given, the refusal header.
+    /// A forwarder answering every request with `status` and, if given, the refusal header (and
+    /// its session echo).
     fn answering(status: usize, refusal: Option<&str>) -> (ServerGuard, [mockito::Mock; 2]) {
         let mut fwd = Server::new();
         let mocks = ["POST", "GET"].map(|method| {
             let mock = fwd.mock(method, Matcher::Any).with_status(status);
             match refusal {
-                Some(reason) => mock.with_header(FORWARD_REFUSED_HEADER, reason),
+                Some(reason) => mock
+                    .with_header(FORWARD_REFUSED_HEADER, reason)
+                    .with_header(FORWARD_SESSION_HEADER, FWD_PATH),
                 None => mock,
             }
             .with_body("refused by policy")
@@ -786,7 +840,7 @@ pub(crate) mod tests {
         ));
         refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
             &target,
-            &fwd.url(),
+            &forwarder_url(&fwd),
         ));
         direct.assert();
 
@@ -851,6 +905,60 @@ pub(crate) mod tests {
                     "{echo:?}: {list:?}"
                 );
             }
+        }
+        direct.assert();
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn a_refusal_without_the_echo_is_logged_without_the_path() {
+        // a forwarder that does not echo its path, or relays a target's refusal header, would
+        // otherwise turn every refusal into what reads as an outage, and say nothing
+        let mut proxy = Server::new();
+        let target = format!("{}/json-rpc", proxy.url());
+        let direct = untouchable(&mut proxy);
+        let dir = tempfile::tempdir().unwrap();
+        for (n, (echo, logged)) in [
+            (None, true),
+            (Some("/another-session/rgb"), true),
+            (Some(FWD_PATH), false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fwd = Server::new();
+            let answer = fwd
+                .mock("POST", FWD_PATH)
+                .with_status(403)
+                .with_header(FORWARD_REFUSED_HEADER, "not-allowlisted");
+            let answer = match echo {
+                Some(echo) => answer.with_header(FORWARD_SESSION_HEADER, echo),
+                None => answer,
+            }
+            .expect(1)
+            .create();
+            let log_name = format!("log-{n}");
+            let (logger, guard) = crate::utils::setup_logger(dir.path(), Some(&log_name)).unwrap();
+            let client =
+                ProxyClient::new_routed(&target, Some(&forwarder(&fwd).with_logger(logger)))
+                    .unwrap();
+            let result = client.get_ack("rid");
+            assert_eq!(
+                matches!(result, Err(Error::ForwarderRefused { .. })),
+                !logged,
+                "{echo:?}: {result:?}"
+            );
+            drop(client);
+            // flushed
+            drop(guard);
+            let log = fs::read_to_string(dir.path().join(&log_name)).unwrap();
+            assert_eq!(
+                log.contains(FORWARD_SESSION_HEADER),
+                logged,
+                "{echo:?}: {log}"
+            );
+            assert!(!log.contains(&FWD_PATH[1..]), "{log}");
+            answer.assert();
         }
         direct.assert();
     }

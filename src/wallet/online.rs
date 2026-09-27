@@ -777,7 +777,7 @@ pub trait WalletOnline: WalletOffline {
         let forwarder = match online_options
             .forwarder_url
             .as_deref()
-            .map(Forwarder::new)
+            .map(|url| Forwarder::new(url).map(|f| f.with_logger(self.logger().clone())))
             .transpose()
         {
             Ok(forwarder) => forwarder,

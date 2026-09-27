@@ -99,17 +99,17 @@ pub struct OnlineOptions {
     /// doing an automatic FastSync for the vanilla keychain
     pub vanilla_sync_lookback: u32,
     /// ERA fork: URL of a loopback HTTP forwarder that carries every RGB proxy and reject-list
-    /// request this wallet makes while online (`http://` to `127.0.0.0/8` or `[::1]`, optionally
-    /// with a path, which may hold a per-session secret: a loopback port is open to every app on
-    /// the device).
+    /// request this wallet makes while online (`http://` to `127.0.0.0/8` or `[::1]`, with a path
+    /// that holds a per-session secret: a loopback port is open to every app on the device, and
+    /// the path also authenticates the forwarder's refusals; a URL without a path is refused).
     ///
     /// Each request is sent to this URL instead of the endpoint it is meant for, unchanged
     /// otherwise, and names that endpoint in the `X-Era-Forward-Target` header (an absolute
     /// `https://` URL for an `rpcs://` transport endpoint, `http://` for `rpc://`) and the service
     /// in `X-Era-Forward-Kind` (`rgb-proxy` or `reject-list`). An endpoint with userinfo or a
     /// fragment is not requested at all ([`Error::InvalidForwardTarget`]). A 403 answer with an
-    /// `X-Era-Forward-Refused` header and, when this URL has a path, an `X-Era-Forward-Session`
-    /// header naming the path is the forwarder's refusal ([`Error::ForwarderRefused`]), and a
+    /// `X-Era-Forward-Refused` header and an `X-Era-Forward-Session` header naming this URL's
+    /// path is the forwarder's refusal ([`Error::ForwarderRefused`]), and a
     /// reject list is read only from a 200 answer that is empty or holds an opout. Invoices and
     /// the transport endpoints stored with transfers keep the real endpoints. There is no
     /// fallback to a direct connection, redirects are not followed, and no error names this URL.
