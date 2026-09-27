@@ -741,5 +741,8 @@ mod sign_psbt;
 mod sync;
 #[cfg(feature = "electrum")]
 mod validate_consignment;
+// ERA fork: CC-99 (era_beta8_pending: runs on the scripted chain)
+#[cfg(all(feature = "esplora", era_beta8_pending))]
+mod unrecorded_spends;
 #[cfg(feature = "electrum")]
 mod witness_receive;
