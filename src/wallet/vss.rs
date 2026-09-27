@@ -119,11 +119,28 @@ impl VssEncryptionMetadata {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
         })?;
-        bytes[0..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| Error::Internal {
+        // ERA fork: a shorter nonce is an error, not a panic (it can come from a VSS server)
+        bytes
+            .get(..BACKUP_NONCE_LENGTH)
+            .and_then(|prefix| prefix.try_into().ok())
+            .ok_or_else(|| Error::Internal {
                 details: "Invalid nonce length".to_string(),
             })
+    }
+
+    /// ERA fork: `Ok` for metadata as [`Self::new`] makes it (a salt of `BACKUP_SALT_LENGTH`
+    /// bytes, a nonce of `BACKUP_NONCE_LENGTH`, both hex), which is all a restore takes from a
+    /// server: anything else is not rgb-lib's.
+    fn check(&self) -> Result<(), Error> {
+        let length = |hex_value: &str| hex::decode(hex_value).map(|bytes| bytes.len()).ok();
+        if length(&self.salt) != Some(BACKUP_SALT_LENGTH)
+            || length(&self.nonce) != Some(BACKUP_NONCE_LENGTH)
+        {
+            return Err(Error::VssError {
+                details: "the backup's encryption metadata is malformed".to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -500,13 +517,19 @@ impl VssBackupClient {
 
     /// ERA fork: [`Self::download_backup`] by a manifest the caller read, so a caller that also
     /// acts on the manifest acts on the same answer the download followed.
+    ///
+    /// The manifest is checked before anything is downloaded ([`check_manifest`]), no buffer is
+    /// sized by its numbers, and what is downloaded must add up to its `total_size` exactly; an
+    /// encrypted backup's metadata must be as rgb-lib writes it.
     pub(crate) async fn download_backup_with(
         &self,
         manifest: &BackupManifest,
     ) -> Result<Vec<u8>, Error> {
+        check_manifest(manifest)?;
+
         // Download the raw data
         let raw_data = if manifest.chunk_count == 1 {
-            self.download_single().await?
+            self.download_single(manifest).await?
         } else {
             self.download_chunked(manifest).await?
         };
@@ -514,6 +537,7 @@ impl VssBackupClient {
         // Decrypt if the backup was encrypted
         if manifest.encrypted {
             let metadata = self.get_encryption_metadata().await?;
+            metadata.check()?;
             decrypt_data(&raw_data, &self.signing_key, &metadata, None)
         } else {
             Ok(raw_data)
@@ -521,7 +545,7 @@ impl VssBackupClient {
     }
 
     /// Download a single backup (non-chunked)
-    async fn download_single(&self) -> Result<Vec<u8>, Error> {
+    async fn download_single(&self, manifest: &BackupManifest) -> Result<Vec<u8>, Error> {
         let request = GetObjectRequest {
             store_id: self.store_id.clone(),
             key: BACKUP_KEY_DATA.to_string(),
@@ -533,15 +557,21 @@ impl VssBackupClient {
             .await
             .map_err(vss_error_to_rgb_error)?;
 
-        response
+        let data = response
             .value
             .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)
+            .ok_or(Error::VssBackupNotFound)?;
+        // ERA fork: the manifest says how much there is
+        if data.len() != manifest.total_size {
+            return Err(backup_size_mismatch());
+        }
+        Ok(data)
     }
 
     /// Download a chunked backup
     async fn download_chunked(&self, manifest: &BackupManifest) -> Result<Vec<u8>, Error> {
-        let mut data = Vec::with_capacity(manifest.total_size);
+        // ERA fork: not sized by the manifest's numbers (a server's), and never past its total
+        let mut data = Vec::new();
 
         for i in 0..manifest.chunk_count {
             let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
@@ -561,9 +591,15 @@ impl VssBackupClient {
                 .map(|kv| kv.value)
                 .ok_or(Error::VssBackupNotFound)?;
 
+            if chunk.is_empty() || chunk.len() > manifest.total_size - data.len() {
+                return Err(backup_size_mismatch());
+            }
             data.extend(chunk);
         }
 
+        if data.len() != manifest.total_size {
+            return Err(backup_size_mismatch());
+        }
         Ok(data)
     }
 
@@ -907,6 +943,39 @@ pub fn decrypt_data(
     }
 
     Ok(decrypted)
+}
+
+/// ERA fork: the largest backup a restore downloads, in bytes (as stored: encrypted, or sanitized
+/// plaintext). A wallet backup is a few megabytes; the cap keeps a server's manifest from making
+/// the restore hold more than this in memory, and each response is capped at 1 GiB by vss-client
+/// itself.
+pub(crate) const MAX_VSS_BACKUP_SIZE: usize = 256 * 1024 * 1024;
+
+/// ERA fork: `Ok` if `manifest` describes a backup rgb-lib could have uploaded and a restore will
+/// download: between one byte and [`MAX_VSS_BACKUP_SIZE`], in no more chunks than bytes (an upload
+/// never stores an empty chunk; no chunk at all adds up to nothing, which the download refuses).
+/// Its numbers come from the server.
+fn check_manifest(manifest: &BackupManifest) -> Result<(), Error> {
+    if manifest.total_size == 0
+        || manifest.total_size > MAX_VSS_BACKUP_SIZE
+        || manifest.chunk_count > manifest.total_size
+    {
+        return Err(Error::VssError {
+            details: format!(
+                "the backup manifest describes no backup a restore takes ({} bytes in {} chunks, \
+                 at most {MAX_VSS_BACKUP_SIZE} bytes)",
+                manifest.total_size, manifest.chunk_count
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// ERA fork: what the server holds does not add up to its manifest's `total_size`.
+fn backup_size_mismatch() -> Error {
+    Error::VssError {
+        details: "the backup's size is not the one its manifest gives".to_string(),
+    }
 }
 
 /// Convert VSS error to RGB-lib error
@@ -2120,5 +2189,171 @@ mod tests {
         let restored = restore(config(&server, key), &target, None).unwrap();
         assert!(restored.join("some_file.txt").is_file());
         assert_eq!(server.reads(BACKUP_KEY_MANIFEST), 1);
+    }
+
+    // ERA fork: what a server writes into the manifest and the encryption metadata cannot crash a
+    // restore, size its buffers, or make it take more or less than the manifest says
+
+    fn chunked_manifest(encrypted: bool, chunk_count: usize, total_size: usize) -> Vec<u8> {
+        serde_json::to_vec(&BackupManifest {
+            chunk_count,
+            total_size,
+            encrypted,
+            version: VSS_BACKUP_VERSION,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_encryption_metadata_is_an_error() {
+        let key = test_signing_key();
+        let [manifest, data, _] = uploaded(EXPECTED, &key, true);
+        let good = VssEncryptionMetadata::new();
+        for metadata in [
+            // a nonce shorter than 19 bytes panicked
+            serde_json::json!({"salt": good.salt, "nonce": "00", "version": 1}),
+            serde_json::json!({"salt": good.salt, "nonce": "", "version": 1}),
+            serde_json::json!({"salt": good.salt, "nonce": format!("{}00", good.nonce), "version": 1}),
+            serde_json::json!({"salt": "00", "nonce": good.nonce, "version": 1}),
+            serde_json::json!({"salt": good.salt, "nonce": "zz", "version": 1}),
+        ] {
+            let server = VssScript::start(vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
+                (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+                (
+                    BACKUP_KEY_METADATA,
+                    vec![serde_json::to_vec(&metadata).unwrap()],
+                ),
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(
+                matches!(result, Err(Error::VssError { .. })),
+                "{metadata}: {result:?}"
+            );
+            assert!(!target.join(EXPECTED).exists());
+        }
+        // nor does the short nonce panic the public helpers
+        let short = VssEncryptionMetadata {
+            salt: good.salt.clone(),
+            nonce: "00".to_string(),
+            version: VSS_BACKUP_VERSION,
+        };
+        assert!(encrypt_data(b"data", &key, &short, None).is_err());
+        assert!(decrypt_data(&[0u8; 32], &key, &short, None).is_err());
+    }
+
+    #[test]
+    fn a_manifest_no_upload_could_write_is_refused_before_any_download() {
+        let key = test_signing_key();
+        let [_, data, metadata] = uploaded(EXPECTED, &key, true);
+        for (chunk_count, total_size) in [
+            // Vec::with_capacity(total_size) panicked on this one, and a large valid size aborted
+            (2, usize::MAX),
+            (1, MAX_VSS_BACKUP_SIZE + 1),
+            (0, 0),
+            (0, data.len()),
+            (1, 0),
+            (3, 2),
+        ] {
+            let server = VssScript::start(vec![
+                (
+                    BACKUP_KEY_MANIFEST,
+                    vec![chunked_manifest(true, chunk_count, total_size)],
+                ),
+                (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+                ("backup/chunk/0", vec![data.clone()]),
+                (BACKUP_KEY_METADATA, vec![metadata.clone()]),
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(
+                matches!(result, Err(Error::VssError { .. })),
+                "{chunk_count} chunks, {total_size} bytes: {result:?}"
+            );
+            // none of the backup asked for
+            assert_eq!(
+                server.reads(BACKUP_KEY_DATA) + server.reads("backup/chunk/0"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn data_that_does_not_add_up_to_its_manifest_is_refused() {
+        let key = test_signing_key();
+        let [_, data, metadata] = uploaded(EXPECTED, &key, true);
+        let half = data.len() / 2;
+        let restored = |answers: Vec<(&str, Vec<Vec<u8>>)>| {
+            let mut answers = answers;
+            answers.push((BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]));
+            answers.push((BACKUP_KEY_METADATA, vec![metadata.clone()]));
+            let server = VssScript::start(answers);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, Some(EXPECTED))
+                // (checked here: the directory goes with root)
+                .map(|wallet_dir| wallet_dir.join("some_file.txt").is_file());
+            let chunk_reads: Vec<usize> = (0..3)
+                .map(|i| server.reads(&format!("{BACKUP_KEY_CHUNK_PREFIX}{i}")))
+                .collect();
+            (result, chunk_reads)
+        };
+
+        // one chunk, not the size the manifest gives
+        for total_size in [data.len() + 1, data.len() - 1] {
+            let (result, _) = restored(vec![
+                (
+                    BACKUP_KEY_MANIFEST,
+                    vec![chunked_manifest(true, 1, total_size)],
+                ),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+            ]);
+            assert!(
+                matches!(result, Err(Error::VssError { .. })),
+                "{total_size}: {result:?}"
+            );
+        }
+
+        // chunks, as an upload splits a larger backup: restored
+        let manifest = chunked_manifest(true, 2, data.len());
+        let (result, reads) = restored(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
+            ("backup/chunk/0", vec![data[..half].to_vec()]),
+            ("backup/chunk/1", vec![data[half..].to_vec()]),
+        ]);
+        assert!(result.unwrap());
+        assert_eq!(reads, [1, 1, 0]);
+
+        // chunks adding up to more (stopped at the chunk that goes past: of three, the third is
+        // never read), to fewer, or an empty one
+        let mut longer = data[half..].to_vec();
+        longer.push(0);
+        for (chunk_count, chunks, expected_reads) in [
+            (2, vec![data[..half].to_vec(), longer], [1, 1, 0]),
+            (
+                2,
+                vec![data[..half].to_vec(), data[half..data.len() - 1].to_vec()],
+                [1, 1, 0],
+            ),
+            (3, vec![data.clone(), vec![0], vec![0]], [1, 1, 0]),
+            (2, vec![vec![], data.clone()], [1, 0, 0]),
+        ] {
+            let mut answers = vec![(
+                BACKUP_KEY_MANIFEST,
+                vec![chunked_manifest(true, chunk_count, data.len())],
+            )];
+            let keys = ["backup/chunk/0", "backup/chunk/1", "backup/chunk/2"];
+            for (key, chunk) in keys.into_iter().zip(chunks) {
+                answers.push((key, vec![chunk]));
+            }
+            let (result, reads) = restored(answers);
+            assert!(matches!(result, Err(Error::VssError { .. })), "{result:?}");
+            assert_eq!(reads, expected_reads);
+        }
     }
 }

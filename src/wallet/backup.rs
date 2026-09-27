@@ -60,10 +60,12 @@ pub(crate) struct BackupPubData {
 
 impl BackupPubData {
     fn nonce(&self) -> Result<[u8; BACKUP_NONCE_LENGTH], InternalError> {
-        let nonce_bytes = self.nonce.as_bytes();
-        nonce_bytes[0..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| InternalError::Unexpected)
+        // ERA fork: a shorter nonce (a damaged or crafted backup file) is an error, not a panic
+        self.nonce
+            .as_bytes()
+            .get(..BACKUP_NONCE_LENGTH)
+            .and_then(|prefix| prefix.try_into().ok())
+            .ok_or(InternalError::Unexpected)
     }
 }
 
@@ -846,5 +848,28 @@ mod tests {
             dir_listing(&target, &fingerprint),
             fs::read_to_string(fixtures.join("file_backup_listing.txt")).unwrap()
         );
+    }
+
+    #[test]
+    fn a_backup_file_with_a_short_nonce_is_an_error() {
+        // restore_backup sliced the nonce of the file's public data, and panicked on a short one
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let mut short = pub_data();
+        short.nonce = s!("short");
+        fs::write(
+            staging.join("backup.pub_data"),
+            serde_json::to_string(&short).unwrap(),
+        )
+        .unwrap();
+        fs::write(staging.join("backup.enc"), [0u8; 64]).unwrap();
+        let backup = dir.path().join("seal").join("backup");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        let logger = Logger::root(slog::Discard, o!());
+        zip_dir(&staging, &backup, false, &logger).unwrap();
+        let target = dir.path().join("data");
+        let result = restore_backup(backup.to_str().unwrap(), PASSWORD, target.to_str().unwrap());
+        assert!(matches!(result, Err(Error::Internal { .. })), "{result:?}");
     }
 }
