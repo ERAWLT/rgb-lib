@@ -176,6 +176,8 @@ impl Forwarder {
 pub(crate) mod tests {
     use mockito::{Matcher, Server, ServerGuard};
     use serde_json::json;
+    // one at a time, with wallet::test::forwarder: see there
+    use serial_test::serial;
 
     use super::*;
 
@@ -258,6 +260,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn accepts_loopback_http_only() {
         for ok in [
             "http://127.0.0.1:8080",
@@ -295,6 +298,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn every_proxy_request_goes_to_the_forwarder_with_its_target() {
         let mut proxy = Server::new();
         let mut fwd = Server::new();
@@ -345,6 +349,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn the_target_keeps_scheme_port_path_and_query() {
         let mut fwd = Server::new();
         // what rgb-lib derives from rpcs://proxy.example.com:8443/0.2/json-rpc?x=1 and from the
@@ -361,6 +366,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn the_target_header_is_the_parsed_url() {
         // what the forwarder compares against its allowlist: url::Url's serialization
         let mut fwd = Server::new();
@@ -398,6 +404,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn a_target_with_userinfo_or_a_fragment_is_refused_before_any_request() {
         let mut fwd = Server::new();
         let never = untouchable(&mut fwd);
@@ -449,6 +456,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn check_proxy_goes_through_the_forwarder() {
         let mut proxy = Server::new();
         let mut fwd = Server::new();
@@ -472,6 +480,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn reject_list_goes_through_the_forwarder() {
         let mut issuer = Server::new();
         let mut fwd = Server::new();
@@ -491,6 +500,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn a_forwarded_reject_list_fails_closed() {
         let mut issuer = Server::new();
         let target = format!("{}/lists/usdt.txt", issuer.url());
@@ -520,6 +530,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn without_a_forwarder_the_reject_list_is_read_as_upstream_reads_it() {
         // upstream reads the body of any answer as the list; the fork changes only the routed
         // path, so this stays as it is (ERA.md, proxy forwarder)
@@ -536,6 +547,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn without_a_forwarder_requests_go_direct_and_carry_no_header() {
         let mut proxy = Server::new();
         let target = format!("{}/json-rpc", proxy.url());
@@ -567,6 +579,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn request_errors_name_the_target_not_the_forwarder() {
         // the forwarder's path may be a per-session secret, and rgb-lib returns the text of a
         // request error and logs some of it
@@ -609,6 +622,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn a_failing_forwarder_is_an_error_not_a_direct_request() {
         let mut proxy = Server::new();
         let target = format!("{}/json-rpc", proxy.url());
@@ -667,6 +681,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn a_refusal_is_forwarder_refused_on_every_request() {
         let mut proxy = Server::new();
         let target = format!("{}/json-rpc", proxy.url());
@@ -721,6 +736,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn only_a_403_with_the_refusal_header_is_a_refusal() {
         let mut proxy = Server::new();
         let target = format!("{}/json-rpc", proxy.url());
@@ -754,6 +770,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(forwarder)]
     fn a_bad_target_fails_like_it_does_without_a_forwarder() {
         let mut fwd = Server::new();
         let never = untouchable(&mut fwd);
