@@ -1406,3 +1406,74 @@ fn a_receive_the_forwarder_blocks_does_not_keep_others_from_failing() {
     }
     direct.assert();
 }
+
+#[test]
+#[serial(forwarder)]
+fn send_end_posts_to_a_usable_endpoint_after_a_refused_one() {
+    let mut services = Services::start();
+    let (wallet, _online) = services.online_wallet();
+    let target = services.target();
+    let refused_target = s!("https://unknown-proxy.example/json-rpc");
+    let mut inputs = SendEndInputs::new(&wallet, &target);
+    // the recipient's invoice lists an unknown proxy first
+    let mut refused_endpoint = inputs.recipients[0].transport_endpoints[0].clone();
+    refused_endpoint.endpoint = refused_target.clone();
+    inputs.recipients[0]
+        .transport_endpoints
+        .insert(0, refused_endpoint);
+
+    let direct = Untouchable::on(&mut services.proxy);
+    let refusal = services.expect_refusal(&refused_target, "consignment.post", "not-allowlisted");
+    let consignment = services.expect_upload(
+        &target,
+        "consignment.post",
+        &format!(
+            r#"{{"recipient_id":"{}","txid":"{FAKE_TXID}","vout":1}}"#,
+            inputs.proxy_rid
+        ),
+        CONSIGNMENT_BYTES.as_bytes(),
+    );
+    let media = services.expect_upload(
+        &target,
+        "media.post",
+        &format!(r#"{{"attachment_id":"{}"}}"#, inputs.media.digest),
+        MEDIA_BYTES.as_bytes(),
+    );
+    // the refusal is skipped like an unreachable proxy, and the next endpoint takes the post
+    inputs.post(&wallet).unwrap();
+    assert!(!inputs.recipients[0].transport_endpoints[0].used);
+    assert!(inputs.recipients[0].transport_endpoints[1].used);
+    refusal.assert();
+    consignment.assert();
+    media.assert();
+    direct.assert();
+}
+
+#[test]
+#[serial(forwarder)]
+fn send_begin_reports_the_first_refusal() {
+    let mut services = Services::start();
+    let mut other_proxy = Server::new();
+    let other_endpoint = format!("rpc://{}/json-rpc", other_proxy.host_with_port());
+    let (mut wallet, online) = services.online_wallet();
+    let asset_id = asset_in_db(&wallet);
+    let invoice = invoice_on(&[services.endpoint(), other_endpoint]);
+
+    let direct = [
+        Untouchable::on(&mut services.proxy),
+        Untouchable::on(&mut other_proxy),
+    ];
+    let first = services.expect_refusal(&probed(&invoice, 0), "server.info", "first-reason");
+    let second = services.expect_refusal(&probed(&invoice, 1), "server.info", "second-reason");
+    let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+    assert_eq!(
+        result.unwrap_err(),
+        Error::ForwarderRefused {
+            target: probed(&invoice, 0),
+            reason: s!("first-reason"),
+        }
+    );
+    first.assert();
+    second.assert();
+    direct.iter().for_each(Untouchable::assert);
+}
