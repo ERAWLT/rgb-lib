@@ -990,3 +990,48 @@ fn a_refused_consignment_download_leaves_the_receive_waiting() {
     refusal.assert();
     direct.assert();
 }
+
+#[test]
+#[parallel]
+fn send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment() {
+    let mut services = Services::start();
+    let (mut wallet, online) = services.online_wallet();
+    let asset_id = asset_in_db(&wallet);
+    let mut invoice = invoice_on(&[services.endpoint()]);
+    let usable = invoice.transport_endpoints[0].clone();
+
+    let direct = Untouchable::on(&mut services.proxy);
+    for bad in [
+        // a trusted-looking name before the real host, evil.example
+        s!("rpcs://rgb-proxy.utexo.com@evil.example/json-rpc"),
+        format!("{}#fragment", services.endpoint()),
+    ] {
+        // refused before any request
+        invoice.transport_endpoints = vec![bad.clone()];
+        let never = Untouchable::on(&mut services.forwarder);
+        let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+        assert!(
+            matches!(result, Err(Error::InvalidForwardTarget { .. })),
+            "{bad}: {result:?}"
+        );
+        never.assert();
+        never.remove();
+
+        // an invoice carrying one is refused even next to a usable endpoint (probed first here)
+        invoice.transport_endpoints = vec![usable.clone(), bad.clone()];
+        let probe = services.expect_rpc(
+            &probed(&invoice, 0),
+            "server.info",
+            Json::Null,
+            server_info(),
+        );
+        let result = send_begin_to(&mut wallet, online, &asset_id, &invoice);
+        assert!(
+            matches!(result, Err(Error::InvalidForwardTarget { .. })),
+            "{bad}: {result:?}"
+        );
+        probe.assert();
+        probe.remove();
+    }
+    direct.assert();
+}

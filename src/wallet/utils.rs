@@ -485,8 +485,9 @@ pub(crate) fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> 
     check_proxy_routed(proxy_url, None)
 }
 
-/// ERA fork: [`check_proxy`], through `forwarder` when one is given. The forwarder's refusal is
-/// [`Error::ForwarderRefused`], not "unable to connect to proxy".
+/// ERA fork: [`check_proxy`], through `forwarder` when one is given. The forwarder's refusal and a
+/// URL it may not be given are [`Error::ForwarderRefused`] and [`Error::InvalidForwardTarget`],
+/// not "unable to connect to proxy".
 #[cfg(feature = "_online")]
 pub(crate) fn check_proxy_routed(
     proxy_url: &str,

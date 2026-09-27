@@ -6764,15 +6764,22 @@ pub trait WalletOnline: WalletOffline {
             }
             for transport_endpoint in &mut local_recipient.transport_endpoints {
                 let endpoint = transport_endpoint.endpoint.clone();
-                transport_endpoint.usable =
-                    *usable_endpoints.entry(endpoint.clone()).or_insert_with(|| {
-                        let probe = self.check_proxy_endpoint(&endpoint);
-                        // ERA fork
-                        if let Err(e @ Error::ForwarderRefused { .. }) = &probe {
-                            refusals.insert(endpoint.clone(), e.clone());
-                        }
-                        probe.is_ok()
-                    });
+                if let Some(usable) = usable_endpoints.get(&endpoint) {
+                    transport_endpoint.usable = *usable;
+                    continue;
+                }
+                let probe = self.check_proxy_endpoint(&endpoint);
+                // ERA fork: an endpoint the forwarder may not be given fails the send, a refusal
+                // is kept
+                match &probe {
+                    Err(e @ Error::InvalidForwardTarget { .. }) => return Err(e.clone()),
+                    Err(e @ Error::ForwarderRefused { .. }) => {
+                        refusals.insert(endpoint.clone(), e.clone());
+                    }
+                    _ => {}
+                }
+                transport_endpoint.usable = probe.is_ok();
+                usable_endpoints.insert(endpoint, transport_endpoint.usable);
             }
             if !local_recipient.transport_endpoints.iter().any(|t| t.usable) {
                 // ERA fork: a forwarder's refusal says why no endpoint is usable (the first)
