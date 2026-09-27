@@ -13,6 +13,9 @@ pub(crate) mod offline;
 pub(crate) mod online;
 pub mod rust_only;
 pub(crate) mod singlesig;
+// ERA fork (CC-99)
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) mod unrecorded_spends;
 pub mod utils;
 #[cfg(feature = "vss")]
 pub mod vss;
@@ -59,6 +62,8 @@ pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
 pub use online::{RgbWalletOpsOnline, check_indexer_url};
 pub use singlesig::{SinglesigKeys, Wallet};
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub use unrecorded_spends::CompletedSpend;
 
 pub(crate) use backup::WalletBackup;
 pub(crate) use core::{

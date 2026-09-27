@@ -237,6 +237,7 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{TransferStatus, WalletTransactionType},
+    error::{InconsistencyReason, UnrecordedSpendReason},
     wallet::utils::block_on,
 };
 
@@ -571,6 +572,8 @@ use crate::wallet::utils::INDEXER_STOP_GAP;
 use crate::wallet::utils::write_fascia;
 #[cfg(feature = "wallet")]
 use crate::wallet::utils::{check_psbt_parsable, strip_rgb_data};
+#[cfg(all(test, feature = "_online"))]
+use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 use crate::{
     api::{

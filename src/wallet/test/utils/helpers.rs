@@ -941,6 +941,7 @@ pub(crate) fn test_go_online_options(indexer_url: Option<&str>) -> OnlineOptions
             super::super::EVM_RPC_URL.to_string(),
         )])),
         forwarder_url: None,
+        complete_unrecorded_spends: false,
     }
 }
 

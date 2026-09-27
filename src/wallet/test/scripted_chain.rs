@@ -848,22 +848,34 @@ pub(crate) fn online_options(chain: &ScriptedChain) -> OnlineOptions {
         skip_consistency_check: false,
         vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK as u32,
         forwarder_url: None,
+        complete_unrecorded_spends: false,
     }
 }
 
-pub(crate) fn issuer(chain: &ScriptedChain, amounts: Vec<u64>) -> Issuer {
+/// A funded wallet with `utxos` colored UTXOs, online on `chain`.
+pub(crate) fn funded(chain: &ScriptedChain, utxos: u8) -> (Wallet, Online) {
     let mut wallet = get_test_wallet(true, None);
     let online = wallet.go_online(online_options(chain)).unwrap();
     chain.fund(&wallet.get_address().unwrap(), FUNDING);
     chain.mine(1);
     wallet
-        .create_utxos(online, false, Some(UTXOS), Some(UTXO_SATS), FEE_RATE, false)
+        .create_utxos(online, false, Some(utxos), Some(UTXO_SATS), FEE_RATE, false)
         .unwrap();
     chain.mine(1);
-    let asset_id = wallet
+    (wallet, online)
+}
+
+/// A new NIA asset, one allocation of each amount.
+pub(crate) fn issue(wallet: &Wallet, amounts: Vec<u64>) -> String {
+    wallet
         .issue_asset_nia(TICKER.to_string(), NAME.to_string(), PRECISION, amounts)
         .unwrap()
-        .asset_id;
+        .asset_id
+}
+
+pub(crate) fn issuer(chain: &ScriptedChain, amounts: Vec<u64>) -> Issuer {
+    let (wallet, online) = funded(chain, UTXOS);
+    let asset_id = issue(&wallet, amounts);
     Issuer {
         wallet,
         online,
