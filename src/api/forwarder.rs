@@ -186,12 +186,18 @@ impl Forwarder {
         Some(Error::ForwarderRefused {
             // as the target header named it
             target: Url::parse(target).map_or_else(|_| target.to_string(), String::from),
-            reason: String::from_utf8_lossy(reason.as_bytes())
-                .chars()
-                .take(MAX_REFUSAL_REASON)
-                .collect(),
+            reason: refusal_reason(reason),
         })
     }
+}
+
+/// The reason of a refusal: the header's value, decoded lossily (its bytes need not be UTF-8) and
+/// cut at [`MAX_REFUSAL_REASON`] characters.
+fn refusal_reason(value: &reqwest::header::HeaderValue) -> String {
+    String::from_utf8_lossy(value.as_bytes())
+        .chars()
+        .take(MAX_REFUSAL_REASON)
+        .collect()
 }
 
 #[cfg(test)]
@@ -847,6 +853,82 @@ pub(crate) mod tests {
             }
         }
         direct.assert();
+    }
+
+    #[test]
+    #[serial(forwarder)]
+    fn a_refusal_reason_is_cut_by_characters() {
+        // mockito sends only ASCII header values, so the decoding is checked on its own
+        let long = "é".repeat(MAX_REFUSAL_REASON + 50);
+        let reason =
+            refusal_reason(&reqwest::header::HeaderValue::from_bytes(long.as_bytes()).unwrap());
+        assert_eq!(reason, "é".repeat(MAX_REFUSAL_REASON));
+        // bytes that are not UTF-8 are replaced, not dropped
+        let value = reqwest::header::HeaderValue::from_bytes(b"no\xffpe").unwrap();
+        assert_eq!(refusal_reason(&value), "no\u{fffd}pe");
+    }
+
+    const SYSTEM_PROXY_CHILD: &str = "RGB_LIB_ERA_SYSTEM_PROXY_CHILD";
+
+    #[test]
+    #[serial(forwarder)]
+    fn the_forwarder_client_ignores_the_system_proxy() {
+        // reqwest reads HTTP_PROXY when a client is built, and the environment is shared by every
+        // test of this process: the part with HTTP_PROXY set runs alone, in a child process
+        let mut system_proxy = Server::new();
+        // what the child's own check sends through the system proxy, and nothing else
+        let checked = system_proxy
+            .mock("POST", Matcher::Any)
+            .match_header("host", "proxy.invalid")
+            .with_body(RPC_OK)
+            .expect(1)
+            .create();
+        let never = untouchable(&mut system_proxy);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api::forwarder::tests::the_forwarder_client_ignores_the_system_proxy_in_a_child",
+                "--include-ignored",
+                "--test-threads=1",
+            ])
+            .env(SYSTEM_PROXY_CHILD, "1")
+            .env("HTTP_PROXY", system_proxy.url())
+            .env("http_proxy", system_proxy.url())
+            .env("ALL_PROXY", system_proxy.url())
+            .env("all_proxy", system_proxy.url())
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("REQUEST_METHOD")
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{log}");
+        assert!(log.contains("test result: ok. 1 passed"), "{log}");
+        checked.assert();
+        never.assert();
+    }
+
+    #[test]
+    #[ignore = "run by the_forwarder_client_ignores_the_system_proxy, with HTTP_PROXY set"]
+    fn the_forwarder_client_ignores_the_system_proxy_in_a_child() {
+        if std::env::var_os(SYSTEM_PROXY_CHILD).is_none() {
+            return;
+        }
+        let target = "http://proxy.invalid/json-rpc";
+        // the environment does send a client to HTTP_PROXY: proxy.invalid resolves nowhere, so
+        // an answer can only come from there
+        let upstream = ProxyClient::new(target).unwrap();
+        assert_eq!(upstream.get_ack("rid").unwrap().result, Some(true));
+        // the forwarder's client does not go there
+        let mut fwd = Server::new();
+        let mock = forwarded_json(&mut fwd, target, "ack.get", json!(true));
+        let client = ProxyClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
+        assert_eq!(client.get_ack("rid").unwrap().result, Some(true));
+        mock.assert();
     }
 
     #[test]
