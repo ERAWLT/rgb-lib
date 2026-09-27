@@ -63,6 +63,8 @@ impl RejectListClient {
     /// read as the list. The forwarder's refusal is [`Error::ForwarderRefused`], anything else is
     /// [`Error::RejectListService`] with the status.
     fn get_forwarded(&self, forwarder: &Forwarder) -> Result<String, Error> {
+        // an error names the list, not the forwarder (see Forwarder::scrub)
+        let scrubbed = |e: reqwest::Error| Self::req_err(Forwarder::scrub(e, &self.base_url));
         let response = forwarder
             .request(
                 &self.client,
@@ -72,7 +74,7 @@ impl RejectListClient {
                 Self::req_err,
             )?
             .send()
-            .map_err(Self::req_err)?;
+            .map_err(scrubbed)?;
         if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {
             return Err(refusal);
         }
@@ -82,7 +84,7 @@ impl RejectListClient {
                 details: format!("HTTP {status} from the forwarder"),
             });
         }
-        response.text().map_err(Self::req_err)
+        response.text().map_err(scrubbed)
     }
 }
 

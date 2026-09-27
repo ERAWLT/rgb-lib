@@ -120,18 +120,25 @@ impl ProxyClient {
     }
 
     // ERA fork: every request is sent and read here. Through a forwarder, its refusal is
-    // Error::ForwarderRefused; any other answer is read as the proxy's, as upstream reads it.
+    // Error::ForwarderRefused, any other answer is read as the proxy's, as upstream reads it, and
+    // an error names the proxy, not the forwarder.
     fn call<R: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> Result<JsonRpcResponse<R>, Error> {
-        let response = request.send().map_err(Self::req_err)?;
-        if self.forwarder.is_some()
-            && let Some(refusal) = Forwarder::refusal(&response, &self.base_url)
-        {
+        if self.forwarder.is_none() {
+            return request
+                .send()
+                .map_err(Self::req_err)?
+                .json::<JsonRpcResponse<R>>()
+                .map_err(Self::req_err);
+        }
+        let scrubbed = |e: reqwest::Error| Self::req_err(Forwarder::scrub(e, &self.base_url));
+        let response = request.send().map_err(scrubbed)?;
+        if let Some(refusal) = Forwarder::refusal(&response, &self.base_url) {
             return Err(refusal);
         }
-        response.json::<JsonRpcResponse<R>>().map_err(Self::req_err)
+        response.json::<JsonRpcResponse<R>>().map_err(scrubbed)
     }
 
     fn req_err(e: impl std::fmt::Display) -> Error {
