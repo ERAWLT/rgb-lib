@@ -50,7 +50,7 @@ pub use objects::{
     Metadata, Online, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection,
     PsbtOutputInfo, ReceiveData, ReceivedMint, Recipient, RgbAllocation, Token, TokenLight,
     Transaction, TransactionType, Transfer, TransferKind, TransferScope, TransferTransportEndpoint,
-    Unspent, Utxo, WalletData, WalletDescriptors, WitnessData,
+    Unspent, Utxo, VanillaTxRecord, WalletData, WalletDescriptors, WitnessData,
 };
 #[cfg(feature = "_online")]
 pub use objects::{
