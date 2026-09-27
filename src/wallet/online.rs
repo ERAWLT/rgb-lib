@@ -141,7 +141,15 @@ pub trait WalletOnline: WalletOffline {
                 .extract_tx()
                 .map_err(InternalError::from)?,
         )?;
+        // ERA fork (CC-99): the record half is shared with the completion of an unrecorded spend
+        self.record_broadcast(txn, &tx)?;
+        Ok(tx)
+    }
 
+    // ERA fork (CC-99): what broadcast_psbt records once the TX is on the network, split out of it
+    // unchanged so that the completion of an own spend whose record was lost (go_online, see
+    // unrecorded_spends) writes exactly what the broadcast would have written
+    fn record_broadcast(&mut self, txn: &DbTxn, tx: &BdkTransaction) -> Result<(), Error> {
         // apply the broadcast TX into BDK directly so its outputs are immediately visible
         // (revealed change SPKs match without needing a wallet sync)
         let seen_at = now().unix_timestamp() as u64;
@@ -163,7 +171,7 @@ pub trait WalletOnline: WalletOffline {
             }
         }
 
-        Ok(tx)
+        Ok(())
     }
 
     fn reserve_vanilla_txos(
