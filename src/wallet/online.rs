@@ -782,7 +782,9 @@ pub trait WalletOnline: WalletOffline {
                 Ok(r) => {
                     debug!(self.logger(), "Consignment NACK response: {:?}", r);
                 }
-                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                // ERA fork: the proxy's own words only (upstream matched the text of any error, and
+                // a forwarder's refusal carries a reason of the forwarder's choosing)
+                Err(Error::Proxy { ref details }) if details.contains("Cannot change ACK") => {
                     warn!(self.logger(), "Found an ACK when trying NACK");
                 }
                 Err(e) => {
