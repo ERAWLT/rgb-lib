@@ -1308,9 +1308,12 @@ impl Drop for Staging {
 /// and the sanitized "wallet/" directory is renamed to the actual fingerprint.
 ///
 /// ERA fork: the manifest is read once, so the decryption and the extraction follow the same
-/// answer, and the name the server gives the wallet is used as a directory name only if it is a
-/// wallet fingerprint (8 lowercase hex characters); anything else is [`Error::VssError`] before
-/// any of the backup is written. An encrypted backup must name that same wallet inside, else
+/// answer. With encryption enabled in `config` (the default), a backup the manifest marks as
+/// unencrypted is [`Error::VssBackupUnencrypted`], before any of it is downloaded: decrypting is
+/// what authenticates a backup (to restore a plaintext one, disable encryption in `config`). The
+/// name the server gives the wallet is used as a directory name only if it is a wallet
+/// fingerprint (8 lowercase hex characters); anything else is [`Error::VssError`] before any of
+/// the backup is written. An encrypted backup must name that same wallet inside, else
 /// [`Error::FingerprintMismatch`]. Only the archive's wallet directory is extracted, into a
 /// staging directory renamed to `<target_dir>/<fingerprint>` once complete: an entry outside it
 /// is not written anywhere. [`restore_from_vss_expecting`] also checks whose wallet it is.
@@ -1329,8 +1332,7 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
 /// - the wallet the server names (`backup/fingerprint`) must be this one, else
 ///   [`Error::FingerprintMismatch`]; the directory is named after `expected_fingerprint`;
 /// - with encryption enabled in `config` (the default), a backup the manifest marks as
-///   unencrypted is [`Error::VssBackupUnencrypted`]: decrypting is what authenticates a backup,
-///   and a server could otherwise hand over any plaintext it likes;
+///   unencrypted is [`Error::VssBackupUnencrypted`], as for [`restore_from_vss`];
 /// - an encrypted backup names its wallet inside, where the server cannot change it: that must be
 ///   this one too, else [`Error::FingerprintMismatch`].
 ///
@@ -1363,8 +1365,9 @@ async fn restore_from_vss_impl(
     {
         return Err(Error::InvalidFingerprint);
     }
-    // ERA fork: a host that names the wallet does not take a plaintext backup when it encrypts
-    let require_encrypted = expected_fingerprint.is_some() && config.encryption_enabled;
+    // ERA fork: with encryption on, only an encrypted backup is taken: decrypting is what
+    // authenticates a backup, and a server could otherwise hand over any plaintext it likes
+    let require_encrypted = config.encryption_enabled;
 
     fs::create_dir_all(target_dir)?;
     let log_dir = Path::new(target_dir);
@@ -1932,6 +1935,9 @@ mod tests {
     /// gets the n-th value listed for it (the last one again after that), so a server that
     /// answers two reads of one key differently can be played. A key with no values is not
     /// there (HTTP 500). Every read is counted.
+    /// The values a [`VssScript`] answers, per key.
+    type Answers<'a> = Vec<(&'a str, Vec<Vec<u8>>)>;
+
     struct VssScript {
         server: mockito::ServerGuard,
         reads: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -2226,6 +2232,174 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored, target.join(EXPECTED));
+    }
+
+    #[test]
+    fn restore_refuses_a_plaintext_backup_when_encryption_is_on() {
+        // upstream's restore_from_vss took a backup the manifest marks as plaintext as it came,
+        // whatever the config said: a wallet of the server's making, its manifest file included
+        let key = test_signing_key();
+        let planted = zip_of(&[
+            ("wallet/", None),
+            ("wallet/wallet_manifest.json", Some(b"{\"planted\":true}")),
+            ("wallet/rgb_lib_db", Some(b"the server's database")),
+        ]);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest_json(false, &planted)]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![planted]),
+        ]);
+        for expected in [None, Some(EXPECTED)] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, expected);
+            assert!(
+                matches!(result, Err(Error::VssBackupUnencrypted)),
+                "{expected:?}: {result:?}"
+            );
+            assert!(!target.join(EXPECTED).exists());
+        }
+        assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
+        // a config with encryption off takes it, as upstream did
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        restore(config(&server, key).with_encryption(false), &target, None).unwrap();
+        assert!(target.join(EXPECTED).join("rgb_lib_db").is_file());
+    }
+
+    #[test]
+    fn every_backup_the_server_makes_is_refused_with_encryption_on() {
+        // the second review's probe (B1): what a server can serve for the expected wallet, short
+        // of one of its genuine backups
+        let key = test_signing_key();
+        let fake = zip_of(&[
+            ("wallet/", None),
+            ("wallet/wallet_manifest.json", Some(b"{\"fake\":true}")),
+            ("wallet/rgb_lib_db", Some(b"server db")),
+        ]);
+        let fake_named = zip_of(&[
+            ("a1b2c3d4/", None),
+            ("a1b2c3d4/wallet_manifest.json", Some(b"{\"fake\":true}")),
+            ("a1b2c3d4/rgb_lib_db", Some(b"server db")),
+        ]);
+        let [_, _, good_metadata] = uploaded(EXPECTED, &key, true);
+        let [_, other_data, other_metadata] = uploaded(EXPECTED, &test_signing_key(), true);
+        let [_, a_data, a_metadata] = uploaded(EXPECTED, &key, true);
+        let [_, b_data, _] = uploaded(EXPECTED, &key, true);
+        let half = a_data.len() / 2;
+        let chunked = |encrypted: bool, count: usize, total: usize| {
+            vec![chunked_manifest(encrypted, count, total)]
+        };
+        let cases: Vec<(&str, Answers)> = vec![
+            (
+                "marked plaintext",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![manifest_json(false, &fake)]),
+                    (BACKUP_KEY_DATA, vec![fake.clone()]),
+                ],
+            ),
+            (
+                "marked encrypted, plaintext wallet/",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![manifest_json(true, &fake)]),
+                    (BACKUP_KEY_DATA, vec![fake.clone()]),
+                    (BACKUP_KEY_METADATA, vec![good_metadata.clone()]),
+                ],
+            ),
+            (
+                "marked encrypted, plaintext a1b2c3d4/",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![manifest_json(true, &fake_named)]),
+                    (BACKUP_KEY_DATA, vec![fake_named.clone()]),
+                    (BACKUP_KEY_METADATA, vec![good_metadata.clone()]),
+                ],
+            ),
+            (
+                "no manifest",
+                vec![(BACKUP_KEY_DATA, vec![fake_named.clone()])],
+            ),
+            (
+                "a manifest that is not JSON",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![b"plaintext".to_vec()]),
+                    (BACKUP_KEY_DATA, vec![fake_named.clone()]),
+                ],
+            ),
+            (
+                "encrypted under another key",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![manifest_json(true, &other_data)]),
+                    (BACKUP_KEY_DATA, vec![other_data.clone()]),
+                    (BACKUP_KEY_METADATA, vec![other_metadata.clone()]),
+                ],
+            ),
+            (
+                "no metadata",
+                vec![
+                    (BACKUP_KEY_MANIFEST, vec![manifest_json(true, &a_data)]),
+                    (BACKUP_KEY_DATA, vec![a_data.clone()]),
+                ],
+            ),
+            (
+                "chunks of two backups",
+                vec![
+                    (BACKUP_KEY_MANIFEST, chunked(true, 2, a_data.len())),
+                    ("backup/chunk/0", vec![a_data[..half].to_vec()]),
+                    ("backup/chunk/1", vec![b_data[half..].to_vec()]),
+                    (BACKUP_KEY_METADATA, vec![a_metadata.clone()]),
+                ],
+            ),
+            (
+                "ciphertext, then plaintext",
+                vec![
+                    (
+                        BACKUP_KEY_MANIFEST,
+                        chunked(true, 2, half + fake_named.len()),
+                    ),
+                    ("backup/chunk/0", vec![a_data[..half].to_vec()]),
+                    ("backup/chunk/1", vec![fake_named.clone()]),
+                    (BACKUP_KEY_METADATA, vec![a_metadata.clone()]),
+                ],
+            ),
+            (
+                "plaintext, then ciphertext",
+                vec![
+                    (
+                        BACKUP_KEY_MANIFEST,
+                        chunked(true, 2, fake_named.len() + a_data.len() - half),
+                    ),
+                    ("backup/chunk/0", vec![fake_named.clone()]),
+                    ("backup/chunk/1", vec![a_data[half..].to_vec()]),
+                    (BACKUP_KEY_METADATA, vec![a_metadata.clone()]),
+                ],
+            ),
+            (
+                "no chunk, marked encrypted",
+                vec![
+                    (BACKUP_KEY_MANIFEST, chunked(true, 0, 0)),
+                    (BACKUP_KEY_METADATA, vec![a_metadata.clone()]),
+                ],
+            ),
+            (
+                "plaintext chunks, marked plaintext",
+                vec![
+                    (BACKUP_KEY_MANIFEST, chunked(false, 2, fake.len())),
+                    ("backup/chunk/0", vec![fake[..10].to_vec()]),
+                    ("backup/chunk/1", vec![fake[10..].to_vec()]),
+                ],
+            ),
+        ];
+        for (name, mut answers) in cases {
+            answers.push((BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]));
+            let server = VssScript::start(answers);
+            for expected in [Some(EXPECTED), None] {
+                let root = tempfile::tempdir().unwrap();
+                let target = root.path().join("data");
+                let result = restore(config(&server, key), &target, expected);
+                assert!(result.is_err(), "{name}, {expected:?}: {result:?}");
+                assert!(!target.join(EXPECTED).exists(), "{name}, {expected:?}");
+            }
+        }
     }
 
     #[test]
