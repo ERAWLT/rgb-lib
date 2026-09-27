@@ -73,12 +73,19 @@ Rules for the branch:
 | `c88f20a` | Leave the forwarder's path out of its Debug form | Fork-only |
 | `a140543` | Guard every mention of the proxy and reject-list client types | Fork-only |
 | `b761c25` | Sync a restored wallet before renaming it into place, and its parent | To propose to UTEXO |
+| `5cab571` | Split the record half out of broadcast_psbt | To propose to UTEXO (with `c1feef6`) |
+| `f82b1c1` | Add a scripted chain for offline wallet tests | Fork-only (could serve UTEXO's own offline tests) |
+| `27d2a5a` | Refuse a signed.psbt whose txid is not its transfer's | To propose to UTEXO |
+| `c1feef6` | Complete an own spend the indexer knows at go_online (CC-99) | To propose to UTEXO, opt-in and default off: their `consume_transfer_fascia` (`-bfa` `rust_only.rs`) completes the same class of spend under the same bar, but needs the `Online` handle this state never grants |
+| `4093572` | Let the host tell a recorded vanilla TX from an unknown one | To propose to UTEXO (with `c1feef6`) |
+| `106a00c` | Reserve the external-operation reason for the -bfa carry | Fork-only (goes with `c1feef6`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
 `e7bdaa4` ([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the series is carried;
 `45c3b39`, `777fe57`, `dcc9654` to `d6357cf`, `4ea8ccd` to `3988f38` and `b761c25` are
-[§5](#5-backup-restore-checks).
+[§5](#5-backup-restore-checks); `5cab571` to `106a00c` are
+[§6](#6-completing-an-own-unrecorded-spend-cc-99).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -157,7 +164,7 @@ layout from xpubs and from a mnemonic, unchanged default descriptors).
 ## 2. CI
 
 `.github/workflows/era.yml` (`1d26404`, extended in `f808c7f`, `07e16e5`, `e7bdaa4`, `bef0c03`,
-`87d5e88`, `45c3b39`, `dcc9654`, `8692b69` and `a140543`) has two jobs.
+`87d5e88`, `45c3b39`, `dcc9654`, `8692b69`, `a140543`, `f82b1c1` and `27d2a5a`) has two jobs.
 
 - **check** runs on push / PR to `era/**` and on manual dispatch: rustfmt, `cargo check`
   with the app's feature set and with the upstream default on top, a check of the uniffi
@@ -165,8 +172,9 @@ layout from xpubs and from a mnemonic, unchanged default descriptors).
   enum, and a variant missing there breaks only that build), a dependency guard over the
   app's mobile targets, the HTTP client guard (below), the proxy forwarder guard
   ([§4](#4-proxy-forwarder-e7bdaa4)), the unit tests above plus the REST-client TLS test, the
-  forwarder tests, the VSS and file backup tests ([§5](#5-backup-restore-checks)) and offline
-  wallet tests, and the migration crate. Every cargo call is `--locked`: a fresh resolution
+  forwarder tests, the VSS and file backup tests ([§5](#5-backup-restore-checks)), offline
+  wallet tests, the scripted-chain and CC-99 tests
+  ([§6](#6-completing-an-own-unrecorded-spend-cc-99)), and the migration crate. Every cargo call is `--locked`: a fresh resolution
   fails on the yanked `secp256k1 0.32.0-beta.2` that `rgb-consensus 0.11.1-rc.11` requires.
 - **https** runs on manual dispatch and on a weekly schedule, with `continue-on-error`:
   the two tests that make real TLS handshakes, to UTEXO's signet RGB proxy
@@ -1115,6 +1123,284 @@ download, the truncation check dropped, a whole block held back. `b761c25`, 7, e
 test: the file syncs or the directory syncs dropped, parents synced first, the rename first,
 the parent sync dropped, sync errors ignored, the wallet kept after a failed parent sync.
 
+## 6. Completing an own unrecorded spend (CC-99)
+
+`5cab571`, `f82b1c1`, `27d2a5a`, `c1feef6`, `4093572` and `106a00c`, after the design of
+2026-09-28 and its adversarial review (the deviations are [listed](#deviations-from-the-design)).
+It has to be in place before the app's lifecycle service (T1.3), which pauses the wallet between
+any two operations.
+
+### Why
+
+A colored spend whose transaction reached the network while the wallet's database did not
+record it leaves the transaction's inputs `exists && !spent` in the database and spent in BDK.
+Upstream's singlesig consistency check (`singlesig.rs`, `wallet_specific_consistency_checks`)
+then refuses every `go_online` with `Inconsistency` (`RestoredBackupInconsistent` after a VSS
+restore). Its only repair, the orphan reconcile in the public `sync`, needs an `Online` handle
+that `go_online` never returns in that state, and would mark the inputs spent without the RGB
+transition or the transfer's status, dropping the change from the stash for good.
+
+Three sequences lead there:
+
+- **S1**: the broadcast reaches the network, its answer is lost (a forwarder answering 502 after
+  relaying, a dropped connection) and so is the lookup `broadcast_tx` makes after a failed
+  `POST /tx`; the operation rolls back. The app's pause seals that state.
+- **S2**: the process dies between the broadcast and the commit.
+- **S3**: the wallet is restored from a seal or VSS backup taken after the operation's `*_begin`
+  and before its commit.
+
+Three operations can do it: a donation's `send_end`, the `refresh` that broadcasts an ACKed send
+(`try_complete_batch`), and `drain_to_end`. `create_utxos` and `send_btc` spend vanilla coins
+only.
+
+### What the host sets and reads
+
+| API | Meaning |
+|---|---|
+| `OnlineOptions::complete_unrecorded_spends: bool` | `#[serde(default)]` false, UDL `= false`. False: upstream's check, unchanged (the same requests, writes and errors). True: the check completes own unrecorded spends it can prove (below). Ignored with `skip_consistency_check`, and by multisig and MPC wallets (their checks are no-ops). |
+| `Wallet::completed_spends() -> Vec<CompletedSpend>` | What the last `go_online` completed. Empty when it completed nothing, skipped the check or failed, and while offline (`go_offline` drops it). Each `go_online` replaces it. Rust API only (not in the UDL). |
+| `CompletedSpend { txid, batch_transfer_idx, previous_status, donation, confirmations }` | `batch_transfer_idx` and `previous_status` are `None` for a drain; the transfer is now `WaitingConfirmations`. `confirmations` is the indexer's answer, 0 for its mempool. |
+| `Error::UnrecordedSpend { txid, reason, batch_transfer_idx }` | New. The wallet recorded the spending TX and the indexer knows it, but its record or files do not allow completing it. Deterministic: retrying does not help. `reason` is a code of `UnrecordedSpendReason` (below). |
+| `Error::UnrecordedSpendUnseen { txid, batch_transfer_idx }` | New. BDK has the coins spent by a TX this wallet recorded, and the indexer answers that it does not know it: lag, or a TX the wallet applied locally that left every mempool. Retryable. |
+| `Error::Inconsistency` / `RestoredBackupInconsistent` | Unchanged variants. With the option on, the spent-coin refusal means "spent by a TX this wallet did not record" and its `details` is upstream's text followed by `; spenders: [..]; reason=<code>`; `Error::inconsistency_reason() -> Option<InconsistencyReason>` reads the code. `None` for every other error and without the option. |
+| an indexer error | The lookup failed: retryable, nothing written. |
+| `Wallet::vanilla_tx_record(txid) -> Option<VanillaTxRecord { txid, type, pending }>` | New (`4093572`). The record a `*_begin` with `dry_run = false` (or a `*_end`) left of a vanilla TX; `pending` while it holds its reservations. What the bridge's drain guard needs (below). |
+
+`InconsistencyReason`: `spender-not-recorded` (another install of the wallet, a copy older than
+the operation, a drain begun with `dry_run = true`), `no-canonical-spender` (the TX that created
+the coin was replaced or reorganized away: not CC-99), `later-spend-unrecorded` (an output of an
+own spend was spent by a TX this wallet has no record of).
+
+`UnrecordedSpendReason`: `transfer-failed`, `unexpected-status`, `record-ambiguous`,
+`record-kind-unsupported`, `transfer-data-missing`, `record-mismatch`, `stash-refused`, and
+`external-operation`, reserved for the `-bfa` base (never produced here; see
+[carrying](#carrying-it)).
+
+The TXID stays in the fork's errors, as in `MinFeeNotMet` / `FailedBroadcast` and every
+broadcast line of the wallet log (design question 4): it is the only name of a drain. The bridge
+drops it from what it hands the app's log (below).
+
+### When it completes
+
+`D` is upstream's divergence: database TXOs `exists && !spent` minus BDK's `list_unspent()`,
+after the check's two full scans in this very `go_online`. The completion
+(`src/wallet/unrecorded_spends.rs`, `plan` then `apply`) runs only when all of this holds, for
+every coin of `D`:
+
+| # | Claim | Proven by |
+|---|---|---|
+| P1 | T spends the coin | the unique canonical TX (`bdk_wallet.transactions()`) with an input on it |
+| P2 | T is this wallet's | exactly one record names T's TXID: one outgoing batch transfer (incoming send-to-self rows ignored) or one `wallet_transaction` of type Drain. The TXID commits to every input and output. |
+| P3 | T reached the network | `get_tx_confirmations(T)` is `Some`: the bar `broadcast_tx` uses to count a broadcast |
+| P4 | nothing after T was lost | no colored output of T is spent in BDK unless its database row is spent |
+| P5 | the record is T's | a send: status `Initiated` or `WaitingCounterparty`; `transfer_data.txt` and `fascia` read as `get_transfer_end_data` reads them; every main transition a Transfer; the fascia's witness is T; the fascia's contracts are exactly the batch transfer's assets (user-driven and moved along: a fascia carries a bundle for each, pinned by `plan_counts_the_assets_moved_along`); the coins of the batch's Input colorings are inputs of T; `signed.psbt`, if there, is T's. A drain: still pending, its reservations exactly T's inputs. |
+| P6 | coverage | every coin is attributed to such a T; one that is not and nothing is completed |
+| P7 | nothing left | the divergence recomputed after the writes is empty, else `Error::Internal` |
+
+The ACKs, the expiry and a NACK play no part: the chain decides, as in `56e6186` and `1051adc`.
+No RGB proxy is contacted and nothing is broadcast.
+
+Precedence, so the verdict does not depend on order: an unexplained coin (Inconsistency) before
+a failed lookup, a failed lookup before an unknown TX (`UnrecordedSpendUnseen`), an unknown TX
+before a record that cannot be completed (`UnrecordedSpend`), which therefore always means the
+indexer knows T.
+
+### What is completed, and what is refused
+
+| Wallet state (after the check's scan) | Origin | Result |
+|---|---|---|
+| outgoing batch `Initiated`, donation, `signed.psbt` there | S1/S2 of `send_end`; its recipient broadcast it from the consignment | completed; stash witness: the TX this wallet signed, as `send_end` consumes it |
+| outgoing batch `Initiated`, donation, no `signed.psbt` | S3: copy after `send_begin` | completed; stash gets the fascia as stored, with the TX unsigned |
+| outgoing batch `WaitingCounterparty`, ACKs in any state, expired or not | S1/S2 of the `refresh` that broadcast it (its failure recorded, the ACK committed); S3 after `send_end` | completed; fascia as stored, as `try_complete_batch` consumes it |
+| outgoing batch `Initiated`, not a donation, no `signed.psbt` | S3: copy after `send_begin`, the send finished elsewhere through `refresh` | completed, as above |
+| pending Drain whose reservations are T's inputs | S1/S2 of `drain_to_end`; S3 after `drain_to_begin(dry_run = false)` | completed; reservations released |
+| several of these at once | one `refresh` that broadcast two sends, a send and a drain | all completed, one commit; one refused and none is |
+| any of these after a VSS restore | S3 via VSS | completed; `.vss_restored` removed after the commit |
+| a spender no record of this wallet names | another install (CC-27), a copy older than the operation, a `dry_run = true` drain, a transfer deleted then broadcast | `Inconsistency` `spender-not-recorded` (`RestoredBackupInconsistent` after a VSS restore) |
+| a coin without a canonical spender | its creating TX replaced or reorganized away | `Inconsistency` `no-canonical-spender` (not CC-99; design question 6) |
+| an output of T spent by an unrecorded TX | a chain of lost transfers from an old copy | `Inconsistency` `later-spend-unrecorded` |
+| the lookup fails | indexer or forwarder down | the indexer's error |
+| own record, BDK has T, the indexer does not know it | indexer lag; T applied locally and evicted | `UnrecordedSpendUnseen` |
+| own batch `Failed` | failed while T was unknown, then broadcast (a donation's recipient, a late relay) | `UnrecordedSpend` `transfer-failed`: terminal in v1, by the lead's decision (a donation cannot be cancelled after a first `send_end` attempt) |
+| own batch `WaitingConfirmations` / `Settled` with inputs unspent; a drain no longer pending | unreachable: committed with the spent marks | `unexpected-status` |
+| two outgoing batches, or a batch and a vanilla TX, with T's TXID | | `record-ambiguous` |
+| inflation, burn or link; a `CreateUtxos` / `SendBtc` record | not exposed by the bridge; unreachable | `record-kind-unsupported` |
+| `transfers/T/`, its info or fascia missing or unparsable, `signed.psbt` unparsable | `delete_transfers`, damage | `transfer-data-missing` |
+| fascia of another TX or other assets, input colorings outside T, reservations other than T's inputs, `signed.psbt` of another TX | damage, a misplaced file | `record-mismatch` |
+| the stash refuses the transitions | a fascia rgb-ops will not consume | `stash-refused` (nothing kept, no panic) |
+| option off, or `skip_consistency_check` | | upstream: no lookup made |
+
+Outside it on purpose, because none is a divergence: a broadcast that never reached the network
+(nothing is spent anywhere; `go_online` passes and the in-session retries or `fail_transfers`
+finish it), a TX the indexer does not show yet in S1 (`go_online` passes; a later one completes
+it), and the vanilla `create_utxos` / `send_btc`.
+
+### The order of the writes
+
+1. **Divergence and attribution** (BDK and the database, no writes): P1, P2, P4.
+2. **Chain**: one `GET /tx/<txid>/status` per own spend (plus `/blocks/tip/height` or
+   `/tx/<txid>/raw`), in TXID order: P3. No second scan.
+3. **Records and files**: P5, and the donation's witness.
+4. **Stash**: the check's runtime, taken before the scans as upstream takes it, stops persisting
+   on drop (`require_explicit_persistence`), so a consume that fails half way stores nothing and
+   cannot panic in `Drop`; bundles the stash already holds are left out
+   (`RgbRuntime::fascia_unknown_part`); `consume_fascia(_, None)` (Tentative, as every
+   `*_end`), a failure being `stash-refused`; then `persist()`, whose failure is `Err(IO)`.
+5. **Database**, in the check's transaction: `record_broadcast` (BDK apply and persist, change
+   promoted, inputs spent), the batch transfer `WaitingConfirmations` (the existing-row branch of
+   `update_or_save_transfers`, called directly, so the save branch cannot run), a drain's
+   reservations deleted.
+6. **P7**, then upstream's asset and media checks, on the same runtime.
+7. `go_online`: `update_backup_info`, commit; then `.vss_restored` removed, the runtime dropped,
+   `trigger_auto_backup`, the report stored.
+
+What a failure leaves: up to step 3, nothing beyond what the scan persists to BDK, as upstream
+today. From step 4 to the commit, the database rolled back and the stash (and BDK) ahead of it,
+which is S2's state: the next `go_online` plans the same completion and skips the bundles. The
+reverse order would commit `WaitingConfirmations` with change the stash cannot spend.
+
+On rgb-ops 0.11.1-rc.11 the stash is durable at step 4 before `persist()`: rgb-lib loads the
+stock with `autosave`, and a successful `consume_fascia` stores index, state and stash in its own
+commit (nonasync `Persisting::store`, stash last); `persist()` then finds nothing dirty. It stays
+the explicit, fallible durability point. A second consume of the same fascia changes nothing on
+that version (`PubWitness::merge_reveal` returns early on equal TXIDs, bundles and assignments
+are sets), so skipping known bundles is visible only when the file and the stash differ; it is
+there for a base whose stash does not merge (`-bfa`).
+
+The report costs the completing `go_online` the lookups of step 2 and the writes; a
+`go_online` with nothing to complete runs upstream's check.
+
+### What the bridge does (era_rgb, API 14)
+
+API 13 is taken by the bridge's round 8, so this ships as 14.
+
+- `connect` sets `complete_unrecorded_spends: true` in its `OnlineOptions` literal (which has no
+  `..Default::default()`, so a new field cannot be forgotten), pinned with
+  `skip_consistency_check: false` by a guard test.
+- `go_online` / `go_online_direct` return a report built from `wallet.completed_spends()` read
+  under the same lock right after `go_online`. A non-empty report is a mutation
+  (`record_mutation`): the seal debt and the VSS marker go up, an upload follows under
+  `AfterEachMutation`.
+- Errors: `UnrecordedSpend` → not retryable, `UnrecordedSpendUnseen` → retryable, each with its
+  own code; `Inconsistency` gains the reason from `inconsistency_reason()`. The bridge's errors
+  carry the reason code and the batch index, **not the TXID** (design question 4: the app's
+  device-log rule, a TXID links to whom the user pays); the report keeps the TXID, which the
+  host needs to clear its keeper and which it does not log.
+- The drain guard in `drain_to_end`, on `vanilla_tx_record(txid)`: a pending Drain proceeds; a
+  Drain no longer pending (recorded by a broadcast or a completion) returns `Ok(txid)` without
+  calling rgb-lib, so a re-send of the same signed PSBT after a completion is not reported as a
+  failure; no record at all (a `dry_run = true` PSBT, an aborted drain) is refused with its own
+  code (`DrainNotPending`), not `InvalidPsbt`, which the app reads as a faulty device reply.
+- The bridge never calls rgb-lib's public `sync`: its orphan reconcile would mark the inputs
+  spent without the transition or the status, and the completion would never see them (a guard
+  keeps it that way).
+- For the app (T1.3): R5 never aborts a pending Drain before `goOnline`. After a `goOnline` that
+  passed, it aborts one only when the report did not name it, the keeper holds no signed PSBT
+  for it and `listPendingVanillaTxs` still shows it. `BroadcastFailed` / `IndexerUnavailable`
+  from `sendEnd` / `drainToEnd` mean "outcome unknown": keep the signed PSBT, offer no cancel. The
+  retry cadence of `UnrecordedSpendUnseen` is the app's (design question 3).
+
+### Tests
+
+`cargo test --locked --lib --features esplora,vss -- wallet::test::scripted_chain::
+wallet::test::unrecorded_spends::` (4 and 21 tests, offline, in `era.yml`, about 30 s).
+
+**The scripted chain** (`f82b1c1`, `src/wallet/test/scripted_chain.rs`) replaces the regtest
+recordings the design planned (the Docker daemon was not available, and recordings go stale with
+every esplora-client upgrade): one local HTTP server answers the Esplora API rgb-lib and BDK use
+from an in-memory chain the test funds and mines, and the RGB proxy's JSON-RPC. A fault answers
+the next matching requests with a chosen status, after the request took effect if asked; a
+withheld TX is unknown to the indexer until released; a TX can be evicted. Every request is
+logged, and one no route answers fails the test. Wallets under test sign, broadcast, issue and
+settle for real (signatures are not checked). Its self-tests reproduce S1 as upstream meets it.
+
+**Wallet level** (`src/wallet/test/unrecorded_spends.rs`):
+
+| # | Case | Asserts |
+|---|---|---|
+| W1 | donation S1, in the mempool and in a block | the report; one status lookup; `WaitingConfirmations`; the stash witness is the signed TX; the next `go_online` completes and asks nothing; `go_offline` drops the report; settles; the change is spent by the next send; balances |
+| W2 | `refresh` S1 of an ACKed send | the report (`WaitingCounterparty`, not a donation); no RGB proxy request during `go_online`; unsigned witness; settles |
+| W3 | two ACKed sends broadcast by one `refresh`, both answers lost | both completed in one `go_online`; the next one asks nothing |
+| W4 | drain S1 | the report (no batch); nothing pending; no colored UTXO left |
+| W5 | S3: copy after `send_begin`, donation and ACKed send | completed as `Initiated`; unsigned witness; settles with the right balance |
+| W6 | VSS marker | kept through `MOCK_FAIL_BEFORE_COMPLETION_COMMIT`, removed by the completion that commits; kept, with `RestoredBackupInconsistent` and its reason, when refused |
+| W7 | stash ahead of the database: `MOCK_SEND_END_CRASH`, and a completion failed before its commit | completed; stash files byte-equal to a copy of the wallet whose `send_end` went through |
+| W8 | option off | `Inconsistency` with exactly upstream's details, no reason, no status lookup, database and stash unchanged |
+| W9 | `skip_consistency_check` | no lookup, no completion; the report replaced by the next `go_online` |
+| W10 | refusals: copy before `send_begin`, a chain of two sends, a `Failed` donation later broadcast, fascia deleted, lookup 502, TX evicted after a local apply | the error and reason; database and stash digests unchanged |
+| W11 | `try_complete_batch` with another send's `signed.psbt` (`27d2a5a`) | a per-transfer `InvalidPsbt`, no `POST /tx` |
+| | a completion | `backup_info()` goes back to true after a backup |
+| | a fascia whose second bundle the stash refuses | `stash-refused`, database and stash digests unchanged |
+| | `persist()` failing (`MOCK_STASH_PERSIST_FAIL`) | `Err(IO)`, database unchanged, the next `go_online` completes |
+| | bundles the stash holds, with a damaged fascia file | completed (the stash is not consumed again) |
+| | `vanilla_tx_record` of a dry run, an aborted, a pending, an unanswered and a completed drain (`4093572`) | none, none, pending, pending, recorded; `drain_to_end` of the same signed PSBT after the completion answers with its TXID |
+
+**Planner table** (`plan` over real wallet states, each case changed in a transaction rolled
+back and a copy of the transfer files, the indexer's answers given by the case): two donations
+completed in TXID order with their signed witnesses; the witness never BDK's copy (a same-TXID
+copy with other witness data); a donation without `signed.psbt`; `WaitingCounterparty` with ACK
+none, true or false and expired; an unexplained coin (Inconsistency, nothing asked); an
+incoming-only record; a later spend unrecorded, and allowed when its row is spent; a failed
+lookup, an unknown TX, a failed lookup beating an unknown TX, an unknown TX beating a `Failed`
+record; `Failed`, `WaitingConfirmations`, `Settled`; two batches and a batch plus a Drain with one
+TXID; an inflation and a `CreateUtxos` record; six ways of missing or unreadable data; a fascia
+and a `signed.psbt` of the other spend (donation and not), an asset the fascia does not move, an
+input coloring outside T; the moved-along asset; a drain's reservations short, released, and of
+a `SendBtc` record; and P7 on a plan that covers nothing.
+
+**Mutations**: 37, each failing a test. Through the mutation script, 34: P2's uniqueness dropped; an unknown TX read as known and a failed lookup read as unknown; P4 dropped; the witness, input-coloring, asset, transition-kind and `signed.psbt` TXID checks dropped; `Failed` accepted; incoming records accepted; the no-canonical-spender and spender-not-recorded checks dropped; `UnrecordedSpendUnseen` after `UnrecordedSpend`; the consume skipped; the status write, the reservation release, `persist()`, `update_backup_info` and P7 dropped; the runtime persisting on drop again; the option always on; a donation witnessed by BDK's copy of T, or by the unsigned TX; `record_broadcast` without the spent marks; the VSS marker removed before the commit, or kept after it; the bundle skip dropped; the report not reset, or not stored; the drain's three checks dropped; `27d2a5a`'s comparison dropped. By hand: `persist()` moved after the commit (two files), and two of `vanilla_tx_record` (always pending, never found). `persist()` dropped is killed through `MOCK_STASH_PERSIST_FAIL`, a hook inside `persist()`: with `autosave` the stash is on disk before it anyway (above), so no other test can see it.
+
+### Deviations from the design
+
+- **The check's runtime is kept, not re-taken.** The design moved `rgb_runtime()` after the
+  wallet-specific checks for every `go_online`; the fork passes the check's runtime, taken where
+  upstream takes it, to the completion (`&mut`). Without the option the order of the lock, the
+  scans and the drop is upstream's.
+- **`colored_divergence` is not extracted from the singlesig check.** The check stays upstream's
+  text: its details print a `HashSet` difference, which a shared `BTreeSet` would change. The
+  completion computes the same set.
+- **No new broadcast or refresh hooks.** S1 comes from the scripted indexer (a relayed `POST
+  /tx`, its answer and the lookup lost), for `send_end`, `refresh` and `drain_to_end` alike; a
+  `refresh` killed before its commit differs from its S1 only by the ACK rows, which the
+  completion does not read. S2 of a donation uses the existing `MOCK_SEND_END_CRASH`. New hooks:
+  `MOCK_FAIL_BEFORE_COMPLETION_COMMIT`, `MOCK_STASH_PERSIST_FAIL`.
+- **No regtest recordings**: the scripted chain (above). §5.4 of the design (regtest, CC-27 with
+  two instances, the whole suite with the option on) was not run: the harness needs Docker.
+- **The stored fascia carries the unsigned TX**, not the TXID only (`rgb_commit` builds
+  `PubWitness::with(unsigned_tx)`); every statement about the stash's witness says so.
+- **From the review of the design**: the runtime stops persisting on drop before the first
+  consume and a consume failure is `stash-refused`; `.vss_restored` goes after the commit;
+  `Inconsistency` carries a parsable reason and both new errors the batch index; bundles the
+  stash holds are skipped on every base; the drain guard's three outcomes and the R5 rule above
+  replace the note-based rule; the persist mutants are killed by tests that read the stash files.
+- **`vanilla_tx_record`** (`4093572`) is new: the bridge's guard cannot tell a recorded drain from
+  an unknown PSBT through `list_pending_vanilla_txs`, which lists pending ones only.
+- **`Failed` with T on chain stays terminal** (design question 1; the lead's decision of 28.09).
+
+### Carrying it
+
+Checked with `git merge-tree --merge-base=62a8c3a <tag> 106a00c` (2026-09-28; not compiled):
+
+- **`v0.3.0-beta.34-bfa`**: no conflict the series did not already have; the new field joins the
+  existing `eth_rpc_url` hunks (`OnlineOptions`, the UDL dictionary, both examples,
+  `test_go_online_options`).
+- **`v0.3.0-beta.43-bfa`**: `broadcast_psbt` merges cleanly, its `release_reserved_txos` landing
+  inside `record_broadcast`, so a completion releases reservations as their broadcast does (the
+  drain's own delete in `apply` is then a no-op). `go_online_impl`, the consistency check,
+  `singlesig.rs` and the new module merge cleanly. New conflicts: `Error` and the UDL, where the
+  two errors land next to UTEXO's `UnsafeTransferHistory` / `UnexpectedTransfer` (keep both).
+- **To add on `-bfa`**: refuse, as `external-operation`, a batch whose directory holds
+  `COLOR_PREPARE_FILE`, `PREPARE_BATCH_FILE` or `STASH_CONSUMED_FILE`, or whose TXID a `psbt_ops/`
+  operation names (`-bfa` `rust_only.rs`): those belong to UTEXO's `consume_transfer_fascia` /
+  `psbt_op_apply`, which keep their own `STASH_CONSUMED` marker.
+- **On `-bfa`, `go_online` asks an Ethereum RPC** (`web3_clientVersion`) of any wallet whose
+  schemas include BFA: give the scripted chain's wallets schemas without BFA, or add that route,
+  or every scripted test fails on an unmatched request.
+- **The stash**: the private rgb-ops of `-bfa` may not merge a second consume; the bundle skip
+  covers S2 and a completion that did not commit, whatever it does. W7 and the planner table have
+  to pass there, plus one live signet completion on a BFA asset, before T4.6 ships: that base
+  cannot be compiled until UTEXO publishes `s-bfa`.
+
 ## Carrying the series onto a new UTEXO tag
 
 ```sh
@@ -1179,6 +1465,9 @@ git push origin era/<name>                              # the branch only, never
   and target handling only the forwarder tests catch
   (`send_begin_reports_the_forwarders_refusal`,
   `send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment`).
+- `5cab571` to `106a00c` (CC-99): see [Carrying it](#carrying-it) in §6. On
+  `v0.3.0-beta.43-bfa` they add the conflicts in `Error` and the UDL, add a refusal for UTEXO's
+  own prepared batches, and need the scripted tests' wallets without the BFA schema.
 - If the proxy forwarder guard fires, route the new call through
   `WalletOnline::proxy_client`, `reject_list_client` or `check_proxy_endpoint`, and change the
   expected set in `era.yml` only for a line that is not a call site; do not widen the
