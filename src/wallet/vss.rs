@@ -1311,12 +1311,13 @@ impl Drop for Staging {
 /// answer. With encryption enabled in `config` (the default), a backup the manifest marks as
 /// unencrypted is [`Error::VssBackupUnencrypted`], before any of it is downloaded: decrypting is
 /// what authenticates a backup (to restore a plaintext one, disable encryption in `config`). The
-/// name the server gives the wallet is used as a directory name only if it is a wallet
-/// fingerprint (8 lowercase hex characters); anything else is [`Error::VssError`] before any of
-/// the backup is written. An encrypted backup must name that same wallet inside, else
+/// name the server gives the wallet is taken only if it is a wallet fingerprint (8 hex
+/// characters); anything else is [`Error::VssError`] before any of the backup is written. An
+/// encrypted backup must name that same wallet inside (ignoring case), else
 /// [`Error::FingerprintMismatch`]. Only the archive's wallet directory is extracted, into a
-/// staging directory renamed to `<target_dir>/<fingerprint>` once complete: an entry outside it
-/// is not written anywhere. [`restore_from_vss_expecting`] also checks whose wallet it is.
+/// staging directory renamed once complete to `<target_dir>/<name>`, the name being the one the
+/// backup carries (inside an encrypted backup, the server's for a plaintext one): an entry outside
+/// it is not written anywhere. [`restore_from_vss_expecting`] also checks whose wallet it is.
 ///
 /// Returns the path to the restored wallet directory.
 ///
@@ -1332,12 +1333,13 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
 
 /// ERA fork: [`restore_from_vss`] for a host that knows which wallet it restores.
 ///
-/// `expected_fingerprint` is that wallet's master fingerprint as rgb-lib names its directory: 8
-/// lowercase hex characters, anything else being [`Error::InvalidFingerprint`] before anything is
-/// written or requested. The server's word is checked against it, not trusted, before any of the
-/// backup reaches the disk:
+/// `expected_fingerprint` is that wallet's master fingerprint: 8 hex characters, anything else
+/// being [`Error::InvalidFingerprint`] before anything is written or requested, compared ignoring
+/// case (rgb-lib names a wallet directory after the master fingerprint as the host gave it, and the
+/// restored directory keeps the name the backup carries). The server's word is checked against
+/// it, not trusted, before any of the backup reaches the disk:
 /// - the wallet the server names (`backup/fingerprint`) must be this one, else
-///   [`Error::FingerprintMismatch`]; the directory is named after `expected_fingerprint`;
+///   [`Error::FingerprintMismatch`];
 /// - with encryption enabled in `config` (the default), a backup the manifest marks as
 ///   unencrypted is [`Error::VssBackupUnencrypted`], as for [`restore_from_vss`];
 /// - an encrypted backup names its wallet inside, where the server cannot change it: that must be
@@ -1354,11 +1356,13 @@ pub async fn restore_from_vss_expecting(
     restore_from_vss_impl(config, target_dir, Some(expected_fingerprint)).await
 }
 
-/// ERA fork: whether `name` is a wallet fingerprint as rgb-lib names a wallet directory (and the
-/// server's `backup/fingerprint` names it): 8 lowercase hex characters, so it can be a directory
-/// name and nothing else, and names one directory only (not another on a case-insensitive disk).
+/// ERA fork: whether `name` is a wallet fingerprint, as the server's `backup/fingerprint` and a
+/// backup's own directory name it: 8 hex characters, so it can be a directory name and nothing
+/// else. The case is the host's: rgb-lib names a wallet directory after the master fingerprint
+/// exactly as the host gives it, so fingerprints are compared ignoring case, and a restore uses the
+/// name the backup carries.
 fn is_fingerprint(name: &str) -> bool {
-    name.len() == 8 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    name.len() == 8 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 async fn restore_from_vss_impl(
@@ -1436,7 +1440,9 @@ async fn restore_logged(
     // ERA fork: before the download, and checked before it is used as a directory name
     let fingerprint = client.get_fingerprint().await?;
     match expected_fingerprint {
-        Some(expected) if fingerprint != expected => return Err(Error::FingerprintMismatch),
+        Some(expected) if !fingerprint.eq_ignore_ascii_case(expected) => {
+            return Err(Error::FingerprintMismatch);
+        }
         None if !is_fingerprint(&fingerprint) => {
             return Err(Error::VssError {
                 details: "the backup on the server names no wallet fingerprint".to_string(),
@@ -1446,15 +1452,6 @@ async fn restore_logged(
     }
     info!(logger, "Wallet fingerprint: {}", fingerprint);
 
-    let wallet_dir = target_dir_path.join(&fingerprint);
-
-    // Check if wallet already exists
-    if wallet_dir.exists() {
-        return Err(Error::WalletDirAlreadyExists {
-            path: wallet_dir.to_string_lossy().to_string(),
-        });
-    }
-
     info!(logger, "Downloading backup from VSS server...");
     let backup_data = client.download_backup_with(&manifest).await?;
     info!(
@@ -1463,25 +1460,34 @@ async fn restore_logged(
         backup_data.len(),
         backup_data.len() as f64 / 1_000_000.0
     );
-    // ERA fork: the wallet directory in the archive. An encrypted backup names its wallet inside,
-    // where the server cannot change it: that must be the wallet the server named. A plaintext
-    // one is sanitized, its directory being "wallet/" whatever the wallet (upstream extracted it
-    // under that name and renamed it afterwards).
-    let dir_in_zip = if manifest.encrypted {
+    // ERA fork: the wallet directory in the archive, and the name it is restored under. An
+    // encrypted backup names its wallet inside, where the server cannot change it: that must be
+    // the wallet the server named (ignoring case), and is the name. A plaintext one is sanitized,
+    // its directory being "wallet/" whatever the wallet (upstream extracted it under that name and
+    // renamed it afterwards), and the server's name for it is the name.
+    let (dir_in_zip, dir_name) = if manifest.encrypted {
         let named = get_fingerprint_from_zip_bytes(&backup_data)?;
-        if named != fingerprint {
+        if !named.eq_ignore_ascii_case(&fingerprint) {
             return Err(Error::FingerprintMismatch);
         }
-        named
+        (named.clone(), named)
     } else {
-        SANITIZED_DIR_NAME.to_string()
+        (SANITIZED_DIR_NAME.to_string(), fingerprint)
     };
+
+    // Check if wallet already exists
+    let wallet_dir = target_dir_path.join(&dir_name);
+    if wallet_dir.exists() {
+        return Err(Error::WalletDirAlreadyExists {
+            path: wallet_dir.to_string_lossy().to_string(),
+        });
+    }
 
     // Extract backup
     // ERA fork: only the wallet directory, into a staging directory renamed into place once the
     // extraction is complete
     info!(logger, "Extracting backup to {:?}", wallet_dir);
-    let staging = Staging::new(target_dir_path, &fingerprint)?;
+    let staging = Staging::new(target_dir_path, &dir_name)?;
     if unzip_wallet_dir(&backup_data, &dir_in_zip, staging.path(), logger)? == 0 {
         return Err(Error::VssError {
             details: "the backup holds no file of the wallet".to_string(),
@@ -2220,10 +2226,10 @@ mod tests {
             "",
             "a1b2c3d",
             "a1b2c3d4e",
-            "A1B2C3D4",
             "../a1b2c",
             "a1b2/c3d",
             "a1b2c3dz",
+            " a1b2c3d",
         ] {
             let result = restore(config(&server, test_signing_key()), &target, Some(expected));
             assert!(
@@ -2517,12 +2523,10 @@ mod tests {
     #[test]
     fn restore_refuses_a_server_fingerprint_that_is_not_one() {
         // upstream's restore_from_vss: the name the server gives the wallet became a directory
-        // name as it came, so "../escape" put the restored wallet next to the target; an upper
-        // case one names another directory than rgb-lib's (the same one on a case-insensitive
-        // disk)
+        // name as it came, so "../escape" put the restored wallet next to the target
         let key = test_signing_key();
         let [manifest, data, _] = uploaded(EXPECTED, &key, false);
-        for named in ["../escape", "A1B2C3D4", "a1b2c3d4/", "", "/tmp/era-escape"] {
+        for named in ["../escape", "a1b2c3d4/", "", "/tmp/era-escape", "a1b2c3dz"] {
             let server = VssScript::start(vec![
                 (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
                 (BACKUP_KEY_FINGERPRINT, vec![named.into()]),
@@ -2935,6 +2939,211 @@ mod tests {
             let (result, reads) = restored(answers);
             assert!(matches!(result, Err(Error::VssError { .. })), "{result:?}");
             assert_eq!(reads, expected_reads);
+        }
+    }
+
+    // ERA fork: a fingerprint's case is the host's (rgb-lib names a wallet directory after the
+    // master fingerprint as given): compared ignoring case, restored under the backup's own name
+
+    const UPPER: &str = "928E8C83";
+
+    #[test]
+    fn a_backup_named_in_upper_case_restores_under_its_own_name() {
+        let key = test_signing_key();
+        // encrypted, the server naming it as the upload did (from the archive), or in another case
+        let [manifest, data, metadata] = uploaded(UPPER, &key, true);
+        for named in [UPPER, "928e8c83"] {
+            let server = VssScript::start(vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
+                (BACKUP_KEY_FINGERPRINT, vec![named.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+                (BACKUP_KEY_METADATA, vec![metadata.clone()]),
+            ]);
+            for expected in [None, Some("928e8c83"), Some(UPPER), Some("928e8C83")] {
+                let root = tempfile::tempdir().unwrap();
+                let target = root.path().join("data");
+                let restored = restore(config(&server, key), &target, expected).unwrap();
+                assert_eq!(restored, target.join(UPPER), "{named} {expected:?}");
+                assert!(restored.join("some_file.txt").is_file());
+            }
+        }
+        // plaintext (encryption off): the server's name for it
+        let [manifest, data, _] = uploaded(UPPER, &key, false);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![UPPER.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+        ]);
+        for expected in [None, Some("928e8c83")] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let restored = restore(
+                config(&server, key).with_encryption(false),
+                &target,
+                expected,
+            )
+            .unwrap();
+            assert_eq!(restored, target.join(UPPER), "{expected:?}");
+        }
+        // another wallet is another wallet, whatever the case
+        let root = tempfile::tempdir().unwrap();
+        let result = restore(
+            config(&server, key).with_encryption(false),
+            &root.path().join("data"),
+            Some("928e8c84"),
+        );
+        assert!(
+            matches!(result, Err(Error::FingerprintMismatch)),
+            "{result:?}"
+        );
+    }
+
+    /// A VSS server that keeps what it is given (putObjects) and answers getObject from it.
+    struct VssStore {
+        server: mockito::ServerGuard,
+        _mocks: [mockito::Mock; 2],
+    }
+
+    impl VssStore {
+        fn start() -> Self {
+            use vss_client::prost::Message;
+            use vss_client::types::{
+                ErrorCode, ErrorResponse, GetObjectResponse, PutObjectRequest, PutObjectResponse,
+            };
+            // key: (version, value)
+            type Kept = HashMap<String, (i64, Vec<u8>)>;
+            let state: Arc<std::sync::Mutex<Kept>> = Arc::default();
+            let key_of = |request: &mockito::Request| {
+                GetObjectRequest::decode(&request.body().unwrap()[..])
+                    .unwrap()
+                    .key
+            };
+            let (known, stored, kept) = (state.clone(), state.clone(), state);
+            let mut server = mockito::Server::new();
+            let get = server
+                .mock("POST", mockito::Matcher::Regex("/getObject$".to_string()))
+                .with_status_code_from_request(move |request| {
+                    if known.lock().unwrap().contains_key(&key_of(request)) {
+                        200
+                    } else {
+                        404
+                    }
+                })
+                .with_body_from_request(move |request| {
+                    let key = key_of(request);
+                    match stored.lock().unwrap().get(&key) {
+                        Some((version, value)) => GetObjectResponse {
+                            value: Some(KeyValue {
+                                key,
+                                version: *version,
+                                value: value.clone(),
+                            }),
+                        }
+                        .encode_to_vec(),
+                        None => ErrorResponse {
+                            error_code: ErrorCode::NoSuchKeyException as i32,
+                            message: "no such key".to_string(),
+                        }
+                        .encode_to_vec(),
+                    }
+                })
+                .create();
+            let put = server
+                .mock("POST", mockito::Matcher::Regex("/putObjects$".to_string()))
+                .with_body_from_request(move |request| {
+                    let request = PutObjectRequest::decode(&request.body().unwrap()[..]).unwrap();
+                    let mut kept = kept.lock().unwrap();
+                    for item in request.transaction_items {
+                        let version = kept.get(&item.key).map_or(0, |(v, _)| *v);
+                        kept.insert(item.key, (version + 1, item.value));
+                    }
+                    for item in request.delete_items {
+                        kept.remove(&item.key);
+                    }
+                    PutObjectResponse {}.encode_to_vec()
+                })
+                .create();
+            Self {
+                server,
+                _mocks: [get, put],
+            }
+        }
+
+        fn config(&self, key: SecretKey) -> VssBackupConfig {
+            VssBackupConfig::new(self.server.url(), "store".to_string(), key)
+        }
+    }
+
+    #[test]
+    fn a_wallet_named_in_upper_case_restores_from_its_own_upload() {
+        use crate::keys::{WitnessVersion, generate_keys};
+        use crate::wallet::SinglesigKeys;
+        use crate::wallet::offline::RgbWalletOpsOffline;
+        use crate::wallet::test::era_fixtures::dir_listing;
+        use crate::wallet::test::get_test_wallet_raw;
+        use crate::{BitcoinNetwork, utils::LOG_FILE};
+        // a watch-only wallet the host names with an upper-case master fingerprint, which rgb-lib
+        // takes as given
+        let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+        let mut wallet_keys = SinglesigKeys::from_keys_no_mnemonic(&keys, None);
+        wallet_keys.master_fingerprint = keys.master_fingerprint.to_uppercase();
+        let wallet = get_test_wallet_raw(&wallet_keys, None, BitcoinNetwork::Regtest);
+        let wallet_dir = wallet.get_wallet_dir();
+        let name = wallet_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(name, wallet_keys.master_fingerprint);
+        let key = test_signing_key();
+        let store = VssStore::start();
+        let client = VssBackupClient::new(store.config(key)).unwrap();
+        block_on(wallet.vss_backup(&client)).unwrap();
+        drop(client);
+        // what the restore must reproduce (the wallet's log is not backed up)
+        let listing: String = dir_listing(wallet_dir.parent().unwrap(), &name)
+            .lines()
+            .filter(|line| !line.ends_with(&format!("/{LOG_FILE}")))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for expected in [None, Some(name.to_lowercase()), Some(name.clone())] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let restored = restore(store.config(key), &target, expected.as_deref()).unwrap();
+            assert_eq!(restored, target.join(&name), "{expected:?}");
+            assert_eq!(dir_listing(&target, &name), listing, "{expected:?}");
+        }
+    }
+
+    #[test]
+    fn a_restore_never_writes_into_an_existing_wallet_directory() {
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded(EXPECTED, &key, true);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        for existing in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            // the wallet's directory already there, holding a file or empty
+            fs::create_dir_all(target.join(EXPECTED)).unwrap();
+            if existing {
+                fs::write(target.join(EXPECTED).join("rgb_lib_db"), b"the wallet").unwrap();
+            }
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(
+                matches!(result, Err(Error::WalletDirAlreadyExists { .. })),
+                "{result:?}"
+            );
+            let left: Vec<String> = fs::read_dir(target.join(EXPECTED))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            let expected: &[&str] = if existing { &["rgb_lib_db"] } else { &[] };
+            assert_eq!(left, expected);
         }
     }
 }
