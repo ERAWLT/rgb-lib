@@ -909,6 +909,10 @@ pub enum UnrecordedSpendReason {
     RecordMismatch,
     /// The RGB stash refused the transfer's state transitions
     StashRefused,
+    /// Reserved for the fork's series on UTEXO's `-bfa` bases, never produced on this one: the
+    /// batch belongs to an operation of UTEXO's own flows (a color-prepare or PSBT operation),
+    /// which completes it itself
+    ExternalOperation,
 }
 
 impl UnrecordedSpendReason {
@@ -922,6 +926,7 @@ impl UnrecordedSpendReason {
             UnrecordedSpendReason::TransferDataMissing => "transfer-data-missing",
             UnrecordedSpendReason::RecordMismatch => "record-mismatch",
             UnrecordedSpendReason::StashRefused => "stash-refused",
+            UnrecordedSpendReason::ExternalOperation => "external-operation",
         }
     }
 
@@ -935,6 +940,7 @@ impl UnrecordedSpendReason {
             UnrecordedSpendReason::TransferDataMissing,
             UnrecordedSpendReason::RecordMismatch,
             UnrecordedSpendReason::StashRefused,
+            UnrecordedSpendReason::ExternalOperation,
         ]
         .into_iter()
         .find(|r| r.code() == code)
