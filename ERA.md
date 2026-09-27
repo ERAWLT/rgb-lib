@@ -16,7 +16,7 @@ Rules for the branch:
 - **Push only the branch to origin, never tags**: `git push origin era/configurable-derivation`,
   never `--tags`, `--follow-tags` or `--mirror`, and never a UTEXO tag. A UTEXO `v*`
   tag pushed here runs `release.yml` as it is in the tagged commit, which has no owner
-  condition (see [§2](#2-ci-1d26404-extended-in-f808c7f-07e16e5-and-e7bdaa4)). This clone
+  condition (see [§2](#2-ci-1d26404-extended-in-f808c7f-07e16e5-e7bdaa4-and-bef0c03)). This clone
   holds UTEXO's tags from `git fetch utexo --tags`, including `v0.3.0-beta.43-bfa`,
   which origin does not have.
 - A new UTEXO base gets a **new branch** (see [Carrying the series](#carrying-the-series-onto-a-new-utexo-tag)),
@@ -33,8 +33,18 @@ Rules for the branch:
 | `d82e21a` | Document the ERA fork of rgb-lib (this file) | Fork-only |
 | `07e16e5` | Guard HTTP client construction and probe real https in CI | Fork-only |
 | `e7bdaa4` | Route RGB proxy traffic through an optional loopback forwarder | Fork-only (generic enough to offer UTEXO later; nothing drafted) |
+| `3f0a555` | Put the forwarder comment on the forwarder test module | Fork-only |
+| `fafe3bd` | Fail closed when a forwarded reject list is not a 2xx answer | Fork-only |
+| `bef0c03` | Route every proxy call site through the wallet's own helpers | Fork-only |
+| `ccd23e9` | Report a forwarder's refusal as Error::ForwarderRefused | Fork-only |
+| `8a0255f` | Refuse forward targets that carry userinfo or a fragment | Fork-only |
+| `cf0afa5` | Apply a new forwarder before go_online probes a new indexer | Fork-only |
+| `9718cac` | Keep the forwarder's URL out of request errors | Fork-only |
+| `0996972` | Describe the reviewed forwarder contract in its rustdoc | Fork-only |
 
-Later commits that touch only this file are part of the series too.
+Later commits that touch only this file are part of the series too. `3f0a555` to `0996972`
+answer the review of `e7bdaa4` ([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the
+series is carried.
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -110,7 +120,7 @@ wallet on the same account uses.
 defaults per network, shared-keychain and non-hardenable rejections, the single-account
 layout from xpubs and from a mnemonic, unchanged default descriptors).
 
-## 2. CI (`1d26404`, extended in `f808c7f`, `07e16e5` and `e7bdaa4`)
+## 2. CI (`1d26404`, extended in `f808c7f`, `07e16e5`, `e7bdaa4` and `bef0c03`)
 
 `.github/workflows/era.yml` has two jobs.
 
@@ -291,22 +301,27 @@ rgb-lib; the difference grows toward these numbers as the app exposes the online
 
 ## 4. Proxy forwarder (`e7bdaa4`)
 
+Reworked after an independent review (2026-09-27, "pass with issues") in `fafe3bd` (reject
+list fails closed), `bef0c03` (the route comes only from the wallet), `ccd23e9` (refusal
+signal), `8a0255f` (no userinfo or fragment in a target), `cf0afa5` (`go_online` applies the
+forwarder before its indexer probe), `9718cac` (errors never name the forwarder) and
+`0996972` (rustdoc). This section describes the result.
+
 ### Why
 
-The app sends all of rgb-lib's network traffic through a forwarder it runs on
-`127.0.0.1` (the plan's D7 = N2, task T1.8): host allowlist, TLS pinning and logging in
-Dart. The Esplora indexer and VSS take whatever URL the host passes, so they can point
-at the forwarder. The RGB proxy cannot: its endpoint is a property of each **invoice**.
-The receiver polls the endpoints in its own invoice, the sender posts to the endpoints
-in the receiver's invoice (`online.rs` `wait_consignment` / `post_transfer_data`). An
-invoice carrying `rpc://127.0.0.1:<port>` is useless to the other wallet, and one
-carrying the public endpoint makes rgb-lib contact the proxy directly, around the
-forwarder (CC-79 in the app's docs).
+The app sends all of rgb-lib's network traffic through a forwarder it runs on `127.0.0.1`
+(the plan's D7 = N2, task T1.8), which decides for each request whether and how it leaves the
+phone ([below](#the-forwarders-side)). The Esplora indexer and VSS take whatever URL the host
+passes, so they can point at the forwarder. The RGB proxy cannot: its endpoint is a property of
+each **invoice**. The receiver polls the endpoints in its own invoice, the sender posts to the
+endpoints in the receiver's invoice (`online.rs` `wait_consignment` / `post_transfer_data`). An
+invoice carrying `rpc://127.0.0.1:<port>` is useless to the other wallet, and one carrying the
+public endpoint makes rgb-lib contact the proxy directly, around the forwarder (CC-79 in the
+app's docs).
 
-The reject list has the same shape, one step worse: its URL comes from the asset
-contract (`reject_list_url`), and consignment validation in `refresh` and `send_begin`
-fetch it. Any asset sent to the wallet can name a host rgb-lib will then contact. So
-the patch routes it too.
+The reject list has the same shape, one step worse: its URL comes from the asset contract
+(`reject_list_url`), and consignment validation in `refresh` and `send_begin` fetch it. Any
+asset sent to the wallet can name a host rgb-lib will then contact. So the patch routes it too.
 
 ### What the app calls
 
@@ -316,7 +331,8 @@ wallet.go_online(OnlineOptions {
     indexer_url,                        // the forwarder's Esplora route (T1.8)
     skip_consistency_check: false,
     vanilla_sync_lookback,
-    forwarder_url: Some(format!("http://127.0.0.1:{port}/rgb")), // None = upstream behaviour
+    // None = upstream behaviour; the path may carry a per-session secret
+    forwarder_url: Some(format!("http://127.0.0.1:{port}/{session_secret}/rgb")),
 })?;
 
 // the forwarded twin of rust_only::check_proxy_url (not needed by a wallet that is online)
@@ -324,116 +340,248 @@ rgb_lib::wallet::rust_only::check_proxy_url_via_forwarder(proxy_url, forwarder_u
 ```
 
 - `forwarder_url` must be plain `http` to a loopback IP literal (`127.0.0.0/8` or
-  `[::1]`; `localhost` is refused), with no credentials, query, fragment or port 0.
-  A path is allowed and used as given. Anything else is
-  `Error::InvalidForwarderUrl { details }` (new variant, also in the uniffi UDL), raised
-  by `go_online` **before** it changes anything, so the previous route stays in force.
-- `go_online` applies the value on every call, including one that keeps the indexer
-  URL (same `Online` id); `None` on a later call switches back to direct connections.
-  The setting lives in `OnlineOptions` rather than behind a wallet setter because it is
-  a route like `indexer_url`: the forwarder gets a new port on every unlock and both
-  change in the same call. Every proxy request happens inside an online method, after
-  the `Online` check, so the forwarder is always in reach.
-- A missing field deserializes to `None` (C-FFI JSON), the uniffi dictionary defaults it
-  to `null`. A Rust struct literal has to name it: that is deliberate, a host upgrading
-  the rev has to decide.
+  `[::1]`; `localhost` is refused), with no credentials, query, fragment or port 0. A path
+  is allowed and used as given. Anything else is `Error::InvalidForwarderUrl { details }`,
+  raised by `go_online` **before** it changes anything, so the previous route stays in force.
+- **A per-session secret belongs in that path.** A loopback port is reachable by every app on
+  the phone, so the forwarder cannot tell rgb-lib from another app by the connection alone. A
+  random path segment per session (`/{session_secret}/rgb`), checked by the forwarder on every
+  request, can. rgb-lib keeps `forwarder_url` in memory only (the wallet's `OnlineData`): it is
+  not written to the wallet's files, invoices, the database or a backup, not logged, and a
+  failed request's error names the URL the request was meant for, never the forwarder's
+  (`9718cac`).
+- **`go_online` applies a valid value on every call, before anything that can fail.** A
+  refused `forwarder_url` changes nothing. Otherwise the new forwarder (or `None`, back to
+  direct connections) is in force as soon as `forwarder_url` has been validated, before the
+  probe of a new `indexer_url` and before the consistency check: a call that fails there
+  still moves the proxy traffic, while the wallet stays online on its previous indexer, as
+  upstream keeps it (`cf0afa5`). The forwarder gets a new port and secret on every unlock, and
+  the previous port may belong to another app by then. A first `go_online` that fails leaves
+  the wallet offline, with no proxy traffic at all.
+- The setting lives in `OnlineOptions` rather than behind a wallet setter because it is a
+  route like `indexer_url`: both change in the same call. Every proxy request happens inside
+  an online method, after the `Online` check, so the forwarder is always in reach.
+- A missing field deserializes to `None` (C-FFI JSON), the uniffi dictionary defaults it to
+  `null`. A Rust struct literal has to name it: that is deliberate, a host upgrading the rev
+  has to decide.
 
-### The contract (what T1.8's forwarder implements)
+### What rgb-lib guarantees
 
-For every request rgb-lib's RGB proxy client and reject-list client make, with
-`forwarder_url` set:
+With `forwarder_url` set, for every request rgb-lib makes to an RGB proxy or a reject list:
 
-- **URL**: the request goes to `forwarder_url` exactly (nothing appended), over plain
-  HTTP/1.1. No request goes to the real host: the client has redirects off and the
-  system proxy off (`no_proxy`), so a 3xx answer is not followed and an `HTTP_PROXY`
-  in the environment is not used.
-- **Headers** added:
-  - `X-Era-Forward-Target`: the absolute URL rgb-lib would have requested, as reqwest
-    parses it (`url::Url` serialization: lower-case host, punycode, explicit
-    non-default port, path, query if any). An `rpcs://host/path` transport endpoint
-    becomes `https://host/path`, `rpc://` becomes `http://`; that mapping is upstream's
-    (`TransportEndpoint::try_from`). Always `http` or `https` with a host; anything else
-    fails inside rgb-lib before a request is made, as it does without a forwarder.
+- **Destination**: `forwarder_url` exactly (scheme, host, port and path as given, nothing
+  appended), HTTP/1.1 over plain TCP. Redirects are not followed (a 3xx is read as an
+  answer), the system proxy is ignored (`no_proxy`, so an `HTTP_PROXY` in the environment is
+  not used), and no error of any kind leads to a direct connection. Wallet code gets these
+  clients only from the wallet's own route ([Guard and tests](#guard-and-tests)).
+- **Headers added**, and no others:
+  - `X-Era-Forward-Target`: the absolute URL rgb-lib would have requested, as `url::Url`
+    serializes it: scheme and host lower-case, a non-ASCII host in punycode, an IPv4 address
+    in dotted decimal, the scheme's default port dropped, dot segments resolved, a character
+    a path may not hold (a space) percent-encoded. An `rpcs://host/path` transport endpoint
+    becomes `https://host/path`, `rpc://` becomes `http://` (upstream's
+    `TransportEndpoint::try_from`).
+    Always `http` or `https` with a host (anything else fails inside rgb-lib, as it does
+    without a forwarder). Never userinfo, never a fragment: a URL carrying either is
+    `Error::InvalidForwardTarget` and is not requested at all (`8a0255f`), as
+    `rpcs://rgb-proxy.utexo.com@evil.example/json-rpc` (host `evil.example`) would otherwise
+    be. It may carry a query: `send_begin` probes an invoice endpoint with its recipient nonce
+    (`?rid_nonce=<hex>`).
   - `X-Era-Forward-Kind`: `rgb-proxy` or `reject-list`.
-- **Everything else is unchanged**: method, body, `Content-Type`.
-  - `rgb-proxy`: always `POST`. `server.info`, `ack.get`, `ack.post`,
-    `consignment.get`, `media.get` are `application/json` JSON-RPC bodies;
-    `consignment.post` and `media.post` are `multipart/form-data` with the fields
-    `method`, `jsonrpc`, `id`, `params` and the file part `file` (a consignment can be
-    megabytes: stream it, keep the boundary).
+- **Everything else as without a forwarder**: method, body, `Content-Type`.
+  - `rgb-proxy`: always `POST`. `server.info`, `ack.get`, `ack.post`, `consignment.get`,
+    `media.get` are `application/json` JSON-RPC bodies; `consignment.post` and `media.post`
+    are `multipart/form-data` with the fields `method`, `jsonrpc`, `id`, `params` and the file
+    part `file` (a consignment can be megabytes: stream it, keep the boundary).
   - `reject-list`: `GET`, no body; the answer is plain text, one opout per line.
-- **The forwarder must**: check `X-Era-Forward-Target` against its allowlist (per
-  kind), strip both `X-Era-Forward-*` headers, send the request to the target with its
-  own TLS and pinning (the `Host` is the target's), and return the upstream status and
-  body as they came. rgb-lib reads the body as JSON-RPC whatever the status, exactly as
-  it reads the proxy's own answer.
-- **Refusing or failing**: answer with any non-2xx status and a body that is not a
-  JSON-RPC response (403 for a target off the allowlist, 503 for an upstream that
-  cannot be reached, 503 to cut a pending call short on lock). Never a 3xx. rgb-lib
-  then behaves as it does when the proxy itself is down: `send_begin` marks the
-  endpoint unusable (`InvalidTransportEndpoints` when none is left), a failed
-  consignment post in `send_end` moves to the next endpoint (`NoValidTransportEndpoint`
-  after the last) while a failed media post is `Error::Proxy`, a receive in `refresh`
-  reads it as "no consignment yet" and keeps waiting, the ACK poll of a send (that
-  transfer's `failure` in the refresh result) and ACK/NACK posts are `Error::Proxy`, a
-  reject list is `Error::RejectListService`. A forwarder that is not listening is the
-  same. There is no fallback to a direct connection anywhere.
+- **Answers** are read as the target's own, with two exceptions:
+  - **the refusal signal**: status **403** with a response header **`X-Era-Forward-Refused`**
+    is the forwarder refusing the request. Its value is the reason, passed through (up to 256
+    characters) in `Error::ForwarderRefused { target, reason }`, `target` being the
+    `X-Era-Forward-Target` value (`ccd23e9`). Both parts are required: a 403 without the
+    header, or the header on another status, is an ordinary answer;
+  - **the reject list fails closed**: only a 2xx answer is read as the list; any other
+    status is `Error::RejectListService` with the status in `details` (`fafe3bd`). Read as a
+    list, an error page holds no opout, and the asset would be validated against an empty
+    list.
+
+  For `rgb-proxy`, any other answer is read as JSON-RPC whatever its status, exactly as rgb-lib
+  reads the proxy's own; a body that is not a JSON-RPC response is `Error::Proxy`.
+
+### How the forwarder must match a target
+
+The allowlist decision is the forwarder's, on a URL that comes from a counterparty's invoice or
+an asset contract. The rule:
+
+1. Parse `X-Era-Forward-Target` as a URL, with a WHATWG-conformant parser (the form above is
+   `url::Url`'s, so parsing and serializing it again gives the same string). Refuse the
+   request if it does not parse, is not absolute `http` or `https`, or carries userinfo or a
+   fragment: rgb-lib never sends those, so such a header is not rgb-lib's.
+2. Compare **scheme**, **host** and **effective port** (the explicit port, else 443 for
+   `https` and 80 for `http`) exactly with the allowlist entry, on the parsed values: the host
+   as serialized (lower-case, punycode, dotted-decimal IPv4, bracketed IPv6).
+3. Never match on the header text: no prefix, suffix or substring test, no `startsWith`
+   (`https://rgb-proxy.utexo.com@evil.example/` starts with a known host), no wildcard beyond
+   what an entry says explicitly.
+4. The **path** is per allowlist entry (for example exactly `/json-rpc` for a proxy, the
+   list's own path for a reject list), compared on the parsed path.
+5. The **query** is not part of the match (a probe carries `rid_nonce`); relay it as it is.
+6. An entry holds for one **kind**: a proxy entry does not admit a `reject-list` request, nor
+   the other way round.
+
+### The forwarder's side
+
+Not rgb-lib's code; what the fork's contract expects of it, consistent with the app's
+decision D7 as amended by the project lead on 2026-09-27:
+
+- **Check the caller**: the path of `forwarder_url` must carry the session's secret; any other
+  path is refused.
+- **Strip** both `X-Era-Forward-*` headers before relaying; the `Host` is the target's.
+- **A target on the allowlist** (per kind) is relayed to the app's own **backend**, which
+  relays it to the target (N2: pinning, the backend's own controls).
+- **An unknown recipient proxy** (`rgb-proxy` only) may be reached **directly by the
+  forwarder itself, only after the user explicitly approved a warning** naming that host:
+  system TLS, redirects not followed, no pinning (there is nothing to pin for an arbitrary
+  host).
+- **A reject list is allowlist-only**: there is no user to ask.
+- **Everything else is refused with the refusal signal**: `403` and
+  `X-Era-Forward-Refused: <reason>`, the reason a short token of the app's choosing (for
+  example `not-allowlisted`, `user-declined`, `consent-expired`).
+- **Relay the target's status and body as they came.** Never answer with a 3xx. For a failure
+  of its own (the backend is down, the target cannot be reached, a pending call is cut short
+  on lock) answer a non-2xx status **without** the refusal header, for example 503: rgb-lib
+  then behaves as for a proxy that is down, and the call can be retried.
+
+### How it surfaces in rgb-lib
+
+| Request | Sent by | The forwarder refuses | The forwarder fails (not listening, a non-2xx that is not JSON-RPC, a timeout) |
+|---|---|---|---|
+| `server.info` | `send_begin`, for each endpoint of each recipient | endpoint unusable; `ForwarderRefused` (the first) if no endpoint of the recipient is usable | endpoint unusable; `InvalidTransportEndpoints` ("no valid transport endpoints") if none is |
+| `server.info` | `rust_only::check_proxy_url_via_forwarder` | `ForwarderRefused` | `Proxy` ("unable to connect to proxy") |
+| `consignment.post` | `send_end`, the usable endpoints in turn | next endpoint; `ForwarderRefused` if none took the consignment | next endpoint; `NoValidTransportEndpoint` if none took it |
+| `media.post` | `send_end`, after the consignment | `ForwarderRefused` | `Proxy` |
+| `ack.get` | `refresh` of a send waiting for its ACK | the transfer's `failure`: `ForwarderRefused` | the transfer's `failure`: `Proxy` |
+| `ack.post` (ACK, NACK) | `refresh` of a receive | the transfer's `failure`: `ForwarderRefused` | the transfer's `failure`: `Proxy` |
+| `media.get` | `refresh`, receiving an asset the wallet does not know | the transfer's `failure`: `ForwarderRefused` | the transfer's `failure`: `Proxy` |
+| `consignment.get` | `refresh` of a receive | "no consignment yet": no failure, the receive keeps waiting | the same |
+| reject list `GET` | `refresh` (receiving an IFA asset), `send_begin` (sending one) | `ForwarderRefused` | `RejectListService` (a non-2xx answer included) |
+
+- A refused endpoint next to a usable one is skipped like an unreachable one, so an invoice
+  listing an unknown proxy beside a known one sends through the known one without an error.
+- `consignment.get` is deliberately unchanged: upstream reads every failure there as "no
+  consignment yet", and `fail_transfers` refreshes a transfer before failing it, so an error
+  there would make an expired receive impossible to fail for as long as the forwarder refuses.
+  The refusal is visible where it is made, in the forwarder.
+- A failing reject list (refused or not) leaves the transfer waiting with that failure on
+  every `refresh`; as upstream does when the list is unreachable, `fail_transfers` cannot fail
+  it meanwhile (it refreshes first). That is the cost of failing closed: a reject list host
+  the app serves must be on its allowlist.
+- `ForwarderRefused` is the forwarder's policy speaking: the same request gets the same
+  answer until something changes on the forwarder's side (its allowlist, the user's consent).
+  An outage keeps today's errors, which a retry can clear.
+- `InvalidForwardTarget` fails `send_begin` at once, even when another endpoint of the
+  recipient is usable: an invoice carrying such an endpoint is malformed or hostile, not a
+  proxy that happens to be down. A stored endpoint only gets there through a `send_begin`
+  made without a forwarder; its requests are never sent, and the error takes the path of a
+  failed request in the table.
 
 ### What does not change
 
-- Invoices, the transport endpoints stored with transfers and in the DB, and every
-  value rgb-lib returns keep the real endpoint
-  (`wallet::test::forwarder::proxy_traffic_goes_through_the_forwarder` checks the
-  invoice and the stored transfer).
+- Invoices, the transport endpoints stored with transfers and in the DB, and every value
+  rgb-lib returns keep the real endpoint
+  (`wallet::test::forwarder::proxy_traffic_goes_through_the_forwarder` checks the invoice and
+  the stored transfer).
 - With `forwarder_url` unset: the same client (upstream's `ProxyClient::new` /
-  `RejectListClient::new`), the same requests, no extra header.
+  `RejectListClient::new`), the same requests, no extra header, the same errors. Upstream
+  reads a direct reject list's answer as the list whatever its status (a 503 page is an empty
+  list); the fork leaves that path as it is (a test pins it). Worth reporting to UTEXO.
 - Not routed by this patch, because the host already chooses those URLs: the indexer
   (`indexer_url`), VSS (its server URL), the multisig hub and DFNS (not used by the app).
   On the `-bfa` bases, `OnlineOptions::eth_rpc_url` (BFA validation reads an Ethereum
   RPC) is the same kind of host-chosen URL: point it at the forwarder too.
 
+### Public API the host adapts to
+
+- `OnlineOptions::forwarder_url: Option<String>` (`e7bdaa4`).
+- `rust_only::check_proxy_url_via_forwarder(proxy_url, forwarder_url)` (`e7bdaa4`); it now
+  returns `ForwarderRefused` and `InvalidForwardTarget` as such.
+- `Error::InvalidForwarderUrl { details }` (`e7bdaa4`), `Error::ForwarderRefused { target,
+  reason }` (`ccd23e9`), `Error::InvalidForwardTarget { details }` (`8a0255f`), all three
+  mirrored in the uniffi UDL, whose build fails on a missing one (`cargo check --locked` in
+  `bindings/uniffi`; not in `era.yml`).
+- Changed error on a routed path: `send_begin` returns `ForwarderRefused` where it returned
+  `InvalidTransportEndpoints` ("no valid transport endpoints") because of a refusal, and
+  `InvalidForwardTarget` for an endpoint with userinfo or a fragment; `send_end` returns
+  `ForwarderRefused` where it returned `NoValidTransportEndpoint` because of a refusal; a
+  forwarded reject list answering a non-2xx status is `RejectListService` where it used to be
+  read as an (empty) list.
+
 ### Where it is
 
-`src/api/forwarder.rs` (validation, the client, the headers, tests), `ProxyClient` /
-`RejectListClient` (`new_routed` and the one place each builds a request),
-`WalletOnline::forwarder` / `proxy_client` and `go_online_impl` in
+`src/api/forwarder.rs` (validation of `forwarder_url`, the client, the target check and the
+headers in `Forwarder::request`, `Forwarder::refusal`, `Forwarder::scrub`, the client-level
+tests), `ProxyClient::post` / `ProxyClient::call` and `RejectListClient::get_forwarded` (the
+one place each builds, sends and reads a routed request), `WalletOnline::forwarder` /
+`proxy_client` / `reject_list_client` / `check_proxy_endpoint` and `go_online_impl` in
 `src/wallet/online.rs`, `utils::check_proxy_routed`, `OnlineOptions::forwarder_url`,
-`OnlineData::forwarder`, `Error::InvalidForwarderUrl`,
-`rust_only::check_proxy_url_via_forwarder`.
+`OnlineData::forwarder`, the three error variants, `rust_only::check_proxy_url_via_forwarder`.
 
 ### Guard and tests
 
-**The proxy forwarder guard** (`era.yml`): wallet code gets these clients only through
-`WalletOnline::proxy_client`, `RejectListClient::new_routed` and `check_proxy_routed`. A
-plain `ProxyClient::new(`, `RejectListClient::new(` or `check_proxy(` anywhere in `src/`
-outside `src/api/` and `src/wallet/test/` fails the step, except `check_proxy`'s own
-definition and test in `utils.rs` and `rust_only::check_proxy_url` (upstream's public
-function: no wallet, so no forwarder). The step also fails when the pattern stops
-matching upstream's own tests. It is a grep: a client built under another name escapes
-it, the same limit as the HTTP client guard.
+**The proxy forwarder guard** (`era.yml`, "Proxy and reject-list clients only through the
+wallet's route"): wallet code reaches an RGB proxy or a reject list only through
+`WalletOnline::proxy_client`, `reject_list_client` and `check_proxy_endpoint`, which read the
+forwarder `go_online` stored and take no route from their caller. The step lists every
+`ProxyClient::new(` / `::new_routed(`, `RejectListClient::new(` / `::new_routed(`,
+`check_proxy(` and `check_proxy_routed(` in `src/` outside the three client files and the
+tests, and fails unless the list is exactly the expected set: the three helpers, upstream's
+`check_proxy` (definition, body, test), `rust_only::check_proxy_url` (no wallet, so no
+forwarder) and `check_proxy_url_via_forwarder` (given one explicitly), and the TLS tests in
+`src/api/mod.rs`. A call site passing `None` to a routed constructor, a direct constructor, or
+a second copy of a helper's line fails it (checked by mutation). It is a grep: a client built
+under another name escapes it, the same limit as the HTTP client guard.
 
 `cargo test --locked --lib --features esplora,vss -- api::forwarder:: wallet::test::forwarder::`
-(12 tests, local mockito servers, no regtest):
+(34 tests, local mockito servers, no regtest). The forwarder in the wallet tests has a path,
+and every request must arrive on it.
 
-- every proxy method (all seven) arrives at the forwarder with the right target and
-  kind, and nothing reaches the proxy; the reject list the same; `check_proxy_url_via_forwarder`;
-- the target keeps scheme, port, path and query (`https` for `rpcs`, `http` for `rpc`);
-- without a forwarder the request goes to the proxy with no `X-Era-*` header, and
-  `new_routed(.., None)` is upstream's client;
-- a forwarder that is down, answers 403, or redirects to the proxy: an error, and the
-  proxy is never contacted;
-- URL validation (accepted and refused forms);
-- wallet level: `go_online` with a forwarder, a witness receive whose invoice and
-  stored transfer carry the real proxy, `refresh` sending `consignment.get` for the
-  transfer's proxy recipient ID through the forwarder; the same without a forwarder
-  going direct; `go_online` switching the forwarder on and off on the same indexer and
-  refusing bad URLs without changing the route; a forwarder that is down leaving the
-  transfer waiting with nothing sent around it.
+- Client level (`api::forwarder::tests`, 15): every proxy method arrives with the right
+  target and kind and nothing reaches the proxy, the reject list the same,
+  `check_proxy_url_via_forwarder`; the target keeps scheme, port, path and query, and is
+  `url::Url`'s serialization; userinfo or a fragment refused on every method before any
+  request; a refusal is `ForwarderRefused` on every method, the check and the reject list,
+  while a 403 without the header or the header on another status is not; the reason's limit;
+  a forwarded reject list fails closed on 403, 503, 404, 500 and 307, a direct one is read as
+  upstream reads it; request errors name the target, not the forwarder; without a forwarder the
+  request goes direct with no `X-Era-*` header; a forwarder that is down, answers 403 or
+  redirects: an error, and the proxy is never contacted; URL validation.
+- Wallet level (`wallet::test::forwarder`, 19), each request sent from the code that sends it
+  in production and required at the forwarder with both headers, never at the real host:
+  `server.info` through `send_begin`; `consignment.get`, a NACK and `ack.get` through
+  `refresh`; `consignment.post` and `media.post` through `post_transfer_data` (`send_end`
+  needs a PSBT that spends real allocations); the ACK through `ack_consignment`, `media.get`
+  through `fetch_and_save_attachments` and the reject list through `get_reject_list` (all three
+  follow a consignment validated against a chain). Then: the reject list fails closed; the
+  refusal in `send_begin` (alone, and next to a usable endpoint), in `send_end`, in the ACK
+  poll, and in `consignment.get`, where it leaves the receive waiting and failable; a
+  forwarder that is down keeps today's errors in `send_begin` and `send_end`; userinfo or a
+  fragment in an invoice endpoint fails `send_begin`, next to a usable one too; `go_online`
+  switching the forwarder on and off, refusing bad URLs without changing the route, and moving
+  it even when the probe of a new indexer fails; the invoice and the stored transfer keep the
+  real proxy; without a forwarder the proxy is contacted directly.
 
-Ten mutations of the patch (helper ignoring the forwarder, `go_online` not applying or
-not replacing it, clearing it before validation, the client ignoring it, redirects
-followed, any host accepted, wrong target header, no kind header, reject list ignoring
-it) each fail at least one of these tests (checked 2026-09-27).
+Mutations checked on 2026-09-27, each failing at least one of these tests: any one call site
+or helper going direct or passing `None` (11), the refusal ignored by the proxy client, the
+reject-list client, `check_proxy`, `send_begin` or `send_end`, a refusal reported next to a
+usable endpoint, a 403 taken as a refusal without the header, the header taken on another
+status, the reason not cut (9), userinfo, a lone password or a fragment let through,
+`check_proxy` or `send_begin` swallowing an invalid target (5), the forwarder applied only
+after the indexer probe or not applied to new online data (2), a forwarded non-2xx reject list
+read as a list, the forwarder's URL left in a send error. Scrubbing the URL from body and
+decoding errors has no effect to test: reqwest 0.13 puts no URL there. Of the mutations of
+`e7bdaa4`, those the new tests do not already repeat were run again (redirects followed, any
+host accepted, a wrong target header, no kind header, the forwarder cleared before
+validation): each still fails.
 
 ## Carrying the series onto a new UTEXO tag
 
@@ -466,14 +614,26 @@ git push origin era/<name>                              # the branch only, never
   `OnlineOptions` / `OnlineData` (`objects.rs`), the UDL dictionary, both examples and
   `test_go_online_options` (keep their `eth_rpc_url` value), and keep both module lines
   in `src/api/mod.rs` (`ethereum`, `forwarder`). They also moved the recipient loop of
-  `send_begin` into `parse_recipient`: keep their version and change its
-  `check_proxy(&transport_endpoint.endpoint)` to
-  `check_proxy_routed(&transport_endpoint.endpoint, self.forwarder())`. The proxy
-  forwarder guard fails if that is missed. Every other hunk of the patch applies as is
-  on both tags, which have the same proxy call sites in `online.rs` (six
-  `ProxyClient::new`, one `check_proxy`) and the same reject-list call.
+  `send_begin` into `parse_recipient`: keep their version and give it the fork's probe (next
+  point). Every other hunk of the patch applies as is on both tags, which have the same
+  proxy call sites in `online.rs` (six `ProxyClient::new`, one `check_proxy`) and the same
+  reject-list call.
+- The review fixes after it (`3f0a555` to `0996972`) were checked against both tags with
+  `git merge-tree --merge-base=62a8c3a <tag> <this branch>`, the series as one diff
+  (2026-09-27; not cherry-picked one by one, not compiled): they conflict nowhere `e7bdaa4`
+  does not, except in `Error` and the UDL on `v0.3.0-beta.43-bfa`, where `ForwarderRefused`
+  lands next to UTEXO's `PsbtOperationNotFound` (keep both). In `parse_recipient`, port the
+  probe loop of the fork's `send_begin_impl`: the `refused` variable,
+  `self.check_proxy_endpoint(..)` and the match on its result (`InvalidForwardTarget` returns
+  at once, the first `ForwarderRefused` is kept), and the check of `refused` before
+  `InvalidTransportEndpoints`. The proxy forwarder guard fails while `parse_recipient` still
+  calls `check_proxy` (on both tags that is the one extra line); a probe without the refusal
+  and target handling only the forwarder tests catch
+  (`send_begin_reports_the_forwarders_refusal`,
+  `send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment`).
 - If the proxy forwarder guard fires, route the new call through
-  `WalletOnline::proxy_client` / `new_routed` / `check_proxy_routed`; do not widen the
+  `WalletOnline::proxy_client`, `reject_list_client` or `check_proxy_endpoint`, and change the
+  expected set in `era.yml` only for a line that is not a call site; do not widen the
   exclusion.
 - If UTEXO has merged the layout patch, drop `6ce375e` and check that their field
   names and defaults match what the app sends.
