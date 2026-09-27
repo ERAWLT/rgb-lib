@@ -21,6 +21,10 @@ name: ERA fork checks
 #     those clients);
 #   - the bindings still build: the uniffi UDL mirrors the Error enum, and a
 #     variant the fork adds without mirroring it breaks only that build.
+#   - the CC-99 completion (OnlineOptions::complete_unrecorded_spends): wallets
+#     fund, issue, send and settle on a scripted chain behind a local Esplora
+#     and RGB proxy, and lose a broadcast's answer, crash, or come back from an
+#     old copy on it.
 # The https job makes real TLS handshakes against UTEXO's public signet
 # services; it depends on third-party hosts, so it is kept out of check.
 # See ERA.md for what the fork changes and why.
