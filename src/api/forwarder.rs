@@ -9,6 +9,9 @@
 //! name the real URL in [`FORWARD_TARGET_HEADER`]. Invoices, stored transport endpoints and
 //! everything else rgb-lib shows keep the real URL. `ERA.md` spells the contract out.
 //!
+//! A forwarder that will not carry a request answers 403 with [`FORWARD_REFUSED_HEADER`], and the
+//! clients report [`Error::ForwarderRefused`]; any other answer is read as the target's.
+//!
 //! Without a forwarder the clients behave as upstream: the same client configuration, the same
 //! requests, no extra header.
 
@@ -24,6 +27,10 @@ pub(crate) const FORWARD_KIND_HEADER: &str = "x-era-forward-kind";
 pub(crate) const FORWARD_KIND_RGB_PROXY: &str = "rgb-proxy";
 /// [`FORWARD_KIND_HEADER`] of a reject-list request.
 pub(crate) const FORWARD_KIND_REJECT_LIST: &str = "reject-list";
+/// Header of a forwarder's refusal, sent with status 403: its value is the reason.
+pub(crate) const FORWARD_REFUSED_HEADER: &str = "x-era-forward-refused";
+/// The longest refusal reason kept, in characters.
+const MAX_REFUSAL_REASON: usize = 256;
 
 /// A validated forwarder URL: plain `http` to a loopback IP literal.
 ///
@@ -108,6 +115,25 @@ impl Forwarder {
             .request(method, self.url.clone())
             .header(FORWARD_TARGET_HEADER, target.as_str())
             .header(FORWARD_KIND_HEADER, kind))
+    }
+
+    /// The forwarder's refusal of a request meant for `target`, if `response` is one: status 403
+    /// with [`FORWARD_REFUSED_HEADER`], whose value (possibly empty) is the reason. Anything else
+    /// is the target's answer or the forwarder failing, and the caller reads it as it would read
+    /// the target's own answer.
+    pub(crate) fn refusal(response: &reqwest::blocking::Response, target: &str) -> Option<Error> {
+        if response.status() != reqwest::StatusCode::FORBIDDEN {
+            return None;
+        }
+        let reason = response.headers().get(FORWARD_REFUSED_HEADER)?;
+        Some(Error::ForwarderRefused {
+            // as the target header named it
+            target: Url::parse(target).map_or_else(|_| target.to_string(), String::from),
+            reason: String::from_utf8_lossy(reason.as_bytes())
+                .chars()
+                .take(MAX_REFUSAL_REASON)
+                .collect(),
+        })
     }
 }
 
@@ -450,13 +476,115 @@ pub(crate) mod tests {
         assert_matches!(client.get_ack("rid"), Err(Error::Proxy { .. }));
         redirect.assert();
 
-        // a forwarder refusing the target (allowlist) fails the call like a proxy that is down
+        // a 403 without the refusal header is not a refusal: an error like a proxy that is down
         let mut fwd = Server::new();
-        let refused = fwd.mock("POST", "/").with_status(403).expect(1).create();
+        let forbidden = fwd.mock("POST", "/").with_status(403).expect(1).create();
         let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
         assert_matches!(client.get_consignment("rid"), Err(Error::Proxy { .. }));
-        refused.assert();
+        forbidden.assert();
 
+        direct.assert();
+    }
+
+    /// A forwarder answering every request with `status` and, if given, the refusal header.
+    fn answering(status: usize, refusal: Option<&str>) -> (ServerGuard, [mockito::Mock; 2]) {
+        let mut fwd = Server::new();
+        let mocks = ["POST", "GET"].map(|method| {
+            let mock = fwd.mock(method, Matcher::Any).with_status(status);
+            match refusal {
+                Some(reason) => mock.with_header(FORWARD_REFUSED_HEADER, reason),
+                None => mock,
+            }
+            .with_body("refused by policy")
+            .create()
+        });
+        (fwd, mocks)
+    }
+
+    #[test]
+    fn a_refusal_is_forwarder_refused_on_every_request() {
+        let mut proxy = Server::new();
+        let target = format!("{}/json-rpc", proxy.url());
+        let direct = untouchable(&mut proxy);
+        let (fwd, _mocks) = answering(403, Some("not-allowlisted"));
+        let refused = |result: Result<(), Error>| {
+            assert_eq!(
+                result.unwrap_err(),
+                Error::ForwarderRefused {
+                    target: target.clone(),
+                    reason: s!("not-allowlisted"),
+                }
+            )
+        };
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+        refused(client.get_info().map(|_| ()));
+        refused(client.get_ack("rid").map(|_| ()));
+        refused(client.get_consignment("rid").map(|_| ()));
+        refused(client.get_media("digest").map(|_| ()));
+        refused(client.post_ack("rid", true).map(|_| ()));
+        refused(
+            client
+                .post_consignment("rid", file.path(), "00", Some(1))
+                .map(|_| ()),
+        );
+        refused(client.post_media("digest", file.path()).map(|_| ()));
+        // the proxy check reports it instead of "unable to connect to proxy"
+        refused(crate::utils::check_proxy_routed(
+            &target,
+            Some(&forwarder(&fwd)),
+        ));
+        refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
+            &target,
+            &fwd.url(),
+        ));
+        direct.assert();
+
+        let mut issuer = Server::new();
+        let list_url = format!("{}/list.txt", issuer.url());
+        let direct = untouchable(&mut issuer);
+        let client = RejectListClient::new_routed(&list_url, Some(&forwarder(&fwd))).unwrap();
+        assert_eq!(
+            client.get_reject_list().unwrap_err(),
+            Error::ForwarderRefused {
+                target: list_url.clone(),
+                reason: s!("not-allowlisted"),
+            }
+        );
+        direct.assert();
+    }
+
+    #[test]
+    fn only_a_403_with_the_refusal_header_is_a_refusal() {
+        let mut proxy = Server::new();
+        let target = format!("{}/json-rpc", proxy.url());
+        let direct = untouchable(&mut proxy);
+        // a 403 without the header, the header on another status: the errors of today, those of
+        // a proxy that does not answer JSON-RPC
+        for (status, refusal) in [(403, None), (503, None), (503, Some("not-allowlisted"))] {
+            let (fwd, _mocks) = answering(status, refusal);
+            let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+            assert_matches!(client.get_ack("rid"), Err(Error::Proxy { .. }));
+            assert_matches!(
+                crate::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))),
+                Err(Error::Proxy { details }) if details == "unable to connect to proxy"
+            );
+            let reject = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+            assert_matches!(
+                reject.get_reject_list(),
+                Err(Error::RejectListService { .. })
+            );
+        }
+        // an empty reason is still a refusal; a long one is cut
+        for (reason, kept) in [(s!(""), 0), ("r".repeat(1000), MAX_REFUSAL_REASON)] {
+            let (fwd, _mocks) = answering(403, Some(&reason));
+            let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
+            assert_matches!(
+                client.get_ack("rid"),
+                Err(Error::ForwarderRefused { reason, .. }) if reason.len() == kept
+            );
+        }
         direct.assert();
     }
 
