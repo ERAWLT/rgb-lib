@@ -31,6 +31,10 @@
 //! `Error::ForwarderRefused` where rgb-lib would otherwise report a proxy out of reach, and must
 //! change nothing where it reads a failed request as something else (`consignment.get`: no
 //! consignment yet). A forwarder that is down keeps today's errors.
+//!
+//! The tests of this module and of `api::forwarder` run one at a time (`serial(forwarder)`): each
+//! holds several mockito servers, whose pool has 20 on macOS, and concurrent tests that each wait
+//! for one more server while holding some deadlock.
 
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value as Json, json};
@@ -440,7 +444,7 @@ impl SendEndInputs {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn proxy_traffic_goes_through_the_forwarder() {
     let mut services = Services::start();
     let endpoint = services.endpoint();
@@ -488,7 +492,7 @@ fn proxy_traffic_goes_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_begin_probes_the_recipient_proxy_through_the_forwarder() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -515,7 +519,7 @@ fn send_begin_probes_the_recipient_proxy_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_end_posts_the_consignment_and_media_through_the_forwarder() {
     let mut services = Services::start();
     let (wallet, _online) = services.online_wallet();
@@ -547,7 +551,7 @@ fn send_end_posts_the_consignment_and_media_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn refresh_polls_the_ack_through_the_forwarder() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -574,7 +578,7 @@ fn refresh_polls_the_ack_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn a_refused_consignment_is_nacked_through_the_forwarder() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -607,7 +611,7 @@ fn a_refused_consignment_is_nacked_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn an_accepted_consignment_is_acked_through_the_forwarder() {
     let mut services = Services::start();
     let (mut wallet, _online) = services.online_wallet();
@@ -648,7 +652,7 @@ fn an_accepted_consignment_is_acked_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn media_are_fetched_through_the_forwarder() {
     let mut services = Services::start();
     let (wallet, _online) = services.online_wallet();
@@ -680,7 +684,7 @@ fn media_are_fetched_through_the_forwarder() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn without_a_forwarder_the_proxy_is_contacted_directly() {
     let mut services = Services::start();
     let endpoint = services.endpoint();
@@ -697,7 +701,7 @@ fn without_a_forwarder_the_proxy_is_contacted_directly() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn the_forwarder_follows_the_latest_go_online() {
     let mut services = Services::start();
     let endpoint = services.endpoint();
@@ -752,7 +756,7 @@ fn the_forwarder_follows_the_latest_go_online() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn a_forwarder_that_is_down_fails_the_request_without_a_fallback() {
     let mut services = Services::start();
     let endpoint = services.endpoint();
@@ -782,7 +786,7 @@ fn opout(byte: u8) -> Opout {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
     let mut services = Services::start();
     let list_url = services.reject_list_url();
@@ -814,7 +818,7 @@ fn the_reject_list_goes_through_the_forwarder_and_fails_closed() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_begin_reports_the_forwarders_refusal() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -837,7 +841,7 @@ fn send_begin_reports_the_forwarders_refusal() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_begin_goes_on_with_a_usable_endpoint_next_to_a_refused_one() {
     let mut services = Services::start();
     let mut unknown = Server::new();
@@ -870,7 +874,7 @@ fn send_begin_goes_on_with_a_usable_endpoint_next_to_a_refused_one() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_begin_keeps_todays_error_when_the_forwarder_is_down() {
     let mut services = Services::start();
     let mut wallet = get_test_wallet(false, None);
@@ -893,7 +897,7 @@ fn send_begin_keeps_todays_error_when_the_forwarder_is_down() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_end_reports_the_forwarders_refusal() {
     let mut services = Services::start();
     let (wallet, _online) = services.online_wallet();
@@ -926,7 +930,7 @@ fn send_end_reports_the_forwarders_refusal() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn a_refused_ack_poll_is_the_sends_refresh_failure() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -949,7 +953,7 @@ fn a_refused_ack_poll_is_the_sends_refresh_failure() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn a_refused_consignment_download_leaves_the_receive_waiting() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -992,7 +996,7 @@ fn a_refused_consignment_download_leaves_the_receive_waiting() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment() {
     let mut services = Services::start();
     let (mut wallet, online) = services.online_wallet();
@@ -1037,7 +1041,7 @@ fn send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment() {
 }
 
 #[test]
-#[parallel]
+#[serial(forwarder)]
 fn a_go_online_whose_new_indexer_fails_still_moves_the_forwarder() {
     let mut services = Services::start();
     let mut last_session = Server::new();
