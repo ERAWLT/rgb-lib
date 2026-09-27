@@ -237,6 +237,7 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{TransferStatus, WalletTransactionType},
+    error::{InconsistencyReason, UnrecordedSpendReason},
     utils::block_on,
 };
 
@@ -567,6 +568,8 @@ use crate::wallet::test::{
     mock_mint_kept_amount, mock_retention_grace, mock_send_end_crash, mock_spam_hidden_spends,
     mock_spam_recipient_assignments, skip_build_dag, skip_check_fee_rate, spv_only,
 };
+#[cfg(all(test, feature = "_online"))]
+use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 use crate::{
     api::{

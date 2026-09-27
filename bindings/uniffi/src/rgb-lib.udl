@@ -175,6 +175,8 @@ interface RgbLibError {
   UnknownLinkedContract(string contract_id);
   UnknownRgbSchema(string schema_id);
   UnknownTransfer(string txid);
+  UnrecordedSpend(string txid, string reason, i32? batch_transfer_idx);
+  UnrecordedSpendUnseen(string txid, i32? batch_transfer_idx);
   UnsupportedBackupVersion(string version);
   UnsupportedBurn(AssetSchema asset_schema);
   UnsupportedInflation(AssetSchema asset_schema);
@@ -558,6 +560,7 @@ dictionary OnlineOptions {
   record<string, string> proxy_auth_keys;
   record<u64, EvmChain> evm_chains;
   string? forwarder_url = null;
+  boolean complete_unrecorded_spends = false;
 };
 
 [Remote]
