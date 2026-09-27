@@ -151,29 +151,36 @@ jobs:
       # fine and picks its own route: ProxyClient::new, RejectListClient::new,
       # check_proxy and rust_only::check_proxy_url go direct, and the _routed
       # forms and check_proxy_url_via_forwarder take whatever forwarder their
-      # caller passes, None included. So the step lists every use of the two
-      # clients' associated functions (any ProxyClient:: or RejectListClient::
-      # path, <ProxyClient>:: included, called or taken as a value) and every
-      # mention of those checks in code (called, taken as a value or
-      # imported; comment lines are left out) outside the clients' own files
-      # and the tests, and fails unless it is exactly this set: the three
-      # helpers, upstream's check_proxy (definition, body, test, import),
-      # rust_only's check_proxy_url (no wallet, so no forwarder) and
+      # caller passes, None included. So the step lists every mention in code
+      # of the two client types (a construction, a function value, a type in
+      # a signature, an import, and so a type alias, a `use ... as` or a macro
+      # naming them) and of those checks (called, taken as a value or
+      # imported); comment lines are left out. It looks outside the clients'
+      # own files and the tests, and fails unless the list is exactly this
+      # set: the three helpers (their signatures and bodies), upstream's
+      # check_proxy (definition, body, test, import), rust_only's
+      # check_proxy_url (no wallet, so no forwarder) and
       # check_proxy_url_via_forwarder (given one explicitly), with their
-      # definitions, and the TLS tests in src/api/mod.rs. A new call site,
-      # upstream's or ours, or a second copy of a helper's line changes the
-      # set. Still a grep: a client built under another name (an alias)
-      # escapes it.
+      # definitions, the crate's imports of the two types, one parameter of
+      # type &ProxyClient, and the TLS tests in src/api/mod.rs. A new call
+      # site, upstream's or ours, or a second copy of a helper's line changes
+      # the set. The compiler cannot enforce this instead (see ERA.md): wallet
+      # code has to reach a direct client for the case with no forwarder.
       - name: Proxy and reject-list clients only through the wallet's route
         run: |
-          pattern='(ProxyClient|RejectListClient)>?::|check_proxy(_routed|_url|_url_via_forwarder)?([^[:alnum:]_]|$)'
+          pattern='(^|[^[:alnum:]_])(ProxyClient|RejectListClient)([^[:alnum:]_]|$)|check_proxy(_routed|_url|_url_via_forwarder)?([^[:alnum:]_]|$)'
           found=$(git grep -nE "$pattern" -- 'src/*.rs' ':!src/wallet/test/' \
               ':!src/api/proxy.rs' ':!src/api/reject_list.rs' ':!src/api/forwarder.rs' \
             | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
             | sed -E 's/^([^:]+):[0-9]+:[[:space:]]*/\1: /' | LC_ALL=C sort || true)
           expected=(
+            'src/wallet/online.rs: fn proxy_client(&self, proxy_url: &str) -> Result<ProxyClient, Error> {'
             'src/wallet/online.rs: ProxyClient::new_routed(proxy_url, self.forwarder())'
+            'src/wallet/online.rs: fn reject_list_client(&self, reject_list_url: &str) -> Result<RejectListClient, Error> {'
             'src/wallet/online.rs: RejectListClient::new_routed(reject_list_url, self.forwarder())'
+            'src/wallet/online.rs: proxy_client: &ProxyClient,'
+            'src/lib.rs: proxy::{GetConsignmentResponse, ProxyClient},'
+            'src/lib.rs: reject_list::RejectListClient,'
             'src/wallet/online.rs: check_proxy_routed(proxy_url, self.forwarder())'
             'src/utils.rs: pub(crate) fn check_proxy(proxy_url: &str) -> Result<(), Error> {'
             'src/utils.rs: check_proxy_routed(proxy_url, None)'
