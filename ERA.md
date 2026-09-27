@@ -65,11 +65,19 @@ Rules for the branch:
 | `bb85811` | Leave nothing behind a VSS restore that fails | To propose to UTEXO |
 | `d6357cf` | Deprecate restore_from_vss in favour of the expecting variant | Fork-only |
 | `8692b69` | Catch more ways around the grep guards in era.yml | Fork-only |
+| `56e6186` | Never fail an outgoing transfer whose TX the indexer knows | To propose to UTEXO (the chain check; the refusal half is fork-only) |
+| `4ea8ccd` | Match a backup's fingerprint ignoring case, and keep its name | To propose to UTEXO (with `b8df12d`) |
+| `c188e63` | Remove only what a failed VSS restore made itself | To propose to UTEXO (with `bb85811`) |
+| `ba96a80` | Bound a VSS manifest's chunks by the chunk size, decrypt as it arrives | To propose to UTEXO |
+| `3988f38` | Stop claiming an interrupted chunked upload keeps the previous backup | To propose to UTEXO |
+| `c88f20a` | Leave the forwarder's path out of its Debug form | Fork-only |
+| `a140543` | Guard every mention of the proxy and reject-list client types | Fork-only |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
-`fe7e1b0` to `ba77828` and `8692b69` answer three reviews of `e7bdaa4`
-([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the series is carried; `45c3b39`,
-`777fe57` and `dcc9654` to `d6357cf` are [§5](#5-backup-restore-checks).
+`fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
+`e7bdaa4` ([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the series is carried;
+`45c3b39`, `777fe57`, `dcc9654` to `d6357cf` and `4ea8ccd` to `3988f38` are
+[§5](#5-backup-restore-checks).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -148,7 +156,7 @@ layout from xpubs and from a mnemonic, unchanged default descriptors).
 ## 2. CI
 
 `.github/workflows/era.yml` (`1d26404`, extended in `f808c7f`, `07e16e5`, `e7bdaa4`, `bef0c03`,
-`87d5e88`, `45c3b39`, `dcc9654` and `8692b69`) has two jobs.
+`87d5e88`, `45c3b39`, `dcc9654`, `8692b69` and `a140543`) has two jobs.
 
 - **check** runs on push / PR to `era/**` and on manual dispatch: rustfmt, `cargo check`
   with the app's feature set and with the upstream default on top, a check of the uniffi
@@ -342,11 +350,13 @@ change ACK" from the proxy only), `a14cdbb` (a refused send can be failed and do
 others), `b8bf73d` (a forwarded reject list only from a 200 that holds an opout), `019b917`
 and `87d5e88` (tests and CI for what the second review's mutations and probes left open), with
 `29a49bb` running the forwarder tests one at a time. The third: `fe7e1b0` and `1051adc` (a send
-is failed only if its TX is not on chain), `1699a6a` (a skipped transfer keeps nothing of its
-attempt), `5a0a980` ("Cannot change ACK" where the proxy puts it), `0b14aae` (a refused forwarder
+is failed only if its TX is not on chain), `1699a6a` (a skipped transfer keeps none of its
+attempt's database writes), `5a0a980` ("Cannot change ACK" where the proxy puts it), `0b14aae` (a refused forwarder
 URL goes offline), `f62e768` (a path is required, an unechoed refusal is logged), `ba77828` (a
-forwarded reject list only whole) and `8692b69` (wider guards). This section describes the
-result.
+forwarded reject list only whole) and `8692b69` (wider guards). The fourth: `56e6186` (no
+outgoing transfer is failed while the indexer knows its TX, whatever path leads there),
+`c88f20a` (the forwarder's Debug form without its path) and `a140543` (the proxy guard lists every
+mention of the client types). This section describes the result.
 
 ### Why
 
@@ -396,8 +406,9 @@ rgb_lib::wallet::rust_only::check_proxy_url_via_forwarder(proxy_url, forwarder_u
   ([below](#what-rgb-lib-guarantees)), which is why a URL without one is refused: its refusals
   could not be told from a relayed target's.
   rgb-lib keeps `forwarder_url` in memory only (the wallet's `OnlineData`): it is not written to
-  the wallet's files, invoices, the database or a backup, not logged, and a failed request's
-  error names the URL the request was meant for, never the forwarder's (`9718cac`).
+  the wallet's files, invoices, the database or a backup, not logged, a failed request's error
+  names the URL the request was meant for, never the forwarder's (`9718cac`), and the
+  forwarder's `Debug` form names its origin only (`c88f20a`).
   `OnlineOptions` derives `Debug` and `Serialize`, so its debug output and its JSON carry the
   secret: **the host must not log it**.
 - **`go_online` applies the value on every call; a call that fails at the probe of a new
@@ -566,6 +577,12 @@ decision D7 as amended by the project lead on 2026-09-27:
 - **Keep the previous session's port bound until `go_offline` has returned**, answering 503
   (or still relaying): a call running when the session ends finishes on the old route
   ([above](#what-the-app-calls)).
+- **Relay the Esplora route's TX lookups as the indexer answers them**: an unknown TX gets
+  `200 {"confirmed":false}` on `GET /tx/<txid>/status` and `404` on `GET /tx/<txid>/raw`, as
+  electrs answers. rgb-lib looks an outgoing transfer's TX up before it fails it
+  ([below](#how-it-surfaces-in-rgb-lib)); any other answer for an unknown TX (a 404 on the status,
+  a 5xx, a timeout) fails the lookup, and no `Initiated` or `WaitingCounterparty` send can be
+  failed for as long as that goes on.
 
 ### How it surfaces in rgb-lib
 
@@ -588,22 +605,46 @@ decision D7 as amended by the project lead on 2026-09-27:
   there would make an expired receive impossible to fail for as long as the forwarder refuses.
 - **`fail_transfers`** refreshes a transfer first and gives up on its error, as upstream does.
   For a **send still in `WaitingCounterparty`**, `ForwarderRefused` and `InvalidForwardTarget`
-  from that refresh count as "no change", and the send is failed (`a14cdbb`), otherwise a lapsed
-  consent would keep it from ever failing, **but only if the indexer does not know its TX**
-  (`fe7e1b0`). Such a send has normally broadcast nothing, but the DB can say "waiting for ACKs"
-  with the TX on chain: a backup taken before the broadcast and restored (the app's consent
-  store does not travel with it), or a kill between the broadcast in `try_complete_batch` and
-  the commit of its refresh. Failing it would stop crediting its change, so when the TX is in
-  the indexer's mempool or in a block, or the lookup fails, the send is kept and the refusal
-  returned. A receive keeps upstream's rule (a donation's witness may already be on chain), and
-  so does an outage (the recipient may have answered). When failing every expired transfer, each
-  attempt runs in a savepoint (`1699a6a`): a transfer one of those two errors still stops is
-  skipped with nothing of its attempt kept (a receive's refresh marks the endpoint it got the
-  consignment from as used, or stores the asset it receives, before the ACK is refused), the
-  others are failed, and the call returns `true` only if a transfer was failed or refreshed.
-  Failing that one transfer alone returns the error. A failing reject list (refused or not)
-  blocks failing the receive the same way, as upstream does when the list is unreachable: that
-  is the cost of failing closed.
+  from that refresh count as "no change" (`a14cdbb`): otherwise a lapsed consent would keep it
+  from ever failing. A receive keeps upstream's rule (a donation's witness may already be on
+  chain), and so does an outage (the recipient may have answered).
+- **No outgoing transfer is failed while the indexer knows its TX** (`fe7e1b0` for a refused
+  ACK poll, `56e6186` for every path; with or without a forwarder). An `Initiated` or
+  `WaitingCounterparty` transfer whose refresh changed nothing has normally broadcast nothing,
+  but not always: a donation, inflation or burn broadcasts in its `*_end`, and a send in
+  `try_complete_batch`, before the commit that records it, so a kill in between, or a backup (the
+  app's seal) taken before and restored, leaves it `Initiated` (which a refresh does not touch)
+  or `WaitingCounterparty` (whose ACK poll may answer "none yet", be refused, or bring a NACK)
+  with its TX on chain. Before failing one, rgb-lib looks its TX up: unknown, it is failed as
+  before; **in the mempool or in a block, `fail_transfers(Some(idx))` returns
+  `CannotFailBatchTransfer`** and changes nothing; **if the lookup fails, it returns the
+  `Indexer` error**. A NACK no longer fails a batch whose TX is known either.
+  - It is not completed there. Upstream's completion path for those states is not
+    `fail_transfers`: an `Initiated` transfer completes when the host calls its `*_end` again
+    with the same signed PSBT (the broadcast repeats harmlessly; upstream's own tests do this
+    after a simulated `send_end` crash), a `WaitingCounterparty` send when its ACKs come in. **So
+    a host that gets `CannotFailBatchTransfer` for an `Initiated` transfer calls that `*_end`
+    again** (`send_end` writes the signed PSBT into the transfer's directory as `signed.psbt`
+    before it posts or broadcasts anything; for inflation and burn only the host has it). A
+    transfer whose `*_end` ran after the backup it was restored from has neither: it stays
+    `Initiated`, which is wrong but safe, where `Failed` was wrong and not. UTEXO's
+    `v0.3.0-beta.43-bfa` answers its own case (prepare batches) the same way, with the same
+    `CannotFail` outcome.
+  - **The indexer's side of it**: an unknown TX must get `200 {"confirmed":false}` on
+    `GET /tx/<txid>/status` and `404` on `GET /tx/<txid>/raw`, as electrs answers. Anything else
+    (a 404 on the status, a 5xx, a timeout) fails every lookup, and no outgoing `Initiated` or
+    `WaitingCounterparty` transfer can be failed for as long as it does: the forwarder and the
+    backend relay those two endpoints as the indexer answers them.
+- **Failing every expired transfer** runs each attempt in a savepoint (`1699a6a`). A transfer
+  kept for one of the reasons above (a policy refusal of a receive, a TX the indexer knows, a
+  lookup the indexer or the network fails, which the bulk call skips as UTEXO's beta.43 does) is
+  skipped with none of its attempt's database writes kept (a receive's refresh marks the
+  endpoint it got the consignment from as used, or stores the asset it receives, before the ACK
+  is refused); files the attempt wrote (a downloaded consignment, media, the RGB stash) stay.
+  The others are failed, and the call returns `true` only if a transfer was failed or refreshed.
+  Failing that one transfer alone returns its error. A failing reject list (refused or not)
+  blocks failing a receive the same way, as upstream does when the list is unreachable: that is
+  the cost of failing closed.
 - **An expired send whose last ACK comes in** is failed by `try_complete_batch` instead of
   broadcast, as upstream does, **unless its TX is on chain already** (`1051adc`, with or without
   a forwarder, for the same two reasons): it then goes on as one that has not expired (the
@@ -658,16 +699,22 @@ decision D7 as amended by the project lead on 2026-09-27:
   | `send_end` | `NoValidTransportEndpoint` when no endpoint took the consignment; `Proxy` from `media.post` | `ForwarderRefused` when a refusal is why; `ForwarderRefused` from `media.post` |
   | `refresh` (a transfer's `failure`) | `Proxy` from `ack.get`, ACK, NACK, `media.get` | `ForwarderRefused`; `InvalidForwardTarget` for a stored endpoint with userinfo or a fragment |
   | reject list (`refresh`, `send_begin`, `provide_out_of_band_consignment`) | any answer read as the list | `ForwarderRefused`, or `RejectListService` for a non-200, a 200 without a length or chunked framing, or one holding text and no opout |
-  | `fail_transfers(Some(send))`, the send's ACK poll refused | error, the send not failed | the send failed (`WaitingCounterparty` only) if the indexer does not know its TX; kept, with the refusal, if it does or the lookup fails |
+  | `fail_transfers(Some(send))`, the send's ACK poll refused | error, the send not failed | the send failed (`WaitingCounterparty` only) if the indexer does not know its TX; kept, with `CannotFailBatchTransfer` if it does, the `Indexer` error if the lookup fails |
   | `fail_transfers(Some(receive))`, a policy error in its refresh | error (`Proxy` for an outage) | `ForwarderRefused` / `InvalidForwardTarget` |
-  | `fail_transfers(None)` with such a transfer among the expired | error, and nothing failed (rolled back) | that transfer skipped with nothing of its attempt kept, the others failed; `false` if no transfer was failed or refreshed |
+  | `fail_transfers(None)` with such a transfer among the expired | error, and nothing failed (rolled back) | that transfer skipped with none of its attempt's database writes kept, the others failed; `false` if no transfer was failed or refreshed |
   | `check_proxy_url_via_forwarder` | `Proxy` ("unable to connect to proxy") on a refusal | `ForwarderRefused`; `InvalidForwardTarget` |
   | NACK refused with a reason containing "Cannot change ACK" | the receive failed without its NACK | the transfer's `failure`: `ForwarderRefused` |
   | a 403 with `X-Era-Forward-Refused` and no valid session echo | read as the target's answer, silently | the same, and a warning in the wallet's log |
 
-- Changed behaviour with or without a forwarder: `refresh` (and `provide_out_of_band_ack`) of an
-  expired send whose last ACK comes in, its TX on chain already: was failed, now goes on to the
-  broadcast (`WaitingConfirmations`); a failed lookup of its TX fails that refresh (`1051adc`).
+- Changed behaviour with or without a forwarder:
+
+  | Call | Was | Now |
+  |---|---|---|
+  | `refresh` (and `provide_out_of_band_ack`) of an expired send whose last ACK comes in, its TX on chain | failed | goes on to the broadcast (`WaitingConfirmations`); a failed lookup fails that refresh (`1051adc`) |
+  | `fail_transfers(Some(idx))`, an outgoing `Initiated` or `WaitingCounterparty` transfer whose refresh changes nothing | failed | failed if the indexer does not know its TX; **`CannotFailBatchTransfer`** if it does; the **`Indexer`** error if the lookup fails (`56e6186`) |
+  | `fail_transfers(None)`, such transfers among the expired | failed | failed if unknown; skipped, and not counted as a change, if known or if the lookup fails (an `Indexer` or `Network` error of any transfer is now skipped, as on beta.43) |
+  | `refresh` of a send whose ACK poll brings a NACK, its TX on chain | failed | left as it is; a failed lookup fails that refresh (`56e6186`) |
+  | `fail_transfers` (`skip_sync` too) of an outgoing `Initiated` or `WaitingCounterparty` transfer | no indexer request | one lookup of its TX before it is failed: failing one needs the indexer |
 
 ### Where it is
 
@@ -678,7 +725,8 @@ the client-level tests), `ProxyClient::post` / `ProxyClient::call` and
 `has_checked_end` next to it in `src/api/reject_list.rs`, `WalletOnline::forwarder` /
 `proxy_client` / `reject_list_client` / `check_proxy_endpoint`, `go_online_impl`,
 `go_offline_impl`, `batch_tx_known`, `try_fail_batch_transfer`, `fail_transfers_impl`,
-`try_complete_batch` and `refuse_consignment` in `src/wallet/online.rs`, `DbTxn::savepoint` in
+`try_complete_batch` and `refuse_consignment` in `src/wallet/online.rs`,
+`TryFailBatchTransferOutcome::CannotFail` in `src/wallet/objects.rs`, `DbTxn::savepoint` in
 `src/database/mod.rs`, `Wallet::go_offline`, `utils::check_proxy_routed`,
 `OnlineOptions::forwarder_url`, `OnlineData::forwarder`, the three error variants,
 `rust_only::check_proxy_url_via_forwarder`.
@@ -688,28 +736,39 @@ the client-level tests), `ProxyClient::post` / `ProxyClient::call` and
 **The proxy forwarder guard** (`era.yml`, "Proxy and reject-list clients only through the
 wallet's route"): wallet code reaches an RGB proxy or a reject list only through
 `WalletOnline::proxy_client`, `reject_list_client` and `check_proxy_endpoint`, which read the
-forwarder `go_online` stored and take no route from their caller. The step lists every
-associated path of the two clients (`ProxyClient::…` and `RejectListClient::…`, a qualified
-`<ProxyClient>::…` included, called or taken as a value) and every mention in code of
-`check_proxy`, `check_proxy_routed`, `check_proxy_url` and `check_proxy_url_via_forwarder`
-(called, taken as a value or imported; comment lines are left out) in `src/` outside the three
-client files and the tests (`8692b69`; before, only `::new(`, `::new_routed(` and the checks
-followed by `(`), and fails unless the list is exactly the expected set: the three helpers,
-upstream's `check_proxy` (definition, body, test, and `lib.rs`'s import of it),
-`rust_only::check_proxy_url` (no wallet, so no forwarder) and `check_proxy_url_via_forwarder`
-(given one explicitly) with their definitions, and the TLS tests in `src/api/mod.rs`. A call
-site passing `None` to a routed constructor, a direct constructor or check, a function value of
-either, a qualified path, or a second copy of a helper's line fails it (checked by injecting
-each). It is a grep: a client built under another name (an alias) escapes it, the same limit
-as the HTTP client guard.
+forwarder `go_online` stored and take no route from their caller. The step lists every mention
+in code of the type names `ProxyClient` and `RejectListClient` (a construction, a function value,
+a type in a signature, an import: so a type alias, a `use … as` or a macro naming them too;
+`a140543`) and of `check_proxy`, `check_proxy_routed`, `check_proxy_url` and
+`check_proxy_url_via_forwarder` (called, taken as a value or imported), comment lines left out,
+in `src/` outside the three client files and the tests (`8692b69` and `a140543`; before, only
+`::new(`, `::new_routed(` and the checks followed by `(`), and fails unless the list is exactly
+the expected set: the three helpers (signatures and bodies), upstream's `check_proxy`
+(definition, body, test, and `lib.rs`'s import of it), `rust_only::check_proxy_url` (no wallet,
+so no forwarder) and `check_proxy_url_via_forwarder` (given one explicitly) with their
+definitions, the crate's imports of the two types, one parameter of type `&ProxyClient`, and the
+TLS tests in `src/api/mod.rs`. A call site passing `None` to a routed constructor, a direct
+constructor or check, a function value of either, a qualified path, a type alias, an aliased
+import, a macro building a client, or a second copy of a helper's line fails it (checked by
+injecting each). It is still a grep: an identifier that is not the type's name escapes it
+(a generic over a trait the clients implement, say), where none exists today.
+
+**Why not the compiler.** Making `ProxyClient::new` `pub(super)` was asked for and not done:
+wallet code must reach a direct client for the case where no forwarder is set, and upstream's
+`check_proxy` (`utils.rs`) and `rust_only::check_proxy_url` need one without a wallet at all.
+Rust's visibility cannot tell the three helpers in `online.rs` from other code in the same
+module, and narrowing `new` alone would leave `new_routed(url, None)` building the same direct
+client from anywhere in the crate, so it would move the hole, not close it. Closing it would take
+moving the route decision and upstream's `check_proxy` into `api`, which reshapes upstream code
+every carry would then have to rebase.
 
 `cargo test --locked --lib --features esplora,vss -- api::forwarder:: wallet::test::forwarder::`
-(53 tests and a child test, local mockito servers and raw sockets, no regtest). Every forwarder
+(57 tests and a child test, local mockito servers and raw sockets, no regtest). Every forwarder
 in the tests has a path, and every request must arrive on it. The tests of both modules share one
 `serial_test` key and run one at a time: each holds several mockito servers, whose pool is 20 on
 macOS, and run side by side they deadlocked waiting for one more (`29a49bb`).
 
-- Client level (`api::forwarder::tests`, 21 and the child): every proxy method arrives with the
+- Client level (`api::forwarder::tests`, 22 and the child): every proxy method arrives with the
   right target and kind and nothing reaches the proxy, the reject list the same,
   `check_proxy_url_via_forwarder`; the target keeps scheme, port, path and query, and is
   `url::Url`'s serialization; userinfo or a fragment refused on every method before any
@@ -724,8 +783,9 @@ macOS, and run side by side they deadlocked waiting for one more (`29a49bb`).
   the forwarder's client ignores `HTTP_PROXY` (in a child process started with it set, after
   showing that an ordinary client does go there); without a forwarder the request goes direct
   with no `X-Era-*` header; a forwarder that is down, answers 403 or redirects: an error, and
-  the proxy is never contacted; URL validation, a URL without a path refused.
-- Wallet level (`wallet::test::forwarder`, 32), each request sent from the code that sends it
+  the proxy is never contacted; URL validation, a URL without a path refused; the `Debug` form
+  without the path.
+- Wallet level (`wallet::test::forwarder`, 35), each request sent from the code that sends it
   in production and required at the forwarder with both headers, never at the real host:
   `server.info` through `send_begin`; `consignment.get`, a NACK and `ack.get` through
   `refresh`; `consignment.post` and `media.post` through `post_transfer_data` (`send_end`
@@ -739,11 +799,15 @@ macOS, and run side by side they deadlocked waiting for one more (`29a49bb`).
   "Cannot change ACK" answer failing the receive with a warning in the wallet's log; a refusal
   without the session echo in the wallet's log, without the path; a refused or unroutable send
   failed by `fail_transfers` once the indexer has said it does not know the TX, and kept, alone
-  and in the bulk call, when the TX is in the mempool, in a block or cannot be looked up; an
-  expired send whose last ACK comes in failed only if its TX is not on chain, going on to the
-  broadcast if it is, and the refresh failing if the lookup does; an outage still keeping a send
-  from failing, a blocked receive skipped by the bulk call with nothing of its attempt kept, a
-  bulk call that only skips returning `false` and marking no backup as needed; a forwarder that
+  and in the bulk call, when the TX is in the mempool, in a block or cannot be looked up; the
+  same for an `Initiated` send and for a `WaitingCounterparty` one whose ACK poll answers "none
+  yet" (`CannotFailBatchTransfer` or the `Indexer` error alone, skipped without a change in the
+  bulk call); a NACK failing a send only when its TX is unknown; a receive failed as upstream
+  does, without a lookup, whatever TX its batch carries; an expired send whose last ACK comes in
+  failed only if its TX is not on chain, going on to the broadcast if it is, and the refresh
+  failing if the lookup does; an outage still keeping a send from failing, a blocked receive
+  skipped by the bulk call with none of its attempt's database writes kept, a bulk call that
+  only skips returning `false` and marking no backup as needed; a forwarder that
   is down keeps today's errors in `send_begin` and `send_end`; userinfo or a fragment in an
   invoice endpoint fails `send_begin`, next to a usable one too; `go_online` switching the
   forwarder on and off, refusing bad URLs without changing a direct route and going offline
@@ -775,16 +839,22 @@ a skip, the change counted before the attempt; the NACK's warning arm dropped, a
 matched again; a refused URL keeping a forwarded route, or dropping a direct one; a URL without
 a path accepted, the unechoed refusal not logged, the echo not required, the wallet's logger not
 handed over; the framing check dropped, a length or chunked framing not honoured, chunked
-anywhere in the codings taken, every version taken as HTTP/2. Scrubbing the URL from body and
+anywhere in the codings taken, every version taken as HTTP/2. Fourth review, 11 mutations,
+each failing a test: the new chain check dropped, its lookup error read as "unknown",
+`Initiated` or `WaitingCounterparty` left out of it, receives let in, a kept transfer counted as
+a change by the bulk call or silent in the single one, an `Indexer` error aborting the bulk call,
+the NACK's check dropped or its lookup error read as "unknown". Scrubbing the URL from body and
 decoding errors has no effect to test: reqwest 0.13 puts no URL there.
 
 ## 5. Backup restore checks
 
 `45c3b39` and `777fe57`, then, after a review of those on 2026-09-27 ("pass with issues": every
 server-made backup it tried was refused by `restore_from_vss_expecting` with encryption on, and
-the rest was open), `dcc9654`, `55cb0c9`, `b8df12d`, `6921d07`, `bb85811` and `d6357cf`. They
-cover the VSS restore and, for the decryption, the file backup too (`Wallet::backup` /
-`restore_backup`, the app's D6 seals).
+the rest was open), `dcc9654`, `55cb0c9`, `b8df12d`, `6921d07`, `bb85811` and `d6357cf`, and after
+a review of those (which restored every genuine backup it could make at `d82e21a`: whole-block
+files, a 6.7 MB one, chunked VSS backups including exactly 2 MiB and 2 MiB + 1), `4ea8ccd`,
+`c188e63`, `ba96a80` and `3988f38`. They cover the VSS restore and, for the decryption, the file
+backup too (`Wallet::backup` / `restore_backup`, the app's D6 seals).
 
 ### Why
 
@@ -801,9 +871,9 @@ It also wrote the server URL and the store ID into the restore log it leaves in 
 directory.
 
 The review of `777fe57` found `restore_from_vss` still open, and it is what the bridge calls at
-the pinned rev: it took a server-made plaintext backup with encryption enabled, extracted
-entries anywhere inside the target directory (over another wallet's database) and took an
-upper-case fingerprint. Both restores extracted entries outside the wallet directory. Both
+the pinned rev: it took a server-made plaintext backup with encryption enabled and extracted
+entries anywhere inside the target directory (over another wallet's database). Both restores
+extracted entries outside the wallet directory. Both
 decryptors, VSS and file, stopped cleanly when their input ended on a block boundary, so a
 backup cut short restored a correct prefix and an empty one restored nothing. And a server's
 metadata or manifest could panic the restore, or abort the process on an allocation.
@@ -816,12 +886,14 @@ signature and still builds the bindings): it refuses everything the expecting va
 except a genuine backup of another wallet, which it cannot tell. With the expecting variant, the
 bridge's own reads before the call, its check of the directory after it and its
 manifest-file heuristic are redundant; emptying the data directory after a failure is harmless.
+The restored directory keeps the name the backup carries, fingerprints being compared ignoring
+case: the bridge, which always lowercases, gets its canonical name back.
 
 ### What a restore checks
 
 Both restores, each answer of the server read once, in this order:
 
-1. (expecting only) `expected_fingerprint` is 8 lowercase hex characters, else
+1. (expecting only) `expected_fingerprint` is 8 hex characters, else
    `Error::InvalidFingerprint`, before anything is requested or written.
 2. The manifest. With encryption enabled in the config (the default), a backup it marks as
    unencrypted is **`Error::VssBackupUnencrypted`** (new variant, in the UDL), before any of it
@@ -829,34 +901,46 @@ Both restores, each answer of the server read once, in this order:
    variant, `6921d07` for both). To restore a plaintext backup, pass a config with encryption
    disabled, as upstream's own plaintext tests do.
 3. The wallet the server names (`backup/fingerprint`): the expected one, else
-   `Error::FingerprintMismatch`; without an expected one, 8 lowercase hex characters, else
-   `Error::VssError` (upper case since `b8df12d`: it names another directory than rgb-lib's, or
-   the same one on a case-insensitive disk). `<target_dir>/<that name>` must not exist
-   (`Error::WalletDirAlreadyExists`).
-4. The download (`55cb0c9`), all `Error::VssError`: the manifest must describe between 1 byte
-   and `MAX_VSS_BACKUP_SIZE` (256 MiB; a wallet backup is a few megabytes) in no more chunks than
-   bytes, checked before anything is downloaded; no buffer is sized by its numbers; the data must
-   add up to its `total_size` exactly (a single backup's data, or the chunks, none empty, the
-   download stopping at the one that goes past it), which every upload has written since VSS
-   backups exist, whatever the chunk size then (4 MiB, now 1 MiB); an encrypted backup's metadata
-   must be a 32-byte salt and a 19-byte nonce, in hex. A short nonce is an error, not a panic,
-   in `encrypt_data` and `decrypt_data` too, and in a file backup's public data.
+   `Error::FingerprintMismatch`; without an expected one, 8 hex characters, else
+   `Error::VssError`. Fingerprints are compared ignoring case (`4ea8ccd`): rgb-lib names a wallet
+   directory after the master fingerprint exactly as the host gives it (`setup_new_wallet`), so a
+   wallet created with `928E8C83` lives in `928E8C83/` and its backups say so; `b8df12d` refused
+   upper case, and with it the genuine backups of such wallets, which `d82e21a` restored.
+4. The download (`55cb0c9`, `ba96a80`), all `Error::VssError`: the manifest must describe
+   between 1 byte and `MAX_VSS_BACKUP_SIZE` (256 MiB; a wallet backup is a few megabytes) in no
+   more chunks than 1 MiB chunks take (so at most 256 requests), checked before anything is
+   downloaded. Every upload has split its data into chunks of `VSS_CHUNK_SIZE`, 4 MiB until
+   `88adde0` (March 2026) and 1 MiB since, so the backups of both fit; `MIN_VSS_CHUNK_SIZE` holds
+   the bound, with a compile-time check against `VSS_CHUNK_SIZE`. No buffer is sized by the
+   manifest's numbers; the data must add up to its `total_size` exactly (a single backup's data,
+   or the chunks, none empty, the download stopping at the one that goes past it), which every
+   upload has written. An encrypted backup's metadata, a 32-byte salt and a 19-byte nonce in hex,
+   is read first, and each piece is decrypted as it arrives: a piece that does not decrypt ends
+   the download there, instead of after the whole backup is in memory. A short nonce is an
+   error, not a panic, in `encrypt_data` and `decrypt_data` too, and in a file backup's public
+   data.
 5. The decryption of an encrypted backup ([below](#what-decryption-proves)).
 6. An encrypted backup names its wallet inside (its first entry), where the server cannot change
-   it: that must be the wallet the server named, else `Error::FingerprintMismatch`
-   (`777fe57` for the expecting variant, `b8df12d` for both).
+   it: that must be the wallet the server named (ignoring case), else
+   `Error::FingerprintMismatch` (`777fe57` for the expecting variant, `b8df12d` for both).
+   `<target_dir>/<name>` must not exist (`Error::WalletDirAlreadyExists`), the name being the
+   one the backup carries: inside it for an encrypted backup, the server's for a plaintext one.
 7. The extraction (`b8df12d`), of the wallet directory only: for an encrypted backup the one it
    names, for a plaintext one its sanitized `wallet/`, mapped straight onto
-   `<target_dir>/<fingerprint>` (no rename). Entry names are resolved by their components (`/`
+   `<target_dir>/<name>` (no rename). Entry names are resolved by their components (`/`
    and `\`; `..` within the archive only; no absolute name, NUL or `:`), and an entry outside the
    wallet directory is skipped, counted in the log. It goes into a staging directory next to the
    wallet's (`.vss_restore_<fingerprint>_<nanos>`), renamed into place once complete; a backup
    holding no file of the wallet is `Error::VssError`. Symlink entries are written as files, as
    upstream wrote them.
-8. A restore that fails leaves nothing behind (`bb85811`): not the staging directory, not its
-   log, and not the target directory, or a parent of it, if it made them; a target that existed
-   keeps what it held. A completed restore keeps its log in the target, as upstream; the log
-   names neither the server URL nor the store ID (`45c3b39`).
+8. A restore that fails leaves nothing behind that it made, and nothing it did not make is
+   touched (`bb85811`, `c188e63`): not the staging directory, not its log, and not the target
+   directory, or a parent of it, if it made them. The directories are created one component at a
+   time and only those `fs::create_dir` made are removed (a target reached as
+   `missing/../there` leaves `there` alone); the log is a file of its own, created with
+   `create_new` as `vss_restore_<unix time>`, with a `_<n>` suffix when that name is taken, so a
+   file that was there is neither written to nor removed. A completed restore keeps its log in
+   the target, as upstream; the log names neither the server URL nor the store ID (`45c3b39`).
 
 ### What decryption proves
 
@@ -878,6 +962,14 @@ metadata's salt) or the password (file: scrypt with the backup's salt).
   cannot tell; a host that needs to has to compare versions itself.
 - **Whose wallet: only with `restore_from_vss_expecting`**, which checks the name the archive
   carries inside, under the same authentication.
+
+**What a damaged file backup gives.** A seal is a zip holding `backup.enc` (the stream) and
+`backup.pub_data`. Cut anywhere, or otherwise not a zip, it is `Error::InvalidFilePath`, the
+variant a missing file gets: the outer zip breaks first. Only a stream cut on a block boundary
+inside a valid outer zip gives `IO` "…truncated". A stream cut mid-block, or with a block changed,
+gives **`WrongPassword`, exactly as a wrong password does**. So `WrongPassword` does not prove the
+password (the seal key) is wrong: it means wrong key *or* damaged seal, and a bridge must not act
+on it as if the key were wrong (discarding or rotating it, telling the user so).
 
 **Backward compatibility.** The encryptors always wrote the short final block, so nothing they
 wrote is refused. `src/wallet/test/fixtures/d82e21a/` holds what `d82e21a` (the rev the app
@@ -903,11 +995,18 @@ than asked); for the files rgb-lib writes that changes nothing.
 - `delete_backup` still trusts the manifest's `chunk_count` (upstream's; not a restore).
 - `restore_backup` (file) still leaves its `restore_<ts>` log, and the target directory, after a
   failure, as upstream does (the bridge removes the log); step 8 is VSS's.
+- **An interrupted chunked upload leaves no restorable backup.** `upload_chunked` writes each
+  chunk under the previous backup's keys (`backup/chunk/<i>`) and the manifest and metadata
+  last, so an upload that stops after its first chunk leaves the previous manifest describing
+  chunks that are partly the new upload's: the previous backup is gone, and the restore fails at
+  the first foreign chunk (its decryption), until an upload completes. upstream's comment said the
+  previous backup survives; `3988f38` corrects it. The layout is unchanged here (the app's task
+  T1.5).
 
 ### Tests
 
 `cargo test --locked --lib --features esplora,vss -- wallet::vss::tests:: wallet::backup::tests::`
-(37 and 3 tests, offline; the first in `era.yml` since `45c3b39`, the second since `dcc9654`). A
+(43 and 3 tests, offline; the first in `era.yml` since `45c3b39`, the second since `dcc9654`). A
 scripted VSS server answers `getObject` per key and per read, and counts the reads, so the host's
 read can be told the truth and rgb-lib's something else.
 
@@ -931,11 +1030,25 @@ read can be told the truth and rgb-lib's something else.
   wallet; a completed restore's log without the URL or store ID; every cut of a VSS and of a file
   ciphertext refused, as truncated at a block boundary; a file backup with a short nonce an
   error; the `d82e21a` fixtures.
+- The fourth review: a backup named `928E8C83` restored under that name with no, lower, upper and
+  mixed expected fingerprints, the server naming it in either case, encrypted and plaintext, and
+  another wallet refused whatever the case; a real wallet created with an upper-case master
+  fingerprint, uploaded through `VssBackupClient` to a mock server that keeps what it is given,
+  restored file for file by both restores; a restore refused, and the directory untouched, when
+  the wallet's directory exists; a failed restore removing only what it made
+  (`missing/../there`, a target blocked by a file, files carrying the log's names); manifests
+  naming more chunks than 1 MiB chunks make refused before any download; a backup of more than
+  4 MiB restored in 4 MiB and in 1 MiB chunks; the download stopping at the first chunk that
+  does not decrypt (reads 1-0-0, 1-1-0, 1-1-1).
 
 Mutations: `777fe57`'s 7 and the two log lines put back (round 2); round 3, 28 (truncation 4,
 metadata and sizes 9, extraction 9, plaintext 2, cleanup 4), each failing a test. A tenth size
 mutation, no longer refusing zero chunks, survived: the size check already refuses them, and the
-clause went.
+clause went. Round 4, 15, each failing a test: upper case refused again, either comparison made
+exact, the directory named after the server for an encrypted backup, the existence check
+dropped; either cleanup dropped, an existing log file reused, a directory that was there counted
+as made; the chunk bound per byte again or per 4 MiB chunk, decryption at the end of the
+download, the truncation check dropped, a whole block held back.
 
 ## Carrying the series onto a new UTEXO tag
 
@@ -986,7 +1099,12 @@ git push origin era/<name>                              # the branch only, never
   `8692b69`) add no conflict on either tag: `try_fail_batch_transfer` (whose chain lookup sits
   next to UTEXO's own lookups for prepare batches on `v0.3.0-beta.43-bfa`), `try_complete_batch`,
   `refuse_consignment`, `DbTxn::savepoint`, `backup.rs` and the fixtures apply as they are, and
-  the gap `1051adc` closes is still in `try_complete_batch` there.
+  the gap `1051adc` closes is still in `try_complete_batch` there. The fourth review's commits
+  (`56e6186` to `a140543`) were checked the same way: on `v0.3.0-beta.34-bfa` they add no
+  conflict; on `v0.3.0-beta.43-bfa` the only new ones are comments around
+  `TryFailBatchTransferOutcome::CannotFail`, which UTEXO already has with the same meaning and
+  the same arm in the single call (keep their variant and doc, drop the fork's), and the bulk
+  loop above, where UTEXO's `CannotFail => continue` becomes dropping the savepoint.
   In `parse_recipient`, port the
   probe loop of the fork's `send_begin_impl`: the `refused` variable,
   `self.check_proxy_endpoint(..)` and the match on its result (`InvalidForwardTarget` returns
