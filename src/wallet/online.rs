@@ -770,12 +770,24 @@ pub trait WalletOnline: WalletOffline {
     }
 
     fn go_online_impl(&mut self, online_options: &OnlineOptions) -> Result<Online, Error> {
-        // ERA fork: validated before anything changes, so a refused URL leaves the wallet as it was
-        let forwarder = online_options
+        // ERA fork: validated before anything changes. A refused URL leaves a wallet no forwarder
+        // routes as it was; one whose traffic a forwarder carries goes offline instead, as it does
+        // below when the probe of a new indexer fails: its route is the previous session's, whose
+        // port another app may own by now
+        let forwarder = match online_options
             .forwarder_url
             .as_deref()
             .map(Forwarder::new)
-            .transpose()?;
+            .transpose()
+        {
+            Ok(forwarder) => forwarder,
+            Err(e) => {
+                if self.forwarder().is_some() {
+                    *self.online_data_mut() = None;
+                }
+                return Err(e);
+            }
+        };
         // ERA fork: a forwarder before or after this call (see the probe of a new indexer URL)
         let routed = forwarder.is_some() || self.forwarder().is_some();
         let indexer_url = &online_options.indexer_url;

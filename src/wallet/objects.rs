@@ -117,8 +117,9 @@ pub struct OnlineOptions {
     ///
     /// Every `go_online` call applies the value. A call whose new `indexer_url` fails its probe
     /// while a forwarder is set before or by the call leaves the wallet offline: the last indexer
-    /// URL is a route of the forwarder's last session. `Wallet::go_offline` drops the route when a
-    /// session ends. `None` (the default, and what a missing field deserializes to) contacts
+    /// URL is a route of the forwarder's last session. So does a call that gives an invalid
+    /// `forwarder_url` ([`Error::InvalidForwarderUrl`]) while a forwarder is set; without one, it
+    /// changes nothing. `Wallet::go_offline` drops the route when a session ends. `None` (the default, and what a missing field deserializes to) contacts
     /// those services directly, as upstream rgb-lib does. The contract is described in the fork's
     /// `ERA.md`.
     #[serde(default)]

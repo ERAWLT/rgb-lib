@@ -717,6 +717,30 @@ fn the_forwarder_follows_the_latest_go_online() {
     let online = wallet.go_online(services.options(None)).unwrap();
     let (_, transfer) = receive(&mut wallet, &endpoint);
     let proxy_rid = transfer.proxy_recipient_id.clone().unwrap();
+    let bad_urls = [
+        "http://10.0.2.2:8080/s/rgb",
+        "https://127.0.0.1:8080/s/rgb",
+        "http://localhost:8080/s/rgb",
+    ];
+
+    // a refused forwarder URL while no forwarder routes the traffic: an error, and nothing
+    // changes (still direct)
+    for bad in bad_urls {
+        let err = wallet
+            .go_online(services.options(Some(bad.to_string())))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidForwarderUrl { .. }),
+            "{bad}: {err:?}"
+        );
+    }
+    let forwarder = Untouchable::on(&mut services.forwarder);
+    let direct = services.expect_direct(&proxy_rid, 1);
+    refresh(&mut wallet, online);
+    direct.assert();
+    forwarder.assert();
+    direct.remove();
+    forwarder.remove();
 
     // same indexer, forwarder added: the online object is kept, the traffic moves
     let online_fwd = wallet
@@ -731,28 +755,6 @@ fn the_forwarder_follows_the_latest_go_online() {
     forwarded.remove();
     direct.remove();
 
-    // a refused forwarder URL is an error and changes nothing: still through the forwarder
-    for bad in [
-        "http://10.0.2.2:8080",
-        "https://127.0.0.1:8080",
-        "http://localhost:8080",
-    ] {
-        let err = wallet
-            .go_online(services.options(Some(bad.to_string())))
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidForwarderUrl { .. }),
-            "{bad}: {err:?}"
-        );
-    }
-    let direct = Untouchable::on(&mut services.proxy);
-    let forwarded = services.expect_forwarded(&proxy_rid, 1);
-    refresh(&mut wallet, online);
-    forwarded.assert();
-    direct.assert();
-    direct.remove();
-    forwarded.remove();
-
     // forwarder removed by the host: direct again, as upstream
     let online_direct = wallet.go_online(services.options(None)).unwrap();
     assert_eq!(online_direct, online);
@@ -761,6 +763,40 @@ fn the_forwarder_follows_the_latest_go_online() {
     refresh(&mut wallet, online);
     direct.assert();
     forwarder.assert();
+    direct.remove();
+    forwarder.remove();
+
+    // a refused forwarder URL where a forwarder routes the traffic: an error, and offline (the
+    // route is the previous session's), as when the probe of a new indexer fails
+    let mut last = online;
+    for bad in bad_urls {
+        wallet
+            .go_online(services.options(services.forwarder_url()))
+            .unwrap();
+        let err = wallet
+            .go_online(services.options(Some(bad.to_string())))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidForwarderUrl { .. }),
+            "{bad}: {err:?}"
+        );
+        let untouched = [
+            Untouchable::on(&mut services.forwarder),
+            Untouchable::on(&mut services.proxy),
+        ];
+        assert_offline(wallet.refresh(last, None, vec![], true));
+        untouched.iter().for_each(Untouchable::assert);
+        untouched.iter().for_each(Untouchable::remove);
+        // the next go_online builds a new state
+        last = wallet
+            .go_online(services.options(services.forwarder_url()))
+            .unwrap();
+    }
+    let direct = Untouchable::on(&mut services.proxy);
+    let forwarded = services.expect_forwarded(&proxy_rid, 1);
+    refresh(&mut wallet, last);
+    forwarded.assert();
+    direct.assert();
 }
 
 #[test]
