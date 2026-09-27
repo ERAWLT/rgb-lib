@@ -705,6 +705,12 @@ pub trait WalletOnline: WalletOffline {
             .as_deref()
             .map(Forwarder::new)
             .transpose()?;
+        // ERA fork: and in force before anything below can fail (the probe of a new indexer URL,
+        // the consistency check). A host's forwarder gets a new loopback port per session, and
+        // the port of the last one may belong to another app by now.
+        if let Some(online_data) = self.online_data_mut().as_mut() {
+            online_data.forwarder = forwarder.clone();
+        }
         let indexer_url = &online_options.indexer_url;
         let online = if let Some(online_data) = self.online_data().as_ref() {
             let online = Online { id: online_data.id };
@@ -722,8 +728,8 @@ pub trait WalletOnline: WalletOffline {
             *self.online_data_mut() = Some(online_data);
             online
         };
-        // ERA fork: every branch above leaves online data in place, and the forwarder always
-        // follows the latest call, including one that keeps the indexer
+        // ERA fork: every branch above leaves online data in place; online data built for the
+        // first call or a new indexer URL starts without the forwarder
         self.online_data_mut()
             .as_mut()
             .expect("online data was set above")
