@@ -1176,44 +1176,128 @@ fn sanitize_zip_for_plaintext(data: &[u8]) -> Result<(Vec<u8>, String), Error> {
     Ok((buffer.into_inner(), fingerprint))
 }
 
-/// Unzip wallet data to a target directory
-fn unzip_wallet_from_bytes(data: &[u8], target_dir: &Path, logger: &Logger) -> Result<(), Error> {
+/// ERA fork: the path of zip entry `name` relative to the directory `dir_name` at the top of the
+/// archive, or `None` for an entry outside it. Separators are `/` and `\` (a Windows-made archive
+/// may carry the latter). An absolute name, a `..` that climbs out of the archive, a NUL, or a
+/// component holding a `:` (a drive or a stream on Windows) is inside nothing.
+fn entry_in_dir(name: &str, dir_name: &str) -> Option<PathBuf> {
+    if name.contains('\0') || name.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut parts: Vec<&str> = vec![];
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part if part.contains(':') => return None,
+            part => parts.push(part),
+        }
+    }
+    match parts.split_first() {
+        Some((first, rest)) if *first == dir_name => Some(rest.iter().collect()),
+        _ => None,
+    }
+}
+
+/// ERA fork: extract the entries of the wallet directory `dir_name` at the top of the zip `data`
+/// into `wallet_dir`, and nothing else (upstream extracted every entry into the target directory,
+/// next to the other wallets there). Returns how many files were extracted. Regular files and
+/// directories only: an entry the archive marks as a symlink is written as a file holding its
+/// target, as upstream wrote it.
+fn unzip_wallet_dir(
+    data: &[u8],
+    dir_name: &str,
+    wallet_dir: &Path,
+    logger: &Logger,
+) -> Result<usize, Error> {
     let reader = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| Error::Internal {
         details: format!("Failed to read zip archive: {e}"),
     })?;
 
+    let (mut files, mut skipped) = (0, 0);
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| Error::Internal {
             details: format!("Failed to read zip entry: {e}"),
         })?;
 
-        let outpath = match file.enclosed_name() {
-            Some(path) => target_dir.join(path),
-            None => continue,
+        let Some(relative) = entry_in_dir(file.name(), dir_name) else {
+            skipped += 1;
+            continue;
         };
+        let outpath = wallet_dir.join(&relative);
 
-        if file.name().ends_with('/') {
-            debug!(logger, "VSS restore: creating directory {:?}", outpath);
+        if file.name().ends_with(['/', '\\']) {
+            debug!(logger, "VSS restore: creating directory {:?}", relative);
             fs::create_dir_all(&outpath)?;
+        } else if relative.as_os_str().is_empty() {
+            // a file where the wallet directory is
+            skipped += 1;
         } else {
             debug!(
                 logger,
                 "VSS restore: extracting file {:?} ({} bytes)",
-                outpath,
+                relative,
                 file.size()
             );
-            if let Some(p) = outpath.parent()
-                && !p.exists()
-            {
+            if let Some(p) = outpath.parent() {
                 fs::create_dir_all(p)?;
             }
             let mut outfile = fs::File::create(&outpath)?;
             std::io::copy(&mut file, &mut outfile)?;
+            files += 1;
         }
     }
+    if skipped > 0 {
+        info!(
+            logger,
+            "VSS restore: {skipped} entries outside the wallet directory not extracted"
+        );
+    }
 
-    Ok(())
+    Ok(files)
+}
+
+/// ERA fork: the directory a restore extracts into, next to the wallet directory it becomes once
+/// the extraction is complete ([`Self::finish`]); removed with whatever it holds otherwise, so a
+/// restore that fails leaves no partial wallet directory behind.
+struct Staging {
+    path: Option<PathBuf>,
+}
+
+impl Staging {
+    fn new(target_dir: &Path, fingerprint: &str) -> Result<Self, Error> {
+        let path = target_dir.join(format!(
+            ".vss_restore_{fingerprint}_{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self { path: Some(path) })
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("set until finish")
+    }
+
+    /// Rename the staging directory to `wallet_dir`.
+    fn finish(mut self, wallet_dir: &Path) -> Result<(), Error> {
+        let path = self.path.take().expect("set until finish");
+        if let Err(e) = fs::rename(&path, wallet_dir) {
+            let _ = fs::remove_dir_all(&path);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// Restore a wallet from VSS backup
@@ -1223,10 +1307,13 @@ fn unzip_wallet_from_bytes(data: &[u8], target_dir: &Path, logger: &Logger) -> R
 /// For plaintext backups, the fingerprint is fetched from a separate server key
 /// and the sanitized "wallet/" directory is renamed to the actual fingerprint.
 ///
-/// ERA fork: the manifest is read once, so the decryption and the rename follow the same answer,
-/// and the name the server gives the wallet is used as a directory name only if it is a wallet
-/// fingerprint (8 hex characters); anything else is [`Error::VssError`] before any of the backup
-/// is written. [`restore_from_vss_expecting`] also checks whose wallet it is.
+/// ERA fork: the manifest is read once, so the decryption and the extraction follow the same
+/// answer, and the name the server gives the wallet is used as a directory name only if it is a
+/// wallet fingerprint (8 lowercase hex characters); anything else is [`Error::VssError`] before
+/// any of the backup is written. An encrypted backup must name that same wallet inside, else
+/// [`Error::FingerprintMismatch`]. Only the archive's wallet directory is extracted, into a
+/// staging directory renamed to `<target_dir>/<fingerprint>` once complete: an entry outside it
+/// is not written anywhere. [`restore_from_vss_expecting`] also checks whose wallet it is.
 ///
 /// Returns the path to the restored wallet directory.
 pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Result<PathBuf, Error> {
@@ -1248,7 +1335,8 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
 ///   this one too, else [`Error::FingerprintMismatch`].
 ///
 /// Each of those is read once, so a server cannot pass a check with one answer and have the
-/// restore act on another.
+/// restore act on another. As for [`restore_from_vss`], only the wallet directory of the archive
+/// is extracted.
 pub async fn restore_from_vss_expecting(
     config: VssBackupConfig,
     target_dir: &str,
@@ -1257,10 +1345,11 @@ pub async fn restore_from_vss_expecting(
     restore_from_vss_impl(config, target_dir, Some(expected_fingerprint)).await
 }
 
-/// ERA fork: whether `name` is a wallet fingerprint, as `zip_wallet_to_bytes` and the server name
-/// it: 8 hex characters, so it can be a directory name and nothing else.
+/// ERA fork: whether `name` is a wallet fingerprint as rgb-lib names a wallet directory (and the
+/// server's `backup/fingerprint` names it): 8 lowercase hex characters, so it can be a directory
+/// name and nothing else, and names one directory only (not another on a case-insensitive disk).
 fn is_fingerprint(name: &str) -> bool {
-    name.len() == 8 && name.bytes().all(|b| b.is_ascii_hexdigit())
+    name.len() == 8 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 async fn restore_from_vss_impl(
@@ -1270,7 +1359,7 @@ async fn restore_from_vss_impl(
 ) -> Result<PathBuf, Error> {
     // ERA fork: the expected fingerprint names a directory, so it is checked before anything
     if let Some(expected) = expected_fingerprint
-        && !(is_fingerprint(expected) && expected.bytes().all(|b| !b.is_ascii_uppercase()))
+        && !is_fingerprint(expected)
     {
         return Err(Error::InvalidFingerprint);
     }
@@ -1310,22 +1399,6 @@ async fn restore_from_vss_impl(
     }
     info!(logger, "Wallet fingerprint: {}", fingerprint);
 
-    info!(logger, "Downloading backup from VSS server...");
-    let backup_data = client.download_backup_with(&manifest).await?;
-    info!(
-        logger,
-        "Downloaded {} bytes ({:.2} MB)",
-        backup_data.len(),
-        backup_data.len() as f64 / 1_000_000.0
-    );
-    // ERA fork: an encrypted backup names its wallet inside, where the server cannot change it
-    if manifest.encrypted
-        && let Some(expected) = expected_fingerprint
-        && get_fingerprint_from_zip_bytes(&backup_data)? != expected
-    {
-        return Err(Error::FingerprintMismatch);
-    }
-
     let target_dir_path = PathBuf::from(target_dir);
     let wallet_dir = target_dir_path.join(&fingerprint);
 
@@ -1336,26 +1409,43 @@ async fn restore_from_vss_impl(
         });
     }
 
-    // Extract backup
-    info!(logger, "Extracting backup to {:?}", target_dir_path);
-    unzip_wallet_from_bytes(&backup_data, &target_dir_path, &logger)?;
-
-    // For non-encrypted backups, the zip uses "wallet/" as the directory name
-    // instead of the real fingerprint. Rename it back.
-    if !manifest.encrypted {
-        let sanitized_dir = target_dir_path.join(SANITIZED_DIR_NAME);
-        if sanitized_dir.exists() {
-            info!(
-                logger,
-                "Renaming sanitized directory {:?} to {:?}", sanitized_dir, wallet_dir
-            );
-            fs::rename(&sanitized_dir, &wallet_dir)?;
+    info!(logger, "Downloading backup from VSS server...");
+    let backup_data = client.download_backup_with(&manifest).await?;
+    info!(
+        logger,
+        "Downloaded {} bytes ({:.2} MB)",
+        backup_data.len(),
+        backup_data.len() as f64 / 1_000_000.0
+    );
+    // ERA fork: the wallet directory in the archive. An encrypted backup names its wallet inside,
+    // where the server cannot change it: that must be the wallet the server named. A plaintext
+    // one is sanitized, its directory being "wallet/" whatever the wallet (upstream extracted it
+    // under that name and renamed it afterwards).
+    let dir_in_zip = if manifest.encrypted {
+        let named = get_fingerprint_from_zip_bytes(&backup_data)?;
+        if named != fingerprint {
+            return Err(Error::FingerprintMismatch);
         }
+        named
+    } else {
+        SANITIZED_DIR_NAME.to_string()
+    };
+
+    // Extract backup
+    // ERA fork: only the wallet directory, into a staging directory renamed into place once the
+    // extraction is complete
+    info!(logger, "Extracting backup to {:?}", wallet_dir);
+    let staging = Staging::new(&target_dir_path, &fingerprint)?;
+    if unzip_wallet_dir(&backup_data, &dir_in_zip, staging.path(), &logger)? == 0 {
+        return Err(Error::VssError {
+            details: "the backup holds no file of the wallet".to_string(),
+        });
     }
 
-    if let Err(e) = fs::write(wallet_dir.join(VSS_RESTORE_MARKER), b"") {
+    if let Err(e) = fs::write(staging.path().join(VSS_RESTORE_MARKER), b"") {
         info!(logger, "Could not write restore marker: {e}");
     }
+    staging.finish(&wallet_dir)?;
 
     info!(logger, "VSS restore completed successfully");
     Ok(wallet_dir)
@@ -1989,8 +2079,15 @@ mod tests {
         let mut entries: Vec<String> = WalkDir::new(root)
             .min_depth(1)
             .into_iter()
+            .map(Result::unwrap)
+            // (a staging directory left behind, ".vss_restore_…", is not a log)
+            .filter(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vss_restore_")
+            })
             .map(|entry| {
-                let entry = entry.unwrap();
                 entry
                     .path()
                     .strip_prefix(root)
@@ -1998,7 +2095,6 @@ mod tests {
                     .to_string_lossy()
                     .to_string()
             })
-            .filter(|path| !path.contains("vss_restore_"))
             .collect();
         entries.sort();
         entries
@@ -2156,19 +2252,239 @@ mod tests {
     #[test]
     fn restore_refuses_a_server_fingerprint_that_is_not_one() {
         // upstream's restore_from_vss: the name the server gives the wallet became a directory
-        // name as it came, so "../escape" put the restored wallet next to the target
+        // name as it came, so "../escape" put the restored wallet next to the target; an upper
+        // case one names another directory than rgb-lib's (the same one on a case-insensitive
+        // disk)
         let key = test_signing_key();
         let [manifest, data, _] = uploaded(EXPECTED, &key, false);
+        for named in ["../escape", "A1B2C3D4", "a1b2c3d4/", "", "/tmp/era-escape"] {
+            let server = VssScript::start(vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest.clone()]),
+                (BACKUP_KEY_FINGERPRINT, vec![named.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key).with_encryption(false), &target, None);
+            assert!(
+                matches!(result, Err(Error::VssError { .. })),
+                "{named:?}: {result:?}"
+            );
+            assert_eq!(server.reads(BACKUP_KEY_DATA), 0, "{named:?}");
+            assert_eq!(tree(root.path()), ["data"], "{named:?}");
+        }
+    }
+
+    // ERA fork: only the archive's wallet directory is extracted, and only whole
+
+    /// A zip of `entries`: a name and its content, or a directory (None).
+    fn zip_of(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buffer);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in entries {
+                match content {
+                    None => zip.add_directory(*name, options).unwrap(),
+                    Some(content) => {
+                        zip.start_file(*name, options).unwrap();
+                        zip.write_all(content).unwrap();
+                    }
+                }
+            }
+            zip.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    /// What the server holds for `zip` uploaded with encryption on, under `key`.
+    fn sealed(zip: &[u8], key: &SecretKey) -> [Vec<u8>; 3] {
+        let metadata = VssEncryptionMetadata::new();
+        let data = encrypt_data(zip, key, &metadata, None).unwrap();
+        [
+            manifest_json(true, &data),
+            data,
+            serde_json::to_vec(&metadata).unwrap(),
+        ]
+    }
+
+    /// A target directory already holding another wallet, `deadbeef`.
+    fn target_with_another_wallet(root: &Path) -> PathBuf {
+        let target = root.join("data");
+        fs::create_dir_all(target.join("deadbeef")).unwrap();
+        fs::write(target.join("deadbeef/rgb_lib_db"), b"another wallet").unwrap();
+        target
+    }
+
+    #[test]
+    fn a_restore_extracts_the_wallet_directory_and_nothing_else() {
+        // entries outside a1b2c3d4/ in an archive encrypted with the user's key: upstream wrote
+        // every one of them into the target directory (or next to it), over another wallet too
+        let key = test_signing_key();
+        let odd = zip_of(&[
+            ("a1b2c3d4/", None),
+            ("a1b2c3d4/rgb_lib_db", Some(b"db")),
+            ("a1b2c3d4\\media_files\\m1", Some(b"media")),
+            ("../outside.txt", Some(b"x")),
+            ("/abs.txt", Some(b"x")),
+            ("deadbeef/rgb_lib_db", Some(b"overwritten")),
+            ("wallet/y.txt", Some(b"x")),
+            ("a1b2c3d4/../z.txt", Some(b"x")),
+            ("a1b2c3d4/../../up.txt", Some(b"x")),
+            ("a1b2c3d4/C:/drive.txt", Some(b"x")),
+        ]);
+        let [manifest, data, metadata] = sealed(&odd, &key);
         let server = VssScript::start(vec![
             (BACKUP_KEY_MANIFEST, vec![manifest]),
-            (BACKUP_KEY_FINGERPRINT, vec![b"../escape".to_vec()]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
             (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
+        ]);
+        for expected in [Some(EXPECTED), None] {
+            let root = tempfile::tempdir().unwrap();
+            let target = target_with_another_wallet(root.path());
+            let restored = restore(config(&server, key), &target, expected).unwrap();
+            assert_eq!(restored, target.join(EXPECTED));
+            assert_eq!(
+                tree(root.path()),
+                [
+                    "data",
+                    "data/a1b2c3d4",
+                    "data/a1b2c3d4/.vss_restored",
+                    "data/a1b2c3d4/media_files",
+                    "data/a1b2c3d4/media_files/m1",
+                    "data/a1b2c3d4/rgb_lib_db",
+                    "data/deadbeef",
+                    "data/deadbeef/rgb_lib_db",
+                ],
+                "{expected:?}"
+            );
+            assert_eq!(
+                fs::read(target.join("deadbeef/rgb_lib_db")).unwrap(),
+                b"another wallet"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plaintext_restore_extracts_the_sanitized_directory_and_nothing_else() {
+        // encryption off in the config: the server's plaintext is taken, but only its wallet/
+        // directory, as the wallet's
+        let key = test_signing_key();
+        let plain = zip_of(&[
+            ("wallet/", None),
+            ("wallet/rgb_lib_db", Some(b"server db")),
+            ("deadbeef/rgb_lib_db", Some(b"overwritten by the server")),
+            ("a1b2c3d4/planted", Some(b"x")),
+            ("../outside.txt", Some(b"x")),
+        ]);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest_json(false, &plain)]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![plain]),
+        ]);
+        for expected in [Some(EXPECTED), None] {
+            let root = tempfile::tempdir().unwrap();
+            let target = target_with_another_wallet(root.path());
+            restore(
+                config(&server, key).with_encryption(false),
+                &target,
+                expected,
+            )
+            .unwrap();
+            assert_eq!(
+                tree(root.path()),
+                [
+                    "data",
+                    "data/a1b2c3d4",
+                    "data/a1b2c3d4/.vss_restored",
+                    "data/a1b2c3d4/rgb_lib_db",
+                    "data/deadbeef",
+                    "data/deadbeef/rgb_lib_db",
+                ],
+                "{expected:?}"
+            );
+            assert_eq!(
+                fs::read(target.join("deadbeef/rgb_lib_db")).unwrap(),
+                b"another wallet"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_refuses_an_encrypted_backup_the_server_names_for_another_wallet() {
+        // upstream's restore_from_vss extracted it under its own name and returned the server's,
+        // a directory that did not exist
+        let key = test_signing_key();
+        let [manifest, data, metadata] = uploaded("deadbeef", &key, true);
+        let server = VssScript::start(vec![
+            (BACKUP_KEY_MANIFEST, vec![manifest]),
+            (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+            (BACKUP_KEY_DATA, vec![data]),
+            (BACKUP_KEY_METADATA, vec![metadata]),
         ]);
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("data");
-        let result = restore(config(&server, key).with_encryption(false), &target, None);
-        assert!(matches!(result, Err(Error::VssError { .. })), "{result:?}");
+        let result = restore(config(&server, key), &target, None);
+        assert!(
+            matches!(result, Err(Error::FingerprintMismatch)),
+            "{result:?}"
+        );
         assert_eq!(tree(root.path()), ["data"]);
+    }
+
+    #[test]
+    fn a_backup_without_a_wallet_file_or_whose_extraction_fails_leaves_nothing() {
+        let key = test_signing_key();
+        let damaged = {
+            let mut zip = zip_of(&[
+                ("wallet/", None),
+                ("wallet/rgb_lib_db", Some(b"a database")),
+                ("wallet/stash.dat", Some(b"damaged-in-transit")),
+            ]);
+            // (stored, so the content is there as it is: its checksum no longer matches)
+            let at = zip
+                .windows(18)
+                .position(|w| w == b"damaged-in-transit")
+                .unwrap();
+            zip[at] = b'D';
+            zip
+        };
+        for (name, zip, encrypted) in [
+            (
+                "no file",
+                zip_of(&[("a1b2c3d4/", None), ("other/file", Some(b"x"))]),
+                true,
+            ),
+            ("a damaged entry", damaged, false),
+        ] {
+            let (manifest, data, metadata) = if encrypted {
+                let [manifest, data, metadata] = sealed(&zip, &key);
+                (manifest, data, metadata)
+            } else {
+                (manifest_json(false, &zip), zip, vec![])
+            };
+            let mut answers = vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest]),
+                (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+                (BACKUP_KEY_DATA, vec![data]),
+            ];
+            if encrypted {
+                answers.push((BACKUP_KEY_METADATA, vec![metadata]));
+            }
+            let server = VssScript::start(answers);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(
+                config(&server, key).with_encryption(encrypted),
+                &target,
+                Some(EXPECTED),
+            );
+            assert!(result.is_err(), "{name}: {result:?}");
+            // no wallet directory, whole or partial, and no staging directory
+            assert_eq!(tree(root.path()), ["data"], "{name}");
+        }
     }
 
     #[test]
