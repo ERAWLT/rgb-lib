@@ -27,7 +27,7 @@ Rules for the branch:
 
 | Commit | Subject | Upstream? |
 |---|---|---|
-| `6ce375e` | Add a configurable keychain layout to singlesig keys | To propose to UTEXO (draft [below](#pr-proposal-for-utexo), not sent) |
+| `6ce375e` | Add a configurable keychain layout to singlesig keys | Proposed to UTEXO: [UTEXO-Protocol/rgb-lib#104](https://github.com/UTEXO-Protocol/rgb-lib/pull/104) (2026-09-28, text [below](#pr-proposal-for-utexo)) |
 | `1d26404` | Run the fork's own checks on era branches only | Fork-only |
 | `f808c7f` | Carry one TLS stack and no migration CLI in the library | Fork-only |
 | `d82e21a` | Document the ERA fork of rgb-lib (this file) | Fork-only |
@@ -1175,8 +1175,12 @@ git push origin era/<name>                              # the branch only, never
 
 ## PR proposal for UTEXO
 
-Text only; nothing has been opened. The PR would carry `6ce375e` alone, rebased on
-their current `dev`.
+Opened on 2026-09-28 as
+[UTEXO-Protocol/rgb-lib#104](https://github.com/UTEXO-Protocol/rgb-lib/pull/104) from
+branch `era/pr-configurable-keychain-layout`: `6ce375e` alone, cherry-picked onto their
+`dev` at `ca5f6b7` (commit `c7202ee`). UTEXO had agreed to take it. We could not compile
+`dev` (the `*-s-bfa` mirrors in its `[patch.crates-io]` are private for us); the PR says
+so. Once it merges, drop `6ce375e` from the series when carrying it onto the next base.
 
 ---
 
