@@ -1673,6 +1673,21 @@ pub enum TransactionType {
     Incoming,
 }
 
+/// ERA fork (CC-99): the record a wallet keeps of a vanilla transaction, see
+/// [`Wallet::vanilla_tx_record`](crate::wallet::Wallet::vanilla_tx_record).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct VanillaTxRecord {
+    /// Transaction ID
+    pub txid: String,
+    /// What the transaction does
+    pub r#type: WalletTransactionType,
+    /// Whether it still holds the inputs it reserved (what
+    /// [`Wallet::list_pending_vanilla_txs`](crate::wallet::Wallet::list_pending_vanilla_txs)
+    /// lists): its `*_end` has not run, nor a completion
+    pub pending: bool,
+}
+
 /// A pending vanilla transaction that has reserved TXOs in the wallet.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]

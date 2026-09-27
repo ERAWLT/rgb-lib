@@ -42,8 +42,8 @@ pub use objects::{
     PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData, Recipient, RecipientInfo,
     RecipientType, RgbAllocation, RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo,
     RgbTransitionInfo, Token, TokenLight, Transaction, TransactionType, Transfer, TransferKind,
-    TransferTransportEndpoint, TransportEndpoint, TypeOfTransition, Unspent, Utxo, WalletData,
-    WalletDescriptors, WitnessData,
+    TransferTransportEndpoint, TransportEndpoint, TypeOfTransition, Unspent, Utxo, VanillaTxRecord,
+    WalletData, WalletDescriptors, WitnessData,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use objects::{

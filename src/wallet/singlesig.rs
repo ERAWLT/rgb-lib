@@ -440,6 +440,32 @@ impl Wallet {
         Ok(())
     }
 
+    /// ERA fork (CC-99): the record this wallet keeps of the vanilla transaction `txid`, if any.
+    ///
+    /// A `*_begin` with `dry_run = false` records the transaction it prepares and reserves its
+    /// inputs (`pending`); its `*_end`, and a completion by `go_online`
+    /// (`OnlineOptions::complete_unrecorded_spends`), release the reservations and keep the
+    /// record; an `*_end` given a PSBT no begin recorded creates the record. `None`: the wallet
+    /// has no record of the transaction (a `dry_run = true` PSBT never ended, one aborted with
+    /// [`abort_pending_vanilla_tx`](Wallet::abort_pending_vanilla_tx), or not a transaction of
+    /// this wallet).
+    ///
+    /// A host that refuses to end a PSBT this wallet did not record (so that a lost answer can
+    /// always be completed) can tell, with this, a transaction already recorded, whose end can be
+    /// answered without broadcasting it again, from one it never recorded.
+    pub fn vanilla_tx_record(&self, txid: String) -> Result<Option<VanillaTxRecord>, Error> {
+        let txn = self.database().begin_transaction()?;
+        let record = txn
+            .get_wallet_transaction_with_reserved_txos_by_txid(&txid)?
+            .map(|(wallet_transaction, reservations)| VanillaTxRecord {
+                txid: wallet_transaction.txid,
+                r#type: wallet_transaction.r#type,
+                pending: !reservations.is_empty(),
+            });
+        txn.commit()?;
+        Ok(record)
+    }
+
     fn finalize_offline_issuance<T: IssuedAssetDetails>(
         &self,
         txn: &DbTxn,

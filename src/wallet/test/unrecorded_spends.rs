@@ -1595,3 +1595,75 @@ fn apply_refuses_to_leave_a_divergence() {
     );
     assert_matches!(result, Err(Error::Internal { details }) if details.contains("left a divergence"));
 }
+
+// the record the bridge's drain guard reads: none for a dry run or an aborted drain, pending
+// until the drain ends or is completed, kept after; the same signed PSBT ended again after a
+// completion answers with its TX
+#[test]
+#[parallel]
+fn a_drain_record_says_whether_it_is_pending() {
+    let chain = ScriptedChain::start();
+    let (wallet, online) = funded(&chain, UTXOS);
+    let mut party = Issuer {
+        wallet,
+        online,
+        asset_id: s!(""),
+    };
+    let address = get_test_wallet(false, None).get_address().unwrap();
+    let dry_run = party
+        .wallet
+        .drain_to_begin(party.online, address.clone(), FEE_RATE, true)
+        .unwrap();
+    assert_eq!(
+        party.wallet.vanilla_tx_record(psbt_txid(&dry_run)).unwrap(),
+        None
+    );
+    let aborted = party
+        .wallet
+        .drain_to_begin(party.online, address.clone(), FEE_RATE, false)
+        .unwrap();
+    party
+        .wallet
+        .abort_pending_vanilla_tx(psbt_txid(&aborted))
+        .unwrap();
+    assert_eq!(
+        party.wallet.vanilla_tx_record(psbt_txid(&aborted)).unwrap(),
+        None
+    );
+
+    let psbt = party
+        .wallet
+        .drain_to_begin(party.online, address, FEE_RATE, false)
+        .unwrap();
+    let signed = party.wallet.sign_psbt(psbt, None).unwrap();
+    let txid = psbt_txid(&signed);
+    let record = |party: &Issuer| party.wallet.vanilla_tx_record(txid.clone()).unwrap();
+    let pending = |pending| {
+        Some(VanillaTxRecord {
+            txid: txid.clone(),
+            r#type: WalletTransactionType::Drain,
+            pending,
+        })
+    };
+    assert_eq!(record(&party), pending(true));
+    lose_the_answer(&chain, &txid);
+    let result = party.wallet.drain_to_end(party.online, signed.clone());
+    assert_matches!(result, Err(Error::Indexer { .. }));
+    assert_eq!(record(&party), pending(true));
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert_eq!(record(&party), pending(false));
+    assert_eq!(
+        party.wallet.drain_to_end(party.online, signed).unwrap(),
+        txid
+    );
+    assert_eq!(record(&party), pending(false));
+    assert_eq!(
+        party
+            .wallet
+            .vanilla_tx_record(FAKE_TXID.to_string())
+            .unwrap(),
+        None
+    );
+}
