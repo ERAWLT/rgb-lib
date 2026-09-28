@@ -1972,3 +1972,36 @@ fn a_completion_beside_a_pending_send() {
         2 * AMOUNT - 2 * AMOUNT_SMALL
     );
 }
+
+// the option off, or on with nothing to complete, is upstream's go_online: it asks for no backup
+#[test]
+#[parallel]
+fn a_clean_go_online_asks_for_no_backup() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let backup_dir = tempfile::tempdir().unwrap();
+    party
+        .wallet
+        .backup(
+            &backup_dir.path().join("backup").to_string_lossy(),
+            PASSWORD,
+        )
+        .unwrap();
+    assert!(!party.wallet.backup_info().unwrap());
+    for options in [online_options(&chain), completing_options(&chain)] {
+        reopen(&chain, &mut party, options).unwrap();
+        assert!(party.wallet.completed_spends().is_empty());
+        assert!(!party.wallet.backup_info().unwrap());
+    }
+}
+
+// the option is off when a host's options do not name it (the C-FFI binding reads them from JSON)
+#[test]
+#[parallel]
+fn the_option_is_off_unless_named() {
+    let options: OnlineOptions = serde_json::from_str(
+        r#"{"indexer_url":"http://x","skip_consistency_check":false,"vanilla_sync_lookback":1}"#,
+    )
+    .unwrap();
+    assert!(!options.complete_unrecorded_spends);
+}
