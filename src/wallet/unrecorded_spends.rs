@@ -17,7 +17,11 @@
 //! status update, the reservation release), inside the check's database transaction, and checks
 //! that no divergence is left. It never broadcasts, never contacts an RGB proxy and never marks a
 //! coin spent that such a transaction does not spend. Anything it cannot prove is refused, all or
-//! nothing, with nothing written. See the fork's `ERA.md`, section 6.
+//! nothing, with nothing written, save one case: rgb-ops commits each fascia on its own, so when
+//! the stash refuses a spend (`stash-refused`), the spends of the same plan consumed before it
+//! stay in the stash, the database rolled back. That is S2's state (the stash ahead of the
+//! database), which the next `go_online` plans again, skipping those bundles. See the fork's
+//! `ERA.md`, section 6.
 //!
 //! [`plan`] only reads (BDK's view, the database, the transfer files and the indexer's answers),
 //! so the table of verdicts is tested without a chain; [`apply`] writes.
