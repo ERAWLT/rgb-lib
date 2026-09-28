@@ -576,11 +576,18 @@ pub(crate) fn complete<W: WalletOnline + ?Sized>(
         &wallet.get_transfers_dir(),
         details,
     )
-    .inspect_err(|e| {
-        warn!(
+    .inspect_err(|e| match e {
+        // the error unsaid: an indexer's answer can name the URL it was asked, which carries the
+        // forwarder's session secret in the app (as in fail_transfers_impl)
+        Error::Indexer { .. } | Error::Network { .. } => warn!(
+            wallet.logger(),
+            "CC-99: not completing the spends of divergent coins {divergence:?}: the indexer's \
+             lookup failed"
+        ),
+        e => warn!(
             wallet.logger(),
             "CC-99: not completing the spends of divergent coins {divergence:?}: {e}"
-        )
+        ),
     })?;
     apply(wallet, txn, runtime, plan)
 }
