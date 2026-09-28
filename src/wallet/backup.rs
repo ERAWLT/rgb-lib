@@ -848,6 +848,43 @@ mod tests {
             dir_listing(&target, &fingerprint),
             fs::read_to_string(fixtures.join("file_backup_listing.txt")).unwrap()
         );
+
+        // ERA fork (CC-101): its RGB stock is one this build reads and writes as it is: the wallet
+        // opens, the three files are byte-equal after it, and each part serializes back to its
+        // own bytes. The tripwire for a base with another rgb-ops (the -bfa carry).
+        use amplify::confinement::U32 as U32MAX;
+        use rgbstd::persistence::{MemIndex, MemStash, MemState};
+        use strict_encoding::{StrictDeserialize, StrictSerialize};
+        let rgb_dir = target
+            .join(&fingerprint)
+            .join(crate::utils::RGB_RUNTIME_DIR);
+        let read = |name: &str| fs::read(rgb_dir.join(name)).unwrap();
+        let before: Vec<Vec<u8>> = ["stash.dat", "state.dat", "index.dat"]
+            .iter()
+            .map(|name| read(name))
+            .collect();
+        drop(crate::wallet::Wallet::load(target.to_str().unwrap(), &fingerprint, None).unwrap());
+        let after: Vec<Vec<u8>> = ["stash.dat", "state.dat", "index.dat"]
+            .iter()
+            .map(|name| read(name))
+            .collect();
+        assert_eq!(after, before);
+        let stash = MemStash::strict_deserialize_from_file::<U32MAX>(rgb_dir.join("stash.dat"))
+            .unwrap()
+            .to_strict_serialized::<U32MAX>()
+            .unwrap();
+        let state = MemState::strict_deserialize_from_file::<U32MAX>(rgb_dir.join("state.dat"))
+            .unwrap()
+            .to_strict_serialized::<U32MAX>()
+            .unwrap();
+        let index = MemIndex::strict_deserialize_from_file::<U32MAX>(rgb_dir.join("index.dat"))
+            .unwrap()
+            .to_strict_serialized::<U32MAX>()
+            .unwrap();
+        assert_eq!(
+            vec![stash.release(), state.release(), index.release()],
+            before
+        );
     }
 
     #[test]

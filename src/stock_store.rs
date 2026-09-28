@@ -635,6 +635,32 @@ mod tests {
         );
     }
 
+    // a stock file over 64 KiB goes through as it is: store and load read the length as rgb-ops'
+    // FsBinStore does (u32), and a mismatch would lock a grown stash out of every load and store
+    #[test]
+    #[parallel]
+    fn a_stock_over_64_kib_is_stored_and_loaded_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rgb_dir = rgb(dir.path());
+        fs::create_dir_all(&rgb_dir).unwrap();
+        let mut stock = Stock::in_memory();
+        // about 13 bytes each
+        let seals: BTreeSet<GraphSeal> = (0..6000).map(GraphSeal::new_random_vout).collect();
+        for seal in &seals {
+            stock.store_secret_seal(*seal).unwrap();
+        }
+        let store = StockStore::new(rgb_dir.clone());
+        stock.make_persistent(store.clone(), true).unwrap();
+        store.check_stored().unwrap();
+        drop(stock);
+        let size = fs::metadata(rgb_dir.join("stash.dat")).unwrap().len();
+        assert!(size > u64::from(u16::MAX), "{size}");
+        let (stock, _) = open_stock(dir.path(), &rgb_dir, false).unwrap();
+        let loaded: BTreeSet<GraphSeal> =
+            stock.as_stash_provider().secret_seals().unwrap().collect();
+        assert_eq!(loaded, seals);
+    }
+
     // a directory sync that failed after the rename is not forgotten by a later store of the same,
     // unchanged bytes: that store syncs the directory, and only then is the failure gone
     #[test]
