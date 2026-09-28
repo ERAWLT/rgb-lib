@@ -1667,3 +1667,88 @@ fn a_drain_record_says_whether_it_is_pending() {
         None
     );
 }
+
+// CC-101: a stash the disk refuses while a spend is completed is an I/O error, which a retry can
+// get past, not the stash's verdict on the transitions; the next go_online completes the spend
+#[test]
+#[parallel]
+fn a_stash_the_disk_refuses_is_an_io_error() {
+    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, _) = donation_answer_lost(&chain, &mut party);
+    STORE_FAILURES
+        .with_borrow_mut(|f| f.push((s!("stash.dat"), InjectedFailure::HalfWritten, usize::MAX)));
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    STORE_FAILURES.with_borrow_mut(|f| f.clear());
+    assert_matches!(result, Err(Error::IO { details }) if details.contains("stash.dat"));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+}
+
+// CC-101: an issuance whose contract the disk refuses is an I/O error, not a panic
+#[test]
+#[parallel]
+fn an_issuance_the_disk_refuses_is_an_io_error() {
+    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
+    let chain = ScriptedChain::start();
+    let (wallet, _online) = funded(&chain, UTXOS);
+    STORE_FAILURES
+        .with_borrow_mut(|f| f.push((s!("stash.dat"), InjectedFailure::HalfWritten, usize::MAX)));
+    let result = wallet.issue_asset_nia(
+        TICKER.to_string(),
+        NAME.to_string(),
+        PRECISION,
+        vec![AMOUNT],
+    );
+    STORE_FAILURES.with_borrow_mut(|f| f.clear());
+    assert_matches!(result, Err(Error::IO { .. }));
+    assert!(
+        wallet
+            .list_assets(vec![])
+            .unwrap()
+            .nia
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+// the report is the last go_online's, even when that call failed before its check: a refused
+// forwarder URL and a failed probe of a new indexer both leave the online state in place (the
+// second keeps the previous session usable), and neither may leave the previous report with it
+#[test]
+#[parallel]
+fn a_failed_go_online_leaves_no_report() {
+    for refused_forwarder in [true, false] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (_, _) = donation_answer_lost(&chain, &mut party);
+        reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+        assert_eq!(party.wallet.completed_spends().len(), 1);
+        let failing = if refused_forwarder {
+            OnlineOptions {
+                forwarder_url: Some(s!("http://localhost:1/secret/rgb")),
+                ..completing_options(&chain)
+            }
+        } else {
+            OnlineOptions {
+                indexer_url: s!("http://127.0.0.1:1"),
+                ..completing_options(&chain)
+            }
+        };
+        let result = party.wallet.go_online(failing);
+        if refused_forwarder {
+            assert_matches!(result, Err(Error::InvalidForwarderUrl { .. }));
+        } else {
+            assert_matches!(result, Err(Error::InvalidIndexer { .. }));
+            // upstream stays online on the previous indexer
+            party
+                .wallet
+                .list_unspents(Some(party.online), false, false)
+                .unwrap();
+        }
+        assert!(party.wallet.completed_spends().is_empty());
+    }
+}
