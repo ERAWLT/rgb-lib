@@ -99,9 +99,11 @@
 pub(crate) mod api;
 pub(crate) mod database;
 pub(crate) mod error;
+// ERA fork (CC-101): the RGB stock on disk
 pub mod keys;
 #[cfg(feature = "mpc")]
 pub mod mpc;
+mod stock_store;
 pub mod utils;
 pub mod wallet;
 
@@ -235,7 +237,7 @@ use rgbstd::{
     },
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
-    persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    persistence::{MemContract, MemContractState, StashReadProvider, Stock},
     rgbcore::commit_verify::{
         CommitId, Conceal, TryCommitVerify,
         mpc::{Commitment, MerkleTree, Message, MultiSource, ProtocolId},
@@ -356,6 +358,7 @@ use crate::{
     },
     error::InternalError,
     keys::{Keys, WitnessVersion},
+    stock_store::StockStore,
     utils::{
         ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, KeychainLayout, LOG_FILE, PURPOSE,
         RgbRuntime, adjust_canonicalization, beneficiary_from_script_buf,

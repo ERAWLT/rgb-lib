@@ -1014,6 +1014,9 @@ pub(crate) enum InternalError {
 
     #[error("Stock error: {0}")]
     StockError(String),
+    /// ERA fork (CC-101): a store of the RGB stock that failed (stock_store); `Error::IO`
+    #[error("RGB stock not stored: {0}")]
+    StockNotStored(String),
 
     #[error("Strip prefix error: {0}")]
     StripPrefix(#[from] std::path::StripPrefixError),
@@ -1210,8 +1213,12 @@ impl From<std::io::Error> for Error {
 
 impl From<InternalError> for Error {
     fn from(e: InternalError) -> Self {
-        Error::Internal {
-            details: e.to_string(),
+        match e {
+            // ERA fork (CC-101): the disk refused the RGB stock, as any I/O error
+            InternalError::StockNotStored(details) => Error::IO { details },
+            e => Error::Internal {
+                details: e.to_string(),
+            },
         }
     }
 }

@@ -1714,9 +1714,13 @@ impl MultisigWallet {
 
         // import and move contract file to the issue consignment path
         let mut runtime = self.rgb_runtime()?;
-        runtime
-            .import_contract(valid_contract.clone(), &DumbResolver)
-            .expect("importing issued contract should work");
+        // ERA fork (CC-101): a store the disk refused is an error, not a panic
+        if let Err(e) = runtime.import_contract(valid_contract.clone(), &DumbResolver) {
+            match e {
+                InternalError::StockNotStored(details) => return Err(Error::IO { details }),
+                e => panic!("importing issued contract should work: {e}"),
+            }
+        }
         let contract_id = valid_contract.contract_id();
         let asset_id = contract_id.to_string();
         let contract_path = self.get_issue_consignment_path(&asset_id);

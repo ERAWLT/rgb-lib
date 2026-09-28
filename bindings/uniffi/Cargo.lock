@@ -3235,6 +3235,7 @@ dependencies = [
  "file-format",
  "hex",
  "hkdf 0.12.4",
+ "nonasync",
  "rand 0.10.1",
  "reqwest",
  "rgb-invoicing",

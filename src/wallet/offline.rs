@@ -362,9 +362,13 @@ pub trait WalletOffline: WalletBackup {
         issue_data: &IssueData,
         runtime: &mut RgbRuntime,
     ) -> Result<DbAsset, Error> {
-        runtime
-            .import_contract(issue_data.valid_contract.clone(), &DumbResolver)
-            .expect("failure importing issued contract");
+        // ERA fork (CC-101): a store the disk refused is an error, not a panic
+        if let Err(e) = runtime.import_contract(issue_data.valid_contract.clone(), &DumbResolver) {
+            match e {
+                InternalError::StockNotStored(details) => return Err(Error::IO { details }),
+                e => panic!("failure importing issued contract: {e}"),
+            }
+        }
 
         let asset = self.add_asset_to_db(txn, &issue_data.asset_data)?;
         let batch_transfer = DbBatchTransferActMod {

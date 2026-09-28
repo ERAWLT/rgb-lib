@@ -480,16 +480,20 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
             );
             continue;
         };
-        runtime.consume_fascia(fascia, None).map_err(|e| {
-            warn!(
-                wallet.logger(),
-                "CC-99: the stash refused the transitions of TX {}: {e}", spend.txid
-            );
-            refusal(
-                &spend.txid,
-                UnrecordedSpendReason::StashRefused,
-                Some(batch_transfer.idx),
-            )
+        runtime.consume_fascia(fascia, None).map_err(|e| match e {
+            // the disk refused the stash (CC-101): an I/O error, not the stash's verdict
+            InternalError::StockNotStored(details) => Error::IO { details },
+            e => {
+                warn!(
+                    wallet.logger(),
+                    "CC-99: the stash refused the transitions of TX {}: {e}", spend.txid
+                );
+                refusal(
+                    &spend.txid,
+                    UnrecordedSpendReason::StashRefused,
+                    Some(batch_transfer.idx),
+                )
+            }
         })?;
     }
     runtime.persist()?;

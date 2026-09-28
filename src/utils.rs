@@ -845,6 +845,8 @@ impl ResolveWitness for DumbResolver {
 pub struct RgbRuntime {
     /// The RGB stock
     stock: Stock,
+    /// ERA fork (CC-101): the stock's files, and the stores of them that failed
+    store: StockStore,
     /// The wallet directory, where the lockfile for the runtime is to be held
     wallet_dir: PathBuf,
     /// Whether dropping the runtime should persist the in-memory stock.
@@ -872,7 +874,22 @@ impl RgbRuntime {
         }
         self.stock.store().map_err(|error| Error::IO {
             details: error.to_string(),
-        })
+        })?;
+        // ERA fork (CC-101): a failed store is kept by the store, not returned (stock_store)
+        self.store
+            .check_stored()
+            .map_err(|details| Error::IO { details })
+    }
+
+    /// ERA fork (CC-101): `result` of a call into the stock that may have stored it, unless a
+    /// store of it failed (see stock_store: rgb-ops is never handed a store error, which it would
+    /// answer with a panic)
+    fn stored<T>(&self, result: Result<T, InternalError>) -> Result<T, InternalError> {
+        let value = result?;
+        self.store
+            .check_stored()
+            .map_err(InternalError::StockNotStored)?;
+        Ok(value)
     }
 
     /// ERA fork (CC-99): `fascia` without the bundles the stash already holds, `None` when it holds
@@ -922,9 +939,11 @@ impl RgbRuntime {
         contract: ValidTransfer,
         resolver: &R,
     ) -> Result<(), InternalError> {
-        self.stock
+        let result = self
+            .stock
             .accept_transfer(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     pub(crate) fn consume_fascia(
@@ -948,9 +967,11 @@ impl RgbRuntime {
             witness_ord: witness_ord.unwrap_or(WitnessOrd::Tentative),
         };
 
-        self.stock
+        let result = self
+            .stock
             .consume_fascia(fascia, resolver)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -995,13 +1016,16 @@ impl RgbRuntime {
         contract: ValidContract,
         resolver: &R,
     ) -> Result<(), InternalError> {
-        self.stock
+        let result = self
+            .stock
             .import_contract(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     pub(crate) fn import_kit(&mut self, kit: ValidKit) -> Result<Status, InternalError> {
-        self.stock.import_kit(kit).map_err(InternalError::from)
+        let result = self.stock.import_kit(kit).map_err(InternalError::from);
+        self.stored(result)
     }
 
     pub(crate) fn contract_assignments_for(
@@ -1044,9 +1068,11 @@ impl RgbRuntime {
     }
 
     pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<bool, InternalError> {
-        self.stock
+        let result = self
+            .stock
             .store_secret_seal(seal)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     pub(crate) fn transfer(
@@ -1114,9 +1140,11 @@ impl RgbRuntime {
         after_height: u32,
         force_witnesses: Vec<RgbTxid>,
     ) -> Result<UpdateRes, InternalError> {
-        self.stock
+        let result = self
+            .stock
             .update_witnesses(resolver, after_height, force_witnesses)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     pub(crate) fn upsert_witness(
@@ -1124,8 +1152,11 @@ impl RgbRuntime {
         witness_id: RgbTxid,
         witness_ord: WitnessOrd,
     ) -> Result<(), InternalError> {
-        self.stock.upsert_witness(witness_id, witness_ord)?;
-        Ok(())
+        let result = self
+            .stock
+            .upsert_witness(witness_id, witness_ord)
+            .map_err(InternalError::from);
+        self.stored(result)
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1143,6 +1174,9 @@ impl RgbRuntime {
 
 impl Drop for RgbRuntime {
     fn drop(&mut self) {
+        // ERA fork (CC-101): this store cannot fail, so it cannot panic: StockStore keeps a
+        // failure instead of returning it, and the file keeps its previous version. Nobody is
+        // left to report it to here; the call that dirtied the stock reported its own.
         if self.persist_on_drop {
             self.stock.store().expect("unable to save stock");
         }
@@ -1186,8 +1220,9 @@ pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRunti
     if !rgb_dir.exists() {
         fs::create_dir_all(&rgb_dir)?;
     }
-    let provider = FsBinStore::new(rgb_dir.clone())?;
-    let stock = Stock::load(provider.clone(), true).or_else(|err| {
+    // ERA fork (CC-101): the stock's files are stored atomically (stock_store)
+    let store = StockStore::new(rgb_dir.clone());
+    let stock = Stock::load(store.clone(), true).or_else(|err| {
         if err
             .0
             .downcast_ref::<DeserializeError>()
@@ -1195,7 +1230,9 @@ pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRunti
             .unwrap_or_default()
         {
             let mut stock = Stock::in_memory();
-            stock.make_persistent(provider, true).expect("unable to save stock");
+            stock.make_persistent(store.clone(), true).expect("unable to save stock");
+            // ERA fork (CC-101): a store the disk refused is an error, not a panic
+            store.check_stored().map_err(|details| Error::IO { details })?;
             return Ok(stock)
         }
         Err(Error::IO { details: err.to_string() })
@@ -1203,6 +1240,7 @@ pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRunti
 
     Ok(RgbRuntime {
         stock,
+        store,
         wallet_dir: wallet_dir.as_ref().to_path_buf(),
         persist_on_drop: true,
     })

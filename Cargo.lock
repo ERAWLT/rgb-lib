@@ -3550,6 +3550,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "mockito",
+ "nonasync",
  "once_cell",
  "p256",
  "rand 0.10.1",

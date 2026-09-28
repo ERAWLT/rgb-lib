@@ -123,6 +123,9 @@ rgb-strict-encoding = { version = "=1.0.2", default-features = false, features =
     "bitcoin",
 ] }
 rgb-strict-types = { version = "=1.0.2", default-features = false }
+# ERA fork (CC-101): the persistence provider trait, to store the RGB stock atomically (the
+# version rgb-ops pins; already in the tree through it)
+nonasync = { version = "=0.1.3", default-features = false }
 
 [dev-dependencies]
 biscuit-auth = { version = "6.0.0", default-features = false, features = [
