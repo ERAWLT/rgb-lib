@@ -892,7 +892,8 @@ impl RgbRuntime {
     /// was lost consumed it before dying (S2), or an earlier completion did and then failed to
     /// commit. A second consume is a merge on rgb-ops 0.11.1-rc.11, but that is a property of the
     /// stash implementation, so it is not relied on. A bundle in the stash implies its index and
-    /// state: `consume_fascia` commits the three together and the stash last.
+    /// state: `consume_fascia` commits the three in the order index, state, stash, and
+    /// `StockStore` holds the stash back while either of the others failed to store (CC-101).
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
         let seal_witness = fascia.seal_witness().clone();

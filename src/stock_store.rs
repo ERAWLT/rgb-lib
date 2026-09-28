@@ -16,6 +16,8 @@
 //!   `unreachable!()`: the process would panic. The failure is kept instead, per file, until a
 //!   later store of that file succeeds, and `RgbRuntime` reports it as `Error::IO` after the call
 //!   that stored. The file keeps its previous version.
+//! - Since rgb-ops then goes on with the files after it, the stash is held back while the index or
+//!   the state is behind: the stash is never newer than either.
 //!
 //! [`open_stock`] loads the three files only as a whole set; see [`StockFiles`].
 
@@ -74,10 +76,28 @@ impl StockStore {
         name: &str,
         object: &T,
     ) -> Result<(), PersistenceError> {
-        let result = object
-            .to_strict_serialized::<U32MAX>()
-            .map_err(|e| e.to_string())
-            .and_then(|data| replace_file(&self.dir, name, data.as_slice()));
+        // The stash stays the oldest of the three: rgb-ops commits index, state and stash in that
+        // order, and a stash that holds a bundle is how a consume is known to have happened
+        // (fascia_unknown_part). While the latest store of the index or the state failed, the
+        // stash is not written: a consume whose index or state is not on disk is then consumed
+        // again, instead of being skipped with its state missing.
+        let behind = (name == STOCK_FILES[0])
+            .then(|| {
+                self.failed
+                    .lock()
+                    .expect("not poisoned")
+                    .keys()
+                    .find(|other| other.as_str() != name)
+                    .cloned()
+            })
+            .flatten();
+        let result = match behind {
+            Some(other) => Err(format!("held back: {other} is not stored")),
+            None => object
+                .to_strict_serialized::<U32MAX>()
+                .map_err(|e| e.to_string())
+                .and_then(|data| replace_file(&self.dir, name, data.as_slice())),
+        };
         let mut failed = self.failed.lock().expect("not poisoned");
         match result {
             Ok(()) => {

@@ -2056,3 +2056,70 @@ fn the_media_check_runs_after_a_completion() {
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
     assert!(party.wallet.completed_spends().is_empty());
 }
+
+/// Spend the change of the issued asset once more, and settle: the stash knows every transition
+/// the change comes from.
+fn spend_the_change(chain: &ScriptedChain, party: &mut Issuer, spent_before: u64) {
+    let (_, signed, _) = begin_send(chain, party, AMOUNT_SMALL, true);
+    let next = party.wallet.send_end(party.online, signed).unwrap();
+    assert!(chain.knows(&next.txid));
+    settle(chain, party);
+    assert_eq!(
+        spendable(&party.wallet, &party.asset_id),
+        AMOUNT - spent_before - AMOUNT_SMALL
+    );
+}
+
+// CC-101: one of the three stock files failing to store while the stash consumes a spend, during
+// the completion or during send_end itself: Error::IO, the stash no newer than the file that
+// failed (it is held back), the next go_online completes the spend, it settles, and its change
+// is spent again. Were the stash written after a failed index or state, the completion would
+// skip the consume and the change could never be spent.
+#[test]
+#[parallel]
+fn a_stock_file_that_fails_to_store_keeps_the_stash_behind() {
+    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
+    for in_send_end in [false, true] {
+        for name in ["index.dat", "state.dat", "stash.dat"] {
+            let chain = ScriptedChain::start();
+            let mut party = issuer(&chain, vec![AMOUNT]);
+            let stash_path = party.wallet.get_wallet_dir().join("rgb").join("stash.dat");
+            let (idx, stash_before) = if in_send_end {
+                let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, true);
+                let stash_before = fs::read(&stash_path).unwrap();
+                STORE_FAILURES.with_borrow_mut(|f| {
+                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
+                });
+                let result = party.wallet.send_end(party.online, signed.clone());
+                STORE_FAILURES.with_borrow_mut(|f| f.clear());
+                assert!(
+                    matches!(result, Err(Error::IO { .. })),
+                    "{name}: {result:?}"
+                );
+                assert!(chain.knows(&psbt_txid(&signed)));
+                (begin.batch_transfer_idx.unwrap(), stash_before)
+            } else {
+                let (idx, _) = donation_answer_lost(&chain, &mut party);
+                let stash_before = fs::read(&stash_path).unwrap();
+                STORE_FAILURES.with_borrow_mut(|f| {
+                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
+                });
+                let result = reopen(&chain, &mut party, completing_options(&chain));
+                STORE_FAILURES.with_borrow_mut(|f| f.clear());
+                assert!(
+                    matches!(result, Err(Error::IO { .. })),
+                    "{name}: {result:?}"
+                );
+                (idx, stash_before)
+            };
+            assert_eq!(fs::read(&stash_path).unwrap(), stash_before, "{name}");
+            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+            reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+            assert_eq!(party.wallet.completed_spends().len(), 1, "{name}");
+            settle(&chain, &mut party);
+            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+            spend_the_change(&chain, &mut party, AMOUNT_SMALL);
+        }
+    }
+}
