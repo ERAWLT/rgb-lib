@@ -827,6 +827,11 @@ pub trait WalletOnline: WalletOffline {
     }
 
     fn go_online_impl(&mut self, online_options: &OnlineOptions) -> Result<Online, Error> {
+        // ERA fork (CC-99): the report is this call's, so it goes before any way out of it (a
+        // refused forwarder URL or a failed probe of a new indexer leaves the online data in place)
+        if let Some(online_data) = self.online_data_mut().as_mut() {
+            online_data.completed_spends = vec![];
+        }
         // ERA fork: validated before anything changes. A refused URL leaves a wallet no forwarder
         // routes as it was; one whose traffic a forwarder carries goes offline instead, as it does
         // below when the probe of a new indexer fails: its route is the previous session's, whose
@@ -882,8 +887,6 @@ pub trait WalletOnline: WalletOffline {
             .as_mut()
             .expect("online data was set above");
         online_data.forwarder = forwarder;
-        // ERA fork (CC-99): what this call completes, if anything
-        online_data.completed_spends = vec![];
 
         if !online_options.skip_consistency_check {
             let txn = self.database().begin_transaction()?;

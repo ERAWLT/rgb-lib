@@ -1714,3 +1714,41 @@ fn an_issuance_the_disk_refuses_is_an_io_error() {
             .is_empty()
     );
 }
+
+// the report is the last go_online's, even when that call failed before its check: a refused
+// forwarder URL and a failed probe of a new indexer both leave the online state in place (the
+// second keeps the previous session usable), and neither may leave the previous report with it
+#[test]
+#[parallel]
+fn a_failed_go_online_leaves_no_report() {
+    for refused_forwarder in [true, false] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (_, _) = donation_answer_lost(&chain, &mut party);
+        reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+        assert_eq!(party.wallet.completed_spends().len(), 1);
+        let failing = if refused_forwarder {
+            OnlineOptions {
+                forwarder_url: Some(s!("http://localhost:1/secret/rgb")),
+                ..completing_options(&chain)
+            }
+        } else {
+            OnlineOptions {
+                indexer_url: s!("http://127.0.0.1:1"),
+                ..completing_options(&chain)
+            }
+        };
+        let result = party.wallet.go_online(failing);
+        if refused_forwarder {
+            assert_matches!(result, Err(Error::InvalidForwarderUrl { .. }));
+        } else {
+            assert_matches!(result, Err(Error::InvalidIndexer { .. }));
+            // upstream stays online on the previous indexer
+            party
+                .wallet
+                .list_unspents(Some(party.online), false, false)
+                .unwrap();
+        }
+        assert!(party.wallet.completed_spends().is_empty());
+    }
+}
