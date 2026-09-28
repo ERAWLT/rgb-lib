@@ -94,14 +94,22 @@ Rules for the branch:
 | `aee685d` | Say what RgbStockDamaged is: a refusal to open, not a wipe signal | To propose to UTEXO (with `7d07452`) |
 | `5dd72f3` | Attribute a restored wallet's unopenable stock to the VSS backup | To propose to UTEXO (with `7d07452`) |
 | `f82cc6b` | Pin a stock an older rev wrote, and one over 64 KiB | To propose to UTEXO (with `ac6724d`) |
+| `1ee1caf` | Let a send whose signed.psbt will not be broadcast be failed | To propose to UTEXO (with `27d2a5a`; the unparsable half is their own lock) |
+| `74a2d66` | Test go_online's asset check again, offline and upstream | To propose to UTEXO (with `7d07452`) |
+| `50a470b` | Keep the kind when a restored wallet's stock cannot be opened | To propose to UTEXO (with `7d07452`) |
+| `3889751` | Say a linked rgb is a symbolic link, and touch nothing behind it | To propose to UTEXO (with `7d07452`) |
+| `f5d6522` | Pin the undecodable kind and the kinds' codes | To propose to UTEXO (with `7d07452`) |
+| `df04de0` | Stop promising in rustdoc that a refused completion writes nothing | To propose to UTEXO (with `c1feef6`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
 `e7bdaa4` ([§4](#4-proxy-forwarder-e7bdaa4)) and go with it wherever the series is carried;
 `45c3b39`, `777fe57`, `dcc9654` to `d6357cf`, `4ea8ccd` to `3988f38` and `b761c25` are
 [§5](#5-backup-restore-checks); `5cab571` to `106a00c` and, after their review, `74664d9` to
-`690f041` are [§6](#6-completing-an-own-unrecorded-spend-cc-99); `ac6724d`, `7d07452` and, after
-their review, `5f5edb8` to `f82cc6b` are [§7](#7-the-rgb-stock-on-disk-cc-101).
+`690f041` and, after their verification, `1ee1caf` and `df04de0` are
+[§6](#6-completing-an-own-unrecorded-spend-cc-99); `ac6724d`, `7d07452`, after their review
+`5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
+[§7](#7-the-rgb-stock-on-disk-cc-101).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -1178,7 +1186,7 @@ only.
 | `OnlineOptions::complete_unrecorded_spends: bool` | `#[serde(default)]` false, UDL `= false`. False: upstream's check, unchanged (the same requests, writes and errors). True: the check completes own unrecorded spends it can prove (below). Ignored with `skip_consistency_check`, and by multisig and MPC wallets (their checks are no-ops). |
 | `Wallet::completed_spends() -> Vec<CompletedSpend>` | What the last `go_online` completed. Empty when it completed nothing, skipped the check or failed, and while offline (`go_offline` drops it). Each `go_online` clears it first, before anything that can fail (`74664d9`). Rust API only (not in the UDL). |
 | `CompletedSpend { txid, batch_transfer_idx, previous_status, donation, confirmations }` | `batch_transfer_idx` and `previous_status` are `None` for a drain; the transfer is now `WaitingConfirmations`. `confirmations` is the indexer's answer, 0 for its mempool. |
-| `Error::UnrecordedSpend { txid, reason, batch_transfer_idx }` | New. The wallet recorded the spending TX and the indexer knows it, but its record or files do not allow completing it. Deterministic: retrying does not help. `reason` is a code of `UnrecordedSpendReason` (below). |
+| `Error::UnrecordedSpend { txid, reason, batch_transfer_idx }` | New. The wallet recorded the spending TX and the indexer knows it, but its record or files do not allow completing it. Deterministic: retrying does not help. `reason` is a code of `UnrecordedSpendReason` (below). Nothing of this spend is written and the database is unchanged; with `stash-refused`, spends of the same `go_online` consumed before it stay in the stash (S2's state), which the next `go_online` skips (the rustdoc says so since `df04de0`). |
 | `Error::UnrecordedSpendUnseen { txid, batch_transfer_idx }` | New. BDK has the coins spent by a TX this wallet recorded, and the indexer answers that it does not know it: lag, or a TX the wallet applied locally that left every mempool. Retryable. |
 | `Error::Inconsistency` / `RestoredBackupInconsistent` | Unchanged variants. With the option on, the spent-coin refusal means "spent by a TX this wallet did not record" and its `details` is upstream's text followed by `; spenders: [..]; reason=<code>`; `Error::inconsistency_reason() -> Option<InconsistencyReason>` reads the code. `None` for every other error and without the option. |
 | an indexer error | The lookup failed: retryable, nothing written. |
@@ -1318,6 +1326,9 @@ number at merge under the bridge's merge rule (`3e48ae71`).
   calling rgb-lib, so a re-send of the same signed PSBT after a completion is not reported as a
   failure; no record at all (a `dry_run = true` PSBT, an aborted drain) is refused with its own
   code (`DrainNotPending`), not `InvalidPsbt`, which the app reads as a faulty device reply.
+- A cancel (`fail_transfers` of one send) whose `signed.psbt` holds another TX or does not parse
+  now fails it (`1ee1caf`) rather than answering `InvalidPsbt`; `refresh` still reports that
+  `InvalidPsbt` for the transfer.
 - The bridge never calls rgb-lib's public `sync`: its orphan reconcile would mark the inputs
   spent without the transition or the status, and the completion would never see them (a guard
   keeps it that way).
@@ -1358,6 +1369,7 @@ settle for real (signatures are not checked). Its self-tests reproduce S1 as ups
 | | a `go_online` failing on a refused forwarder URL, or on a new indexer that does not answer (`74664d9`) | no report left; in the second case the previous session still works |
 | W10 | refusals: copy before `send_begin`, a chain of two sends, a `Failed` donation later broadcast, fascia deleted, lookup 502, TX evicted after a local apply | the error and reason; database and stash digests unchanged |
 | W11 | `try_complete_batch` with another send's `signed.psbt` (`27d2a5a`) | a per-transfer `InvalidPsbt`, no `POST /tx` |
+| | that send failed on request (`1ee1caf`); the same with its TX broadcast by another copy of the wallet; a send whose `signed.psbt` is empty | `Failed`, no `POST /tx`, the asset spendable again; `CannotFailBatchTransfer`, still `WaitingCounterparty`; every refresh `InvalidPsbt`, then `Failed` as the first |
 | | a completion | `backup_info()` goes back to true after a backup |
 | | a fascia whose second bundle the stash refuses | `stash-refused`, database and stash digests unchanged |
 | | two spends in one plan, the stash refusing either (`adb712a`) | the database unchanged, both `Initiated`; the earlier spend in the stash only when it came first; the same refusal again; once the fascia is whole, both completed and settled |
@@ -1383,7 +1395,7 @@ and a `signed.psbt` of the other spend (donation and not), an asset the fascia d
 input coloring outside T; the moved-along asset; a drain's reservations short, released, and of
 a `SendBtc` record; and P7 on a plan that covers nothing.
 
-**Mutations**: 37 in the first round, each failing a test. Through the mutation script, 34: P2's uniqueness dropped; an unknown TX read as known and a failed lookup read as unknown; P4 dropped; the witness, input-coloring, asset, transition-kind and `signed.psbt` TXID checks dropped; `Failed` accepted; incoming records accepted; the no-canonical-spender and spender-not-recorded checks dropped; `UnrecordedSpendUnseen` after `UnrecordedSpend`; the consume skipped; the status write, the reservation release, `persist()`, `update_backup_info` and P7 dropped; the runtime persisting on drop again; the option always on; a donation witnessed by BDK's copy of T, or by the unsigned TX; `record_broadcast` without the spent marks; the VSS marker removed before the commit, or kept after it; the bundle skip dropped; the report not reset, or not stored; the drain's three checks dropped; `27d2a5a`'s comparison dropped. By hand: `persist()` moved after the commit (two files), and two of `vanilla_tx_record` (always pending, never found). `persist()` dropped and moved were killed only through `MOCK_STASH_PERSIST_FAIL`, a hook inside `persist()`, which the review of these commits found fires where production never writes; the hook went (`3b856ac`), and both are equivalent mutants on this base. After that review, 8 more, each failing a test: the report reset where it was, the lookup's text logged, spenders taken from BDK's full graph, the divergence counting rows that do not exist, every `go_online` asking for a backup, the option on by default, every I/O error read as missing data, and the checks skipped after a completion.
+**Mutations**: 37 in the first round, each failing a test. Through the mutation script, 34: P2's uniqueness dropped; an unknown TX read as known and a failed lookup read as unknown; P4 dropped; the witness, input-coloring, asset, transition-kind and `signed.psbt` TXID checks dropped; `Failed` accepted; incoming records accepted; the no-canonical-spender and spender-not-recorded checks dropped; `UnrecordedSpendUnseen` after `UnrecordedSpend`; the consume skipped; the status write, the reservation release, `persist()`, `update_backup_info` and P7 dropped; the runtime persisting on drop again; the option always on; a donation witnessed by BDK's copy of T, or by the unsigned TX; `record_broadcast` without the spent marks; the VSS marker removed before the commit, or kept after it; the bundle skip dropped; the report not reset, or not stored; the drain's three checks dropped; `27d2a5a`'s comparison dropped. By hand: `persist()` moved after the commit (two files), and two of `vanilla_tx_record` (always pending, never found). `persist()` dropped and moved were killed only through `MOCK_STASH_PERSIST_FAIL`, a hook inside `persist()`, which the review of these commits found fires where production never writes; the hook went (`3b856ac`), and both are equivalent mutants on this base. After that review, 8 more, each failing a test: the report reset where it was, the lookup's text logged, spenders taken from BDK's full graph, the divergence counting rows that do not exist, every `go_online` asking for a backup, the option on by default, every I/O error read as missing data, and the checks skipped after a completion. After the verification of those fixes, 1 more: the `InvalidPsbt` arm of `try_fail_batch_transfer` dropped (all three tests of `1ee1caf`).
 
 ### Deviations from the design
 
@@ -1417,13 +1429,26 @@ a `SendBtc` record; and P7 on a plan that covers nothing.
   completion are pinned. A check-all-first pass before the consumes, which would make a stash
   refusal write nothing, was not added: rgb-ops' own pre-check (`check_opid_commitments`) covers
   one of the ways a consume fails, so the guarantee would still not hold for the others.
+- **From the verification of those fixes** (`1ee1caf`, `df04de0`): a send whose `signed.psbt`
+  will not be broadcast, because W11's guard refuses it or because it does not parse (upstream's
+  own lock, for a file `send_end`'s unsynced write left empty), could not be failed until it
+  expired (the invoice's expiration, or the bridge's hour), its coins reserved, and the user's
+  cancel answered `InvalidPsbt`. `try_fail_batch_transfer` now counts that `InvalidPsbt`, for an
+  outgoing send in `WaitingCounterparty`, as no change, next to the forwarder's refusal: the send
+  is failed unless its own TX is on chain (`CannotFailBatchTransfer`). In that refresh both
+  sources come before any broadcast. `plan_send` still refuses such a batch as `record-mismatch`
+  at `go_online` when its TX is on chain (another copy of the wallet broadcast it): that file is
+  what `try_complete_batch` would broadcast, a deliberate stop. The rustdoc of `UnrecordedSpend`
+  and of the option no longer says a refusal writes nothing.
 - **`vanilla_tx_record`** (`4093572`) is new: the bridge's guard cannot tell a recorded drain from
   an unknown PSBT through `list_pending_vanilla_txs`, which lists pending ones only.
 - **`Failed` with T on chain stays terminal** (design question 1; the lead's decision of 28.09).
 
 ### Carrying it
 
-Checked with `git merge-tree --merge-base=62a8c3a <tag> 690f041` (2026-09-28; not compiled):
+Checked with `git merge-tree --merge-base=62a8c3a <tag> 690f041` (2026-09-28; not compiled); the
+verification's `1ee1caf` and `df04de0` add no conflict (the arm in `try_fail_batch_transfer`
+merges cleanly on both tags, the rustdoc lands inside the `Error` and `OnlineOptions` hunks listed below):
 
 - **Both tags**: one new conflict in `src/wallet/mod.rs`, the `pub use objects::{..}` list, where
   UTEXO's `AssetBFA` meets `VanillaTxRecord`: keep both.
@@ -1458,8 +1483,10 @@ Checked with `git merge-tree --merge-base=62a8c3a <tag> 690f041` (2026-09-28; no
 on real files: a full disk and SIGKILLs mid-store leaving a stock file cut short, and a missing
 file "healed" by an empty stock written over the survivors. Then `5f5edb8` to `f82cc6b`, after a
 review of those two commits (the same day: one major, the stash stored after a file that failed;
-the rest durability, what the error means, and what was pinned). This concerns every rgb-lib
-wallet, not only ERA's: to propose to UTEXO.
+the rest durability, what the error means, and what was pinned). Then `74a2d66` to `f5d6522`,
+after a verification of those fixes (no blocker, no major: coverage lost by `5dd72f3`, the kind
+kept through the VSS mapping, symbolic links, and pins). This concerns every rgb-lib wallet, not
+only ERA's: to propose to UTEXO.
 
 ### Why
 
@@ -1516,7 +1543,7 @@ way:
   stored") and reported the same way. The stash is never ahead of the index or the state, so a
   spend whose index or state did not reach the disk is consumed again by the next attempt.
 
-**The load** (`7d07452`, `1a078a7`, `aee685d`, `stock_store::open_stock`, through
+**The load** (`7d07452`, `1a078a7`, `aee685d`, `3889751`, `stock_store::open_stock`, through
 `load_or_create_rgb_runtime`):
 
 | On disk | Result |
@@ -1526,6 +1553,7 @@ way:
 | one longer than its content | `RgbStockDamaged`, `trailing`; nothing written |
 | one whose content does not decode | `RgbStockDamaged`, `undecodable` (or `cut_short`, as it reads); nothing written |
 | one not a regular file, or `rgb` not a directory | `RgbStockDamaged`, `not_a_file`; nothing written |
+| `rgb` or a stock file a symbolic link | `RgbStockDamaged`, `not_a_file` ("rgb is a symbolic link"); nothing written, nothing behind the link touched |
 | one the system refuses to read (permissions) | `Error::IO`, as before |
 | some but not all | `RgbStockDamaged`, `missing` ("index.dat missing"); nothing written |
 | none, wallet without a manifest (a wallet being created; multisig and MPC wallets) | a new, empty stock, made in `rgb.new/` and renamed into place whole |
@@ -1543,10 +1571,17 @@ way:
   it: a kill between a store's rename and its directory sync leaves a rename nothing made
   durable.
 - **`rgb` as a file** was `Error::IO` on every attempt, for ever; it is `not_a_file` (`aee685d`).
+- **Symbolic links are refused** (`3889751`), `rgb` or a stock file, as "... is a symbolic link".
+  A linked `rgb` loaded before `aee685d`, but both backup walks (`backup.rs`, `vss.rs`) go
+  through the wallet directory without following links, so it was backed up empty and the
+  restore was refused for a missing stock (reproduced by the verification); a store renames its
+  new file over a linked file, which replaces the link. rgb-lib and the ERA app never make
+  either. The leftover cleanup checks `rgb` without following it, so nothing behind a link is
+  removed or synced.
 - **The lock.** A load that fails now releases the runtime's lock file. It stayed, and every later
   load waited out `LOCK_FILE_TIMEOUT_SECS` (an hour outside tests) before "unreleased lock file".
 
-**The error** (`aee685d`, `5dd72f3`). Its final shape:
+**The error** (`aee685d`, `5dd72f3`, `50a470b`). Its final shape:
 
 ```rust
 Error::RgbStockDamaged { details: String, kind: String }
@@ -1555,10 +1590,12 @@ Error::RgbStockDamaged { details: String, kind: String }
 ```
 
 - `details` names the file and how: "stash.dat is cut short", "index.dat is longer than its
-  content", "state.dat is not a file", "rgb is not a directory", "index.dat missing", "no stock
-  file for a wallet that was already set up".
+  content", "state.dat does not decode: ...", "state.dat is not a file", "rgb is not a
+  directory", "rgb is a symbolic link", "index.dat missing", "no stock file for a wallet that
+  was already set up".
 - `kind` is one of `missing`, `cut_short`, `trailing`, `undecodable`, `not_a_file`, the codes of
-  the exported `RgbStockDamage` (`code()`, `from_code()`). It is a hint for diagnostics, **not a
+  the exported `RgbStockDamage` (`code()`, `from_code()`); `Error::rgb_stock_damage()` reads it
+  back from this error and from the restored-backup form below. It is a hint for diagnostics, **not a
   way to tell a format change from damage**: random corruption reads as `cut_short` too, and
   `cut_short`, `trailing` and `undecodable` are all what intact files of another rgb-ops format
   look like.
@@ -1569,18 +1606,28 @@ Error::RgbStockDamaged { details: String, kind: String }
   keeps the directory as it is, and replaces it with a backup only when it can rule out a format
   change, for example because that backup was written by the same build. There is no integrity
   check: a file that still decodes is accepted as it is (see [Not done](#not-done)).
-- **After a VSS restore it is the backup's failure** (`5dd72f3`, `vss` feature). While the
-  restore marker (`.vss_restored`) is in the wallet directory, `setup_rgb` returns it as
+- **After a VSS restore it is reported against the backup** (`5dd72f3`, `50a470b`, `vss`
+  feature). While the restore marker (`.vss_restored`) is in the wallet directory, `setup_rgb`
+  returns it as
 
   ```rust
-  Error::RestoredBackupInconsistent { details: format!("RGB state: {details}") }
+  Error::RestoredBackupInconsistent { details: format!("RGB state ({kind}): {details}") }
+  // e.g. "RGB state (missing): index.dat missing",
+  //      "RGB state (trailing): stash.dat is longer than its content"
   ```
 
-  (the `kind` is dropped, the marker stays). A backup torn this way reports the same error
-  whether it was encrypted (which keeps the manifest, so it was refused as `RgbStockDamaged`) or
-  plaintext (manifest stripped, so an empty set got an empty stock and failed the consistency
-  check at `go_online`, as upstream). `RestoredBackupInconsistent` can therefore come from
-  `Wallet::new` as well as from `go_online`. A file restore writes no marker and keeps
+  with the marker kept. The details always start `RGB state (<kind>): `, the kind one of the five
+  codes; `Error::rgb_stock_damage()` returns it (and `None` for a restored backup that failed the
+  consistency check, whose details are upstream's), and `inconsistency_reason()` is `None`. A
+  backup torn this way reports the same error whether it was encrypted (which keeps the
+  manifest, so it was refused as `RgbStockDamaged`) or plaintext (manifest stripped, so an empty
+  set got an empty stock and failed the consistency check at `go_online`, as upstream).
+  `RestoredBackupInconsistent` can therefore come from `Wallet::new` as well as from `go_online`.
+  From `Wallet::new` it is **not a verdict on the backup**: `trailing`, `undecodable` and
+  `cut_short` may be intact files of another rgb-ops format, and then every newer backup fails
+  the same way, so the variant's message ("likely stale ... restore a newer backup") does not
+  apply; the rustdoc says so. `5dd72f3` dropped the kind here, which left a host only prose to
+  tell the two apart; `50a470b` carries it. A file restore writes no marker and keeps
   `RgbStockDamaged`.
 
 The ERA bridge takes both with CC-99's report (§6) in era_rgb API 16.
@@ -1613,8 +1660,8 @@ The ERA bridge takes both with CC-99's report (§6) in era_rgb API 16.
 
 ### Tests
 
-`cargo test --locked --lib --features esplora,vss -- stock_store::` (20 tests and the kill
-test's child, offline), four scripted-chain tests in `wallet::test::unrecorded_spends`, and
+`cargo test --locked --lib --features esplora,vss -- stock_store::` (22 tests and the kill
+test's child, offline), five scripted-chain tests in `wallet::test::unrecorded_spends`, and
 `d82e21a_file_backup_still_restores` in `wallet::backup::tests`; all three sets run in `era.yml`.
 Failures are injected per file through test-only hooks (`STORE_FAILURES`: half of the new file
 written, the process gone before the rename, the directory sync failing), and the steps of a
@@ -1631,14 +1678,23 @@ store are recorded (`STORE_EVENTS`).
 - **Kills**: a child process runs stores in a loop and is SIGKILLed 24 times at spread delays;
   after each, the stock loads whole (on the run recorded here 4 of the 24 kills left a `.new`
   behind, so they did land mid-store).
-- Each file missing; cut short, empty, longer than its content, not decoding, a directory:
-  refused with its kind, the other files byte-unchanged, whether a new stock is allowed or not,
-  the lock released; `rgb` a file refused as `not_a_file` either way, nothing written; an
-  unreadable file an I/O error; no file at all refused with a manifest, new without; a new stock
-  that fails half way (a file cut short, a kill before a file's rename, before the directory's)
-  leaving no stock file, the next attempt making it whole; a wallet reopened without `index.dat`
-  (its stash kept byte for byte) or without `rgb/`, refused; the same wallet with the VSS marker
-  written: `RestoredBackupInconsistent` ("RGB state: index.dat missing"), the marker kept.
+- Each file missing; cut short, empty, longer than its content, a directory: refused with its
+  kind and message, the other files byte-unchanged, whether a new stock is allowed or not, the
+  lock released; content that does not decode, as it reads (`f5d6522`): 64 bytes of `0xff` are
+  `undecodable` for `stash.dat` and `state.dat` and `cut_short` for `index.dat`, a `stash.dat`
+  with its first byte changed `undecodable`; `rgb` a file refused as `not_a_file` either way,
+  nothing written; `rgb` or `index.dat` a symbolic link refused as one, with a leftover behind the
+  link left alone (`3889751`); an unreadable file an I/O error; no file at all refused with a
+  manifest, new without; a new stock that fails half way (a file cut short, a kill before a
+  file's rename, before the directory's) leaving no stock file, the next attempt making it whole;
+  a wallet reopened without `index.dat` (its stash kept byte for byte) or without `rgb/`,
+  refused.
+- **The VSS mapping** (`50a470b`): a wallet without `index.dat`, and one whose `stash.dat` has
+  trailing bytes, each `RgbStockDamaged` without the marker and, with it,
+  `RestoredBackupInconsistent` "RGB state (missing): index.dat missing" / "RGB state (trailing):
+  stash.dat is longer than its content", the kind read back by `rgb_stock_damage()` both times,
+  no inconsistency reason, the marker kept; a consistency-check refusal reads as no kind. Every
+  kind reads back from its code, the five codes pinned, unknown ones refused.
 - The CC-99 completion and an issuance whose stash store fails: `Error::IO`, nothing committed,
   the next attempt succeeds.
 - **The hold-back** (the review's six probes, `a_stock_file_that_fails_to_store_keeps_the_stash_behind`):
@@ -1649,8 +1705,12 @@ store are recorded (`STORE_EVENTS`).
   before a completion that consumed and did not commit put back; the next `go_online` consumes
   again, the spend settles, and its change is spent.
 - **The format**: the `d82e21a` wallet as above.
-
-**Mutations**: 26 in the first round, each failing a test. The store: written in place (no `.new`), the file sync or the directory sync dropped, the rename before the sync, a failure not kept, never cleared, or returned to rgb-ops (the test process aborts on the panic this section removes), unchanged bytes rewritten, a `.new` left after a failure, `RgbRuntime` or `persist()` ignoring a failure, the failure mapped to `Internal`, the completion reading it as `stash-refused`, an issuance panicking on it. The load: a partial set treated as none, cut short, trailing data or undecodable read as `IO`, an unreadable file as damaged, a directory as a file, a new stock with a manifest or where not allowed, a new stock made in place, a stale `.new` or `rgb.new/` kept, the lock kept after a refusal. A mutation of the kill test's own subject (writing in place) fails the deterministic tests; the kill test is evidence, not a mutation killer. One mutant per wrapper of `RgbRuntime` was not run for `accept_transfer` and `update_witnesses`, which need a consignment or a resolver; they route through the same `stored()`. After the review, 6 more, each failing a test: the hold-back dropped (the six probes), the index dropped from the skip, the directory sync of a pending failure dropped, the load's sync of `rgb/` dropped, the VSS mapping dropped, and a `u16` length limit in place of `u32`.
+- **The asset check** (`74a2d66`, `the_asset_check_refuses_a_stock_without_the_asset`): an
+  issuer's `rgb/` replaced by a fresh wallet's, a whole stock without the asset: `go_online`
+  refused with upstream's `Inconsistency` "DB assets do not match with ones stored in RGB", with
+  the completion option and without. `5dd72f3` had moved the only tests of that branch to the
+  refusal at `Wallet::new`, and `if false && ...` on it survived `era.yml`.
+**Mutations**: 26 in the first round, each failing a test. The store: written in place (no `.new`), the file sync or the directory sync dropped, the rename before the sync, a failure not kept, never cleared, or returned to rgb-ops (the test process aborts on the panic this section removes), unchanged bytes rewritten, a `.new` left after a failure, `RgbRuntime` or `persist()` ignoring a failure, the failure mapped to `Internal`, the completion reading it as `stash-refused`, an issuance panicking on it. The load: a partial set treated as none, cut short, trailing data or undecodable read as `IO`, an unreadable file as damaged, a directory as a file, a new stock with a manifest or where not allowed, a new stock made in place, a stale `.new` or `rgb.new/` kept, the lock kept after a refusal. A mutation of the kill test's own subject (writing in place) fails the deterministic tests; the kill test is evidence, not a mutation killer. One mutant per wrapper of `RgbRuntime` was not run for `accept_transfer` and `update_witnesses`, which need a consignment or a resolver; they route through the same `stored()`. After the review, 6 more, each failing a test: the hold-back dropped (the six probes), the index dropped from the skip, the directory sync of a pending failure dropped, the load's sync of `rgb/` dropped, the VSS mapping dropped, and a `u16` length limit in place of `u32`. After the verification, 8 more, each failing a test in `era.yml`'s set: the asset check skipped, a decode error read as `cut_short`, `from_code` answering `None` (the two together had survived), the kind dropped from the restored details, `rgb_stock_damage()` answering `None` for them, the symbolic-link arm dropped, the check following the link (`metadata`), and the cleanup following it (`is_dir`).
 
 ### Carrying it
 
@@ -1658,22 +1718,32 @@ Checked with `git merge-tree --merge-base=62a8c3a <tag> 7d07452` (not compiled):
 `v0.3.0-beta.34-bfa` adds no conflict; `v0.3.0-beta.43-bfa` adds one, in
 `From<InternalError> for Error`, where UTEXO maps `UnknownContract` to `AssetNotFound`: keep both
 arms. The review's commits (`5f5edb8` to `f82cc6b`) add none on either tag (the same files and
-the same conflict hunks as at `35186ad`, 2026-09-28). Then:
+the same conflict hunks as at `35186ad`, 2026-09-28), nor do the verification's (`1ee1caf` to
+`df04de0`, against `fd18e92`: new text only inside the `Error` and `OnlineOptions` hunks already
+there). Then:
 
 - **Run the format tripwire first**: `d82e21a_file_backup_still_restores`. It is the check that
   the base's rgb-ops reads the stock the app's wallets hold. If it fails on a decode (the `-bfa`
   tags patch rgb-ops), every wallet the app has would be refused as `RgbStockDamaged` after the
   update, its files intact: that needs a migration of the stock before the carry ships, and no
-  host may answer it with a restore.
-- **Two upstream tests expect what this changes** (`5dd72f3`):
-  `go_online::consistency_check_fail_asset_ids` (its `prefill_2` / `prefill_3` copies, without
-  `rgb/`, are refused at `Wallet::new` as `RgbStockDamaged` `missing`; upstream opened them on
-  an empty stock and failed the consistency check) and
-  `vss_e2e::backup_gaps::inconsistent_restored_backup_returns_dedicated_error` (refused at
-  `Wallet::new` as `RestoredBackupInconsistent`, not at `go_online`). Both need the regtest or VSS
-  services and were compiled, not run (no Docker on the machine). On a new tag take UTEXO's
-  version of each and put the expectation back; an upstream test that removes stock files or
-  `rgb/` of a wallet with a manifest and expects an empty stock changes the same way.
+  host may answer it with a restore. The same goes for a wallet restored from VSS after the
+  carry, whose refusal comes as `RestoredBackupInconsistent` "RGB state (undecodable): ..." (or
+  `trailing`, `cut_short`): not a stale backup, and every newer backup the old build wrote fails
+  the same way.
+- **Two upstream tests expect what this changes** (`5dd72f3`, `74a2d66`, `50a470b`):
+  `go_online::consistency_check_fail_asset_ids` and
+  `vss_e2e::backup_gaps::inconsistent_restored_backup_returns_dedicated_error` remove `rgb/` of
+  a wallet that has a manifest, which upstream opened on an empty stock whose consistency check
+  failed at `go_online`. Here each keeps one assertion of the refusal at `Wallet::new`
+  (`RgbStockDamaged` `missing`; `RestoredBackupInconsistent` starting "RGB state (missing): "),
+  then puts a fresh wallet's `rgb/` in place, a whole stock without the asset, and reaches
+  `go_online` as upstream does (`Inconsistency` "DB assets do not match with ones stored in RGB"
+  for `prefill_2` and `prefill_3`; `RestoredBackupInconsistent` for the restore, the marker kept).
+  Both need the regtest or VSS services and were compiled, not run (no Docker on the machine).
+  On a new tag take UTEXO's version of each and make the same two changes; an upstream test that
+  removes stock files or `rgb/` of a wallet with a manifest and expects an empty stock changes
+  the same way. The asset branch itself is also covered offline, in `era.yml`
+  (`the_asset_check_refuses_a_stock_without_the_asset`).
 - On `-bfa` the private rgb-ops must be checked for the same provider trait, the same `nonasync`
   version and the same rollback behaviour; for the order index, state, stash in a commit's
   stores and the three file names (`STOCK_FILES`), which the hold-back relies on; and every
@@ -1683,6 +1753,8 @@ the same conflict hunks as at `35186ad`, 2026-09-28). Then:
 ### Not done
 
 - The set is atomic per file only, and the skip does not check the state (above).
+- **A symbolic link** in place of `rgb` or of a stock file is refused, not followed (above):
+  following it would take teaching both backup walks to follow it too.
 - **No integrity check.** A file that decodes is accepted as it is: a changed byte inside a value
   that still decodes loads as another stock, and nothing says so. A checksum needs a format of
   its own (a header or a sidecar file), which the byte-equality with `FsBinStore` above excludes.
@@ -1755,11 +1827,11 @@ git push origin era/<name>                              # the branch only, never
   and target handling only the forwarder tests catch
   (`send_begin_reports_the_forwarders_refusal`,
   `send_begin_refuses_an_endpoint_with_userinfo_or_a_fragment`).
-- `5cab571` to `106a00c` and `74664d9` to `690f041` (CC-99): see [Carrying it](#carrying-it) in
+- `5cab571` to `106a00c`, `74664d9` to `690f041`, `1ee1caf` and `df04de0` (CC-99): see [Carrying it](#carrying-it) in
   §6. On both `-bfa` tags they add a conflict in `src/wallet/mod.rs`, on `v0.3.0-beta.43-bfa` also in
   `Error` and the UDL; they need a refusal for UTEXO's prepared and bridge batches, and the
   scripted tests' wallets without the BFA schema.
-- `ac6724d`, `7d07452` and `5f5edb8` to `f82cc6b` (CC-101): see [Carrying it](#carrying-it-1) in
+- `ac6724d`, `7d07452`, `5f5edb8` to `f82cc6b` and `74a2d66` to `f5d6522` (CC-101): see [Carrying it](#carrying-it-1) in
   §7: one more conflict in `From<InternalError> for Error` on `v0.3.0-beta.43-bfa`, two upstream
   tests whose expectation changed, the format tripwire to run first, and the private rgb-ops to
   check.
