@@ -1407,8 +1407,9 @@ mod tests {
         // write garbage to stash.dat: Stock::load fails with a decode error
         fs::write(rgb_dir.join("stash.dat"), b"not valid binary data").unwrap();
         let result = load_rgb_runtime(dir.path());
-        // ERA fork (CC-101): state.dat and index.dat are missing, so the set is not whole
-        assert_matches!(result, Err(Error::RgbStockDamaged { .. }));
+        // ERA fork (CC-101): no decode is reached: state.dat and index.dat are missing, so the set
+        // is refused as not whole (stock_store's tests cover the decode errors)
+        assert_matches!(result, Err(Error::RgbStockDamaged { kind, .. }) if kind == "missing");
     }
 
     #[test]

@@ -765,18 +765,18 @@ mod tests {
     #[parallel]
     fn a_damaged_file_is_refused_and_nothing_written() {
         type Damage = fn(&Path);
-        let damages: [(Damage, Option<&str>, &str); 5] = [
+        let damages: [(Damage, &str, &str); 4] = [
             (
                 |path| {
                     let data = fs::read(path).unwrap();
                     fs::write(path, &data[..data.len() / 2]).unwrap();
                 },
-                Some("cut_short"),
+                "cut_short",
                 "is cut short",
             ),
             (
                 |path| fs::write(path, b"").unwrap(),
-                Some("cut_short"),
+                "cut_short",
                 "is cut short",
             ),
             (
@@ -785,17 +785,15 @@ mod tests {
                     data.push(0);
                     fs::write(path, data).unwrap();
                 },
-                Some("trailing"),
+                "trailing",
                 "is longer than its content",
             ),
-            // whatever it reads as
-            (|path| fs::write(path, [0xffu8; 64]).unwrap(), None, ""),
             (
                 |path| {
                     fs::remove_file(path).unwrap();
                     fs::create_dir(path).unwrap();
                 },
-                Some("not_a_file"),
+                "not_a_file",
                 "is not a file",
             ),
         ];
@@ -805,18 +803,48 @@ mod tests {
                 damage(&rgb(dir.path()).join(name));
                 let before = files(dir.path());
                 let details = damaged(load_rgb_runtime(dir.path()));
-                if let Some(kind) = kind {
-                    assert!(
-                        details.starts_with(&format!("{kind}: ")),
-                        "{name}: {details}"
-                    );
-                }
                 assert!(
-                    details.contains(&format!("{name} {expected}")),
+                    details.starts_with(&format!("{kind}: {name} {expected}")),
                     "{name}: {details}"
                 );
                 assert_eq!(files(dir.path()), before, "{name}: {details}");
             }
+        }
+        // content that does not decode, which reads as the file makes it read: 64 bytes of 0xff,
+        // and a stash whose first byte is changed
+        let garbage: [(&str, Damage, &str); 4] = [
+            (
+                "stash.dat",
+                |path| fs::write(path, [0xffu8; 64]).unwrap(),
+                "undecodable: stash.dat does not decode",
+            ),
+            (
+                "state.dat",
+                |path| fs::write(path, [0xffu8; 64]).unwrap(),
+                "undecodable: state.dat does not decode",
+            ),
+            (
+                "index.dat",
+                |path| fs::write(path, [0xffu8; 64]).unwrap(),
+                "cut_short: index.dat is cut short",
+            ),
+            (
+                "stash.dat",
+                |path| {
+                    let mut data = fs::read(path).unwrap();
+                    data[0] = 0xff;
+                    fs::write(path, data).unwrap();
+                },
+                "undecodable: stash.dat does not decode",
+            ),
+        ];
+        for (name, damage, expected) in garbage {
+            let dir = with_stock();
+            damage(&rgb(dir.path()).join(name));
+            let before = files(dir.path());
+            let details = damaged(load_rgb_runtime(dir.path()));
+            assert!(details.starts_with(expected), "{name}: {details}");
+            assert_eq!(files(dir.path()), before, "{name}: {details}");
         }
         // rgb itself a file, whether a new stock is allowed or not
         let dir = with_stock();
@@ -829,6 +857,42 @@ mod tests {
                 "not_a_file: rgb is not a directory"
             );
             assert_eq!(files(dir.path()), before);
+        }
+    }
+
+    // the kinds' codes, which a host reads (RgbStockDamaged's kind, the details of a restored
+    // wallet's refusal), read back
+    #[test]
+    #[parallel]
+    fn every_kind_reads_back_from_its_code() {
+        let kinds = [
+            RgbStockDamage::Missing,
+            RgbStockDamage::CutShort,
+            RgbStockDamage::Trailing,
+            RgbStockDamage::Undecodable,
+            RgbStockDamage::NotAFile,
+        ];
+        let codes: Vec<_> = kinds.iter().map(|k| k.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "missing",
+                "cut_short",
+                "trailing",
+                "undecodable",
+                "not_a_file"
+            ]
+        );
+        for kind in kinds {
+            assert_eq!(RgbStockDamage::from_code(kind.code()), Some(kind));
+            assert_eq!(
+                kind.error(s!("x")).rgb_stock_damage(),
+                Some(kind),
+                "{kind:?}"
+            );
+        }
+        for code in ["", "x", "Missing", "cut-short"] {
+            assert_eq!(RgbStockDamage::from_code(code), None, "{code}");
         }
     }
 
