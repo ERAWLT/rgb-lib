@@ -29,6 +29,7 @@ use rgbstd::persistence::{MemIndex, MemStash, MemState};
 use strict_encoding::{StrictDeserialize, StrictSerialize};
 
 use super::*;
+use crate::utils::RGB_RUNTIME_DIR;
 
 /// The files of the stock, in the order rgb-ops loads them.
 pub(crate) const STOCK_FILES: [&str; 3] = ["stash.dat", "state.dat", "index.dat"];
@@ -93,10 +94,13 @@ impl StockStore {
             .flatten();
         let result = match behind {
             Some(other) => Err(format!("held back: {other} is not stored")),
-            None => object
-                .to_strict_serialized::<U32MAX>()
-                .map_err(|e| e.to_string())
-                .and_then(|data| replace_file(&self.dir, name, data.as_slice())),
+            None => {
+                let pending = self.failed.lock().expect("not poisoned").contains_key(name);
+                object
+                    .to_strict_serialized::<U32MAX>()
+                    .map_err(|e| e.to_string())
+                    .and_then(|data| replace_file(&self.dir, name, data.as_slice(), pending))
+            }
         };
         let mut failed = self.failed.lock().expect("not poisoned");
         match result {
@@ -142,11 +146,16 @@ impl PersistenceProvider<MemIndex> for StockStore {
 }
 
 /// Replace `dir/name` with `data`: written whole to `dir/name.new`, synced, renamed over the
-/// file, then the directory synced. Nothing is written when the file already holds `data`. A
-/// failure before the rename leaves the file as it was (and removes the new one if it can).
-fn replace_file(dir: &Path, name: &str, data: &[u8]) -> Result<(), String> {
+/// file, then the directory synced. Nothing is written when the file already holds `data`; with
+/// a failure `pending` for the file, the directory is still synced then (the failure may have
+/// been that sync, after a rename that made the file what it is). A failure before the rename
+/// leaves the file as it was (and removes the new one if it can).
+fn replace_file(dir: &Path, name: &str, data: &[u8], pending: bool) -> Result<(), String> {
     let target = dir.join(name);
     if fs::read(&target).is_ok_and(|current| current == data) {
+        if pending {
+            return sync_dir(dir, name).map_err(|e| e.to_string());
+        }
         return Ok(());
     }
     let new = dir.join(format!("{name}{NEW_SUFFIX}"));
@@ -296,6 +305,9 @@ pub(crate) fn open_stock(
                 fs::remove_file(new)?;
             }
         }
+        // what the stock is built on is on disk: a process killed between a rename and the sync
+        // of the directory after it left a rename that may not be
+        sync_dir(rgb_dir, RGB_RUNTIME_DIR)?;
     }
     match StockFiles::of(rgb_dir)? {
         StockFiles::Whole => {}
@@ -409,8 +421,6 @@ fn inject(_name: &str, _at: InjectedFailure) -> io::Result<()> {
 mod tests {
     use rgbstd::persistence::fs::FsBinStore;
     use serial_test::parallel;
-
-    use crate::utils::RGB_RUNTIME_DIR;
 
     use super::*;
 
@@ -609,14 +619,49 @@ mod tests {
         );
     }
 
+    // a directory sync that failed after the rename is not forgotten by a later store of the same,
+    // unchanged bytes: that store syncs the directory, and only then is the failure gone
+    #[test]
+    #[parallel]
+    fn a_failed_directory_sync_is_made_up_for_by_the_next_store() {
+        let dir = with_stock();
+        inject("stash.dat", InjectedFailure::DirSync, 1);
+        let mut runtime = load_rgb_runtime(dir.path()).unwrap();
+        assert!(matches!(
+            runtime.store_secret_seal(seal()),
+            Err(InternalError::StockNotStored(_))
+        ));
+        STORE_EVENTS.with_borrow_mut(|e| e.clear());
+        // unchanged bytes: rgb-ops stores the stash at the start and at the end of the transaction
+        AssetSchema::Nia.import_kit(&mut runtime).unwrap();
+        let events = STORE_EVENTS.with_borrow_mut(std::mem::take);
+        assert_eq!(events, vec![StoreEvent::SyncDir(s!("stash.dat"))]);
+        runtime.persist().unwrap();
+    }
+
+    // a load syncs rgb/ before a stock is built on it: a process killed between a rename and the
+    // sync of the directory after it left a rename that may not be on disk
+    #[test]
+    #[parallel]
+    fn a_load_syncs_the_stock_directory() {
+        let dir = with_stock();
+        STORE_EVENTS.with_borrow_mut(|e| e.clear());
+        drop(load_rgb_runtime(dir.path()).unwrap());
+        let events = STORE_EVENTS.with_borrow_mut(std::mem::take);
+        assert_eq!(
+            events,
+            vec![StoreEvent::SyncDir(RGB_RUNTIME_DIR.to_string())]
+        );
+    }
+
     // every store: the new file written and synced, renamed, then the directory synced; a store of
     // unchanged bytes writes nothing
     #[test]
     #[parallel]
     fn a_store_syncs_before_and_after_the_rename() {
         let dir = with_stock();
-        STORE_EVENTS.with_borrow_mut(|e| e.clear());
         let mut runtime = load_rgb_runtime(dir.path()).unwrap();
+        STORE_EVENTS.with_borrow_mut(|e| e.clear());
         runtime.store_secret_seal(seal()).unwrap();
         let events = STORE_EVENTS.with_borrow_mut(std::mem::take);
         let stash: Vec<&StoreEvent> = events
