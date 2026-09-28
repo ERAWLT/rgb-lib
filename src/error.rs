@@ -919,7 +919,8 @@ pub enum RgbStockDamage {
     Trailing,
     /// A file whose content does not decode
     Undecodable,
-    /// A stock file that is not a regular file, or `rgb` that is not a directory
+    /// A stock file that is not a regular file, or `rgb` that is not a directory (a symbolic link
+    /// is neither)
     NotAFile,
 }
 

@@ -262,9 +262,17 @@ pub(crate) enum StockFiles {
 }
 
 impl StockFiles {
+    /// A symbolic link is refused, whether `rgb` or a stock file: the backups walk the wallet
+    /// directory without following links, so a linked `rgb` would be backed up empty, and a
+    /// store renames its new file over a linked one, which replaces the link.
     pub(crate) fn of(dir: &Path) -> Result<Self, Error> {
         match fs::symlink_metadata(dir) {
             Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(
+                    RgbStockDamage::NotAFile.error(format!("{RGB_RUNTIME_DIR} is a symbolic link"))
+                );
+            }
             Ok(_) => {
                 return Err(
                     RgbStockDamage::NotAFile.error(format!("{RGB_RUNTIME_DIR} is not a directory"))
@@ -281,6 +289,11 @@ impl StockFiles {
         for name in STOCK_FILES {
             match fs::symlink_metadata(dir.join(name)) {
                 Ok(metadata) if metadata.is_file() => {}
+                Ok(metadata) if metadata.is_symlink() => {
+                    return Err(
+                        RgbStockDamage::NotAFile.error(format!("{name} is a symbolic link"))
+                    );
+                }
                 Ok(_) => {
                     return Err(RgbStockDamage::NotAFile.error(format!("{name} is not a file")));
                 }
@@ -317,7 +330,8 @@ pub(crate) fn open_stock(
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
     }
-    if rgb_dir.is_dir() {
+    // (not through a symbolic link, which StockFiles::of refuses: nothing is touched behind it)
+    if fs::symlink_metadata(rgb_dir).is_ok_and(|metadata| metadata.is_dir()) {
         for name in STOCK_FILES {
             let new = rgb_dir.join(format!("{name}{NEW_SUFFIX}"));
             if new.exists() {
@@ -816,6 +830,42 @@ mod tests {
             );
             assert_eq!(files(dir.path()), before);
         }
+    }
+
+    // a symbolic link, as rgb or as a stock file, is refused (a linked rgb would be backed up
+    // empty), and nothing behind it is touched, not even a store's leftover
+    #[cfg(unix)]
+    #[test]
+    #[parallel]
+    fn a_symbolic_link_is_refused_and_nothing_behind_it_touched() {
+        use std::os::unix::fs::symlink;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let dir = with_stock();
+        let target = elsewhere.path().join("rgb");
+        fs::rename(rgb(dir.path()), &target).unwrap();
+        symlink(&target, rgb(dir.path())).unwrap();
+        fs::write(target.join("stash.dat.new"), b"x").unwrap();
+        let (before, behind) = (files(dir.path()), files(elsewhere.path()));
+        for new_allowed in [EXISTING, NEW] {
+            assert_eq!(
+                damaged(load_or_create_rgb_runtime(dir.path(), new_allowed)),
+                "not_a_file: rgb is a symbolic link"
+            );
+            assert_eq!(files(dir.path()), before);
+            assert_eq!(files(elsewhere.path()), behind);
+        }
+
+        let dir = with_stock();
+        let target = elsewhere.path().join("index.dat");
+        fs::rename(rgb(dir.path()).join("index.dat"), &target).unwrap();
+        symlink(&target, rgb(dir.path()).join("index.dat")).unwrap();
+        let (before, behind) = (files(dir.path()), files(elsewhere.path()));
+        assert_eq!(
+            damaged(load_rgb_runtime(dir.path())),
+            "not_a_file: index.dat is a symbolic link"
+        );
+        assert_eq!(files(dir.path()), before);
+        assert_eq!(files(elsewhere.path()), behind);
     }
 
     // a file the system refuses to read is an I/O error, which a retry may get past
