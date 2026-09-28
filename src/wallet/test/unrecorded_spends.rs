@@ -1752,3 +1752,32 @@ fn a_failed_go_online_leaves_no_report() {
         assert!(party.wallet.completed_spends().is_empty());
     }
 }
+
+// the text of a failed lookup stays out of the wallet's log: a forwarder's error page names the
+// path it was asked for, and the path carries the session's secret
+#[test]
+#[parallel]
+fn a_failed_lookup_leaves_its_text_out_of_the_log() {
+    const SECRET: &str = "5ec2e7a1b0c4d9f86e3a";
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (_, txid) = donation_answer_lost(&chain, &mut party);
+    let path = format!("/tx/{txid}/status");
+    chain.fault_answering(
+        "GET",
+        &path,
+        502,
+        false,
+        1,
+        &format!("no upstream for /{SECRET}/esplora{path}"),
+    );
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    // the caller gets the error as it came (the host scrubs what it passes on)
+    assert_matches!(result, Err(Error::Indexer { details }) if details.contains(SECRET));
+    let log_path = party.wallet.get_wallet_dir().join("log");
+    // the log is written by a thread of its own, flushed when the wallet goes
+    drop(party);
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("CC-99: not completing the spends of divergent coins"));
+    assert!(!log.contains(SECRET));
+}

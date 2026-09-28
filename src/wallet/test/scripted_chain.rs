@@ -61,6 +61,7 @@ struct Fault {
     // the request takes effect before the fault answers
     relay: bool,
     remaining: usize,
+    body: String,
 }
 
 #[derive(Default)]
@@ -459,10 +460,10 @@ impl State {
             .find(|f| f.remaining > 0 && f.method == method && f.path == path)
             .map(|f| {
                 f.remaining -= 1;
-                (f.status, f.relay)
+                (f.status, f.relay, f.body.clone())
             });
-        if let Some((status, false)) = fault {
-            return Response::text(status, "scripted fault");
+        if let Some((status, false, body)) = &fault {
+            return Response::text(*status, body);
         }
         let response = if path == PROXY_PATH && method == "POST" {
             self.proxy(content_type, body)
@@ -476,7 +477,7 @@ impl State {
             }
         };
         match fault {
-            Some((status, true)) => Response::text(status, "scripted fault"),
+            Some((status, true, body)) => Response::text(status, &body),
             _ => response,
         }
     }
@@ -775,12 +776,26 @@ impl ScriptedChain {
     /// Answer the next `times` requests `method path` with `status`; with `relay`, after the
     /// request took effect.
     pub(crate) fn fault(&self, method: &str, path: &str, status: u16, relay: bool, times: usize) {
+        self.fault_answering(method, path, status, relay, times, "scripted fault");
+    }
+
+    /// [`Self::fault`] with the body of the answer (an error page that names what it was asked).
+    pub(crate) fn fault_answering(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        relay: bool,
+        times: usize,
+        body: &str,
+    ) {
         self.state().faults.push(Fault {
             method: method.to_string(),
             path: path.to_string(),
             status,
             relay,
             remaining: times,
+            body: body.to_string(),
         });
     }
 
