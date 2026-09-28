@@ -155,6 +155,19 @@ pub enum Error {
         details: String,
     },
 
+    /// ERA fork (CC-101): the wallet's RGB state files (`rgb/stash.dat`, `state.dat`,
+    /// `index.dat`) are not a whole, readable set: one is missing, cut short, longer than its
+    /// content or does not decode, or all are missing for a wallet that has a manifest.
+    ///
+    /// Nothing was written: rgb-lib no longer replaces the files that are there with an empty
+    /// stock. The RGB state has to come back from a backup. A file the system refuses to read
+    /// (permissions) is `IO`, not this.
+    #[error("The wallet's RGB state is damaged: {details}")]
+    RgbStockDamaged {
+        /// Which file, and how
+        details: String,
+    },
+
     /// The consistency check failed on a wallet that was just restored from a VSS backup,
     /// meaning the backup itself is inconsistent or older than other wallet state
     #[error(

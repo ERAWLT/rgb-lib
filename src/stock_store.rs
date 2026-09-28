@@ -3,7 +3,8 @@
 //! rgb-ops keeps a wallet's RGB state in three files, `rgb/stash.dat`, `state.dat` and
 //! `index.dat` (its `FsBinStore`), and stores each by truncating it in place and writing it
 //! field by field, with no sync. A store that fails (a full disk) or is interrupted (the process
-//! killed) leaves a file cut short, which no later load can read.
+//! killed) leaves a file cut short, which no later load can read. And rgb-lib created an empty
+//! stock whenever one of the three was missing, which overwrote the two that survived.
 //!
 //! [`StockStore`] replaces `FsBinStore` as the stock's persistence provider:
 //! - A file is written whole to `<name>.new` next to it, synced, renamed over it, and the
@@ -16,6 +17,7 @@
 //!   later store of that file succeeds, and `RgbRuntime` reports it as `Error::IO` after the call
 //!   that stored. The file keeps its previous version.
 //!
+//! [`open_stock`] loads the three files only as a whole set; see [`StockFiles`].
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +30,8 @@ use super::*;
 
 /// The files of the stock, in the order rgb-ops loads them.
 pub(crate) const STOCK_FILES: [&str; 3] = ["stash.dat", "state.dat", "index.dat"];
+/// Where a new stock is made before it is renamed into place, next to `rgb/`.
+pub(crate) const STOCK_STAGING_DIR: &str = "rgb.new";
 const NEW_SUFFIX: &str = ".new";
 
 /// The stock's persistence provider: the three files of one directory, each stored atomically.
@@ -62,7 +66,7 @@ impl StockStore {
 
     fn load_file<T: StrictDeserialize>(&self, name: &str) -> Result<T, PersistenceError> {
         T::strict_deserialize_from_file::<U32MAX>(self.dir.join(name))
-            .map_err(PersistenceError::with)
+            .map_err(|e| PersistenceError::with(LoadFailure::from_deserialize(name, e)))
     }
 
     fn store_file<T: StrictSerialize>(
@@ -164,6 +168,162 @@ fn sync_dir(dir: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Why a file of the stock could not be loaded.
+#[derive(Debug)]
+pub(crate) enum LoadFailure {
+    /// The file is not a whole stock file: cut short, longer than its content, or not decoding
+    Damaged(String),
+    /// The file system refused the read (permissions, I/O)
+    Io(String),
+}
+
+impl LoadFailure {
+    fn from_deserialize(name: &str, e: DeserializeError) -> Self {
+        match e {
+            DeserializeError::Decode(DecodeError::Io(io)) => match io.kind() {
+                ErrorKind::UnexpectedEof => LoadFailure::Damaged(format!("{name} is cut short")),
+                ErrorKind::NotFound => LoadFailure::Damaged(format!("{name} is missing")),
+                _ => LoadFailure::Io(format!("{name}: {io}")),
+            },
+            DeserializeError::DataNotEntirelyConsumed => {
+                LoadFailure::Damaged(format!("{name} is longer than its content"))
+            }
+            DeserializeError::Decode(e) => {
+                LoadFailure::Damaged(format!("{name} does not decode: {e}"))
+            }
+        }
+    }
+}
+
+impl fmt::Display for LoadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadFailure::Damaged(details) | LoadFailure::Io(details) => f.write_str(details),
+        }
+    }
+}
+
+impl std::error::Error for LoadFailure {}
+
+impl From<LoadFailure> for Error {
+    fn from(failure: LoadFailure) -> Self {
+        match failure {
+            LoadFailure::Damaged(details) => Error::RgbStockDamaged { details },
+            LoadFailure::Io(details) => Error::IO { details },
+        }
+    }
+}
+
+/// Which of the stock's files a directory holds.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StockFiles {
+    /// all three
+    Whole,
+    /// none: a new stock, for a wallet that has none yet
+    None,
+    /// some, not all: never a stock rgb-lib wrote
+    Partial(Vec<&'static str>),
+}
+
+impl StockFiles {
+    pub(crate) fn of(dir: &Path) -> Result<Self, Error> {
+        let mut missing = vec![];
+        for name in STOCK_FILES {
+            match fs::symlink_metadata(dir.join(name)) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => {
+                    return Err(Error::RgbStockDamaged {
+                        details: format!("{name} is not a file"),
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => missing.push(name),
+                Err(e) => {
+                    return Err(Error::IO {
+                        details: format!("{name}: {e}"),
+                    });
+                }
+            }
+        }
+        Ok(match missing.len() {
+            0 => StockFiles::Whole,
+            n if n == STOCK_FILES.len() => StockFiles::None,
+            _ => StockFiles::Partial(missing),
+        })
+    }
+}
+
+/// Load the stock of `rgb_dir` with `store` as its provider.
+///
+/// All three files: loaded, and any that is cut short, longer than its content or not decoding
+/// is [`Error::RgbStockDamaged`] (a file the system refuses to read is `Error::IO`). Some but not
+/// all: [`Error::RgbStockDamaged`], nothing written. None: a new, empty stock when
+/// `new_allowed` (a wallet that has none yet), made in [`STOCK_STAGING_DIR`] and renamed into
+/// place whole, so that a stock is never seen half made; [`Error::RgbStockDamaged`] otherwise.
+/// A `.new` file a store left behind is removed first; the caller holds the runtime's lock.
+pub(crate) fn open_stock(
+    wallet_dir: &Path,
+    rgb_dir: &Path,
+    new_allowed: bool,
+) -> Result<(Stock, StockStore), Error> {
+    let staging = wallet_dir.join(STOCK_STAGING_DIR);
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    if rgb_dir.is_dir() {
+        for name in STOCK_FILES {
+            let new = rgb_dir.join(format!("{name}{NEW_SUFFIX}"));
+            if new.exists() {
+                fs::remove_file(new)?;
+            }
+        }
+    }
+    match StockFiles::of(rgb_dir)? {
+        StockFiles::Whole => {}
+        StockFiles::Partial(missing) => {
+            return Err(Error::RgbStockDamaged {
+                details: format!("{} missing", missing.join(", ")),
+            });
+        }
+        StockFiles::None if !new_allowed => {
+            return Err(Error::RgbStockDamaged {
+                details: s!("no stock file for a wallet that has a manifest"),
+            });
+        }
+        StockFiles::None => make_new_stock(wallet_dir, rgb_dir, &staging)?,
+    }
+    let store = StockStore::new(rgb_dir.to_path_buf());
+    let stock =
+        Stock::load(store.clone(), true).map_err(|e| match e.0.downcast::<LoadFailure>() {
+            Ok(failure) => Error::from(*failure),
+            Err(e) => Error::IO {
+                details: e.to_string(),
+            },
+        })?;
+    Ok((stock, store))
+}
+
+fn make_new_stock(wallet_dir: &Path, rgb_dir: &Path, staging: &Path) -> Result<(), Error> {
+    fs::create_dir_all(staging)?;
+    let store = StockStore::new(staging.to_path_buf());
+    let mut stock = Stock::in_memory();
+    stock
+        .make_persistent(store.clone(), true)
+        .map_err(|e| Error::IO {
+            details: e.to_string(),
+        })?;
+    store
+        .check_stored()
+        .map_err(|details| Error::IO { details })?;
+    // what `rgb/` holds is no stock (checked by the caller): at most a store's leftovers
+    if rgb_dir.exists() {
+        fs::remove_dir_all(rgb_dir)?;
+    }
+    inject(STOCK_STAGING_DIR, InjectedFailure::BeforeRename)?;
+    rename(STOCK_STAGING_DIR, staging, rgb_dir)?;
+    sync_dir(wallet_dir, STOCK_STAGING_DIR)?;
+    Ok(())
+}
+
 // Test hooks: what a store does to the disk, recorded, and failures a test injects. Stores run on
 // the thread that calls into the stock, so each test sees only its own.
 
@@ -234,6 +394,9 @@ mod tests {
 
     use super::*;
 
+    const NEW: bool = true;
+    const EXISTING: bool = false;
+
     fn rgb(wallet_dir: &Path) -> PathBuf {
         wallet_dir.join(RGB_RUNTIME_DIR)
     }
@@ -270,7 +433,7 @@ mod tests {
     /// A wallet directory with a stock that knows the NIA schema.
     fn with_stock() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let mut runtime = load_rgb_runtime(dir.path()).unwrap();
+        let mut runtime = load_or_create_rgb_runtime(dir.path(), NEW).unwrap();
         AssetSchema::Nia.import_kit(&mut runtime).unwrap();
         dir
     }
@@ -291,11 +454,20 @@ mod tests {
         GraphSeal::new_random_vout(0)
     }
 
+    fn damaged(result: Result<RgbRuntime, Error>) -> String {
+        match result {
+            Err(Error::RgbStockDamaged { details }) => details,
+            Err(e) => panic!("expected RgbStockDamaged, got {e:?}"),
+            Ok(_) => panic!("expected RgbStockDamaged, got a runtime"),
+        }
+    }
+
     #[test]
     #[parallel]
     fn a_new_stock_is_made_whole_and_reads_back() {
         let dir = with_stock();
         assert_eq!(names(dir.path()), stock_names());
+        assert!(!dir.path().join(STOCK_STAGING_DIR).exists());
         assert_eq!(schemata(dir.path()), 1);
     }
 
@@ -360,10 +532,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(schemata(dir.path()), 1);
-        assert_eq!(
-            files(dir.path()).get("rgb/stash.dat"),
-            before.get("rgb/stash.dat")
-        );
+        assert_eq!(files(dir.path()), before);
+    }
+
+    // a new stock whose making died before its rename leaves rgb.new/ behind: it goes at the next
+    // load, whatever it holds
+    #[test]
+    #[parallel]
+    fn a_stale_staging_directory_goes() {
+        let dir = with_stock();
+        let before = files(dir.path());
+        let staging = dir.path().join(STOCK_STAGING_DIR);
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("stash.dat"), b"half").unwrap();
+        assert_eq!(schemata(dir.path()), 1);
+        assert!(!staging.exists());
+        assert_eq!(files(dir.path()), before);
     }
 
     // a failure lasts until the file is stored again: the next store of it catches up
@@ -434,6 +618,132 @@ mod tests {
         assert_eq!(events.len(), 3);
         runtime.persist().unwrap();
         assert!(STORE_EVENTS.with_borrow(|e| e.is_empty()));
+    }
+
+    // one file missing: refused, nothing written, whether a new stock is allowed or not
+    #[test]
+    #[parallel]
+    fn a_missing_file_is_refused_and_the_others_kept() {
+        for name in STOCK_FILES {
+            let dir = with_stock();
+            fs::remove_file(rgb(dir.path()).join(name)).unwrap();
+            let before = files(dir.path());
+            for new_allowed in [EXISTING, NEW] {
+                let details = damaged(load_or_create_rgb_runtime(dir.path(), new_allowed));
+                assert_eq!(details, format!("{name} missing"));
+                assert_eq!(files(dir.path()), before, "{name}");
+                // the refused load released the runtime's lock
+                assert!(!dir.path().join("rgb_runtime.lock").exists());
+            }
+        }
+    }
+
+    // a file cut short, empty, longer than its content, not decoding, or not a file: refused,
+    // nothing written
+    #[test]
+    #[parallel]
+    fn a_damaged_file_is_refused_and_nothing_written() {
+        type Damage = fn(&Path, &str);
+        let damages: [(Damage, &str); 5] = [
+            (
+                |path, _| {
+                    let data = fs::read(path).unwrap();
+                    fs::write(path, &data[..data.len() / 2]).unwrap();
+                },
+                "is cut short",
+            ),
+            (|path, _| fs::write(path, b"").unwrap(), "is cut short"),
+            (
+                |path, _| {
+                    let mut data = fs::read(path).unwrap();
+                    data.push(0);
+                    fs::write(path, data).unwrap();
+                },
+                "is longer than its content",
+            ),
+            (|path, _| fs::write(path, [0xffu8; 64]).unwrap(), ""),
+            (
+                |path, _| {
+                    fs::remove_file(path).unwrap();
+                    fs::create_dir(path).unwrap();
+                },
+                "is not a file",
+            ),
+        ];
+        for name in STOCK_FILES {
+            for (damage, expected) in damages {
+                let dir = with_stock();
+                damage(&rgb(dir.path()).join(name), name);
+                let before = files(dir.path());
+                let details = damaged(load_rgb_runtime(dir.path()));
+                assert!(details.starts_with(name), "{name}: {details}");
+                assert!(details.contains(expected), "{name}: {details}");
+                assert_eq!(files(dir.path()), before, "{name}: {details}");
+            }
+        }
+    }
+
+    // a file the system refuses to read is an I/O error, which a retry may get past
+    #[cfg(unix)]
+    #[test]
+    #[parallel]
+    fn an_unreadable_file_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = with_stock();
+        let stash = rgb(dir.path()).join("stash.dat");
+        fs::set_permissions(&stash, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&stash).is_ok() {
+            // running as root
+            return;
+        }
+        let result = load_rgb_runtime(dir.path());
+        fs::set_permissions(&stash, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_matches!(result, Err(Error::IO { details }) if details.starts_with("stash.dat"));
+    }
+
+    // no stock file at all: a new stock only where one is allowed
+    #[test]
+    #[parallel]
+    fn no_stock_is_new_only_where_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(rgb(dir.path())).unwrap();
+        let details = damaged(load_or_create_rgb_runtime(dir.path(), EXISTING));
+        assert!(details.contains("no stock file"), "{details}");
+        assert!(names(dir.path()).is_empty());
+        let with_stock = with_stock();
+        for name in STOCK_FILES {
+            fs::remove_file(rgb(with_stock.path()).join(name)).unwrap();
+        }
+        damaged(load_rgb_runtime(with_stock.path()));
+        load_or_create_rgb_runtime(with_stock.path(), NEW).unwrap();
+        assert_eq!(names(with_stock.path()), stock_names());
+    }
+
+    // a new stock is made next to rgb/ and renamed into place whole: one that fails to be made
+    // leaves no stock file in rgb/, and the next attempt makes it
+    #[test]
+    #[parallel]
+    fn a_new_stock_that_fails_leaves_none_half_made() {
+        for (name, at) in [
+            ("state.dat", InjectedFailure::HalfWritten),
+            ("index.dat", InjectedFailure::BeforeRename),
+            (STOCK_STAGING_DIR, InjectedFailure::BeforeRename),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            inject(name, at, 1);
+            let result = load_or_create_rgb_runtime(dir.path(), NEW);
+            assert!(matches!(result, Err(Error::IO { .. })), "{name}");
+            assert_eq!(
+                StockFiles::of(&rgb(dir.path())).unwrap(),
+                StockFiles::None,
+                "{name}"
+            );
+            let mut runtime = load_or_create_rgb_runtime(dir.path(), NEW).unwrap();
+            AssetSchema::Nia.import_kit(&mut runtime).unwrap();
+            drop(runtime);
+            assert_eq!(names(dir.path()), stock_names(), "{name}");
+            clear_injected();
+        }
     }
 
     // killed while storing, over and over (a child process storing in a loop, SIGKILLed at
@@ -511,6 +821,42 @@ mod tests {
             assert_eq!(after.get(name), before.get(name), "{name}");
         }
         assert_eq!(schemata(dir.path()), 1);
+    }
+
+    // a wallet's stock missing a file (here the index, with the stash worth keeping) is refused
+    // when the wallet is opened again, and the stash is left as it was; and so is one with no
+    // stock at all, since it has a manifest. A new wallet gets its stock whole.
+    #[test]
+    #[parallel]
+    fn a_wallet_with_a_damaged_stock_is_refused() {
+        use crate::wallet::{RgbWalletOpsOffline, test::get_test_wallet};
+        let wallet = get_test_wallet(true, None);
+        let (wallet_data, keys, wallet_dir) = (
+            wallet.get_wallet_data(),
+            wallet.get_keys(),
+            wallet.get_wallet_dir(),
+        );
+        drop(wallet);
+        let stock: Vec<String> = names(&wallet_dir)
+            .into_iter()
+            .filter(|n| n.starts_with("rgb/"))
+            .collect();
+        assert_eq!(stock, stock_names());
+
+        fs::remove_file(rgb(&wallet_dir).join("index.dat")).unwrap();
+        let before = files(&wallet_dir);
+        let result = Wallet::new(wallet_data.clone(), keys.clone());
+        assert!(matches!(
+            result,
+            Err(Error::RgbStockDamaged { ref details }) if details == "index.dat missing"
+        ));
+        let after = files(&wallet_dir);
+        assert_eq!(after.get("rgb/stash.dat"), before.get("rgb/stash.dat"));
+
+        fs::remove_dir_all(rgb(&wallet_dir)).unwrap();
+        let result = Wallet::new(wallet_data, keys);
+        assert!(matches!(result, Err(Error::RgbStockDamaged { .. })));
+        assert!(!rgb(&wallet_dir).exists());
     }
 
     // the child of a_kill_mid_store_never_leaves_a_file_cut_short; a no-op unless it is that child

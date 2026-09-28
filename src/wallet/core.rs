@@ -264,7 +264,13 @@ pub(crate) fn setup_rgb<P: AsRef<Path>>(
     if bitcoin_network == BitcoinNetwork::Mainnet && supported_schemas.contains(&AssetSchema::Ifa) {
         return Err(Error::CannotUseIfaOnMainnet);
     }
-    let mut runtime = load_rgb_runtime(wallet_dir)?;
+    // ERA fork (CC-101): a new stock only for a wallet that has none yet (its manifest is written
+    // last, by Wallet::new): a wallet that has one keeps its stock or is refused
+    let new_allowed = matches!(
+        fs::symlink_metadata(wallet_dir.as_ref().join(WALLET_MANIFEST_FILE)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    );
+    let mut runtime = load_or_create_rgb_runtime(wallet_dir, new_allowed)?;
     let known_schemas = runtime.schemata()?;
     if known_schemas.len() < NUM_KNOWN_SCHEMAS {
         let known: HashSet<_> = known_schemas.iter().map(|s| s.id).collect();

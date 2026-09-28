@@ -1213,37 +1213,38 @@ fn write_rgb_runtime_lockfile(wallet_dir: &Path) -> Result<(), Error> {
     }
 }
 
+/// Load the RGB runtime of an existing wallet: its stock has to be whole on disk (see
+/// [`load_or_create_rgb_runtime`]).
 pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRuntime, Error> {
+    load_or_create_rgb_runtime(wallet_dir, false)
+}
+
+/// ERA fork (CC-101): load the RGB runtime; with `new_allowed`, a wallet directory holding none
+/// of the stock's files gets a new, empty stock.
+///
+/// Upstream created an empty stock whenever any one of the three files was missing, and wrote
+/// it over the two that were there. A stock is now loaded only as a whole set, and anything else
+/// is `Error::RgbStockDamaged` with nothing written (see `stock_store::open_stock`).
+pub(crate) fn load_or_create_rgb_runtime<P: AsRef<Path>>(
+    wallet_dir: P,
+    new_allowed: bool,
+) -> Result<RgbRuntime, Error> {
     write_rgb_runtime_lockfile(wallet_dir.as_ref())?;
-
-    let rgb_dir = wallet_dir.as_ref().join(RGB_RUNTIME_DIR);
-    if !rgb_dir.exists() {
-        fs::create_dir_all(&rgb_dir)?;
-    }
-    // ERA fork (CC-101): the stock's files are stored atomically (stock_store)
-    let store = StockStore::new(rgb_dir.clone());
-    let stock = Stock::load(store.clone(), true).or_else(|err| {
-        if err
-            .0
-            .downcast_ref::<DeserializeError>()
-            .map(|e| matches!(e, DeserializeError::Decode(DecodeError::Io(e)) if e.kind() == ErrorKind::NotFound))
-            .unwrap_or_default()
-        {
-            let mut stock = Stock::in_memory();
-            stock.make_persistent(store.clone(), true).expect("unable to save stock");
-            // ERA fork (CC-101): a store the disk refused is an error, not a panic
-            store.check_stored().map_err(|details| Error::IO { details })?;
-            return Ok(stock)
+    let runtime_or_lock = |result: Result<(Stock, StockStore), Error>| match result {
+        Ok((stock, store)) => Ok(RgbRuntime {
+            stock,
+            store,
+            wallet_dir: wallet_dir.as_ref().to_path_buf(),
+            persist_on_drop: true,
+        }),
+        Err(e) => {
+            // no runtime holds the lock
+            let _ = fs::remove_file(wallet_dir.as_ref().join(RGB_RUNTIME_LOCK_FILE));
+            Err(e)
         }
-        Err(Error::IO { details: err.to_string() })
-    })?;
-
-    Ok(RgbRuntime {
-        stock,
-        store,
-        wallet_dir: wallet_dir.as_ref().to_path_buf(),
-        persist_on_drop: true,
-    })
+    };
+    let rgb_dir = wallet_dir.as_ref().join(RGB_RUNTIME_DIR);
+    runtime_or_lock(open_stock(wallet_dir.as_ref(), &rgb_dir, new_allowed))
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1403,7 +1404,8 @@ mod tests {
         // write garbage to stash.dat: Stock::load fails with a decode error
         fs::write(rgb_dir.join("stash.dat"), b"not valid binary data").unwrap();
         let result = load_rgb_runtime(dir.path());
-        assert_matches!(result, Err(Error::IO { .. }));
+        // ERA fork (CC-101): state.dat and index.dat are missing, so the set is not whole
+        assert_matches!(result, Err(Error::RgbStockDamaged { .. }));
     }
 
     #[test]
