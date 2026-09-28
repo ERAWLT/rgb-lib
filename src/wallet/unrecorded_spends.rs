@@ -459,10 +459,12 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
     runtime: &mut RgbRuntime,
     plan: Plan,
 ) -> Result<Vec<CompletedSpend>, Error> {
-    // phase 4, the stash. A consume that fails half way must not be stored, which the runtime's
-    // drop would do; the only store is the explicit persist below, whose failure is an error
-    // rather than a panic. A bundle the stash already holds (S2, or a completion that did not
-    // commit) is not consumed again.
+    // phase 4, the stash. Each consume_fascia stores what it consumed when it commits (rgb-ops
+    // commits index, state and stash together, and the stock autosaves): that is where the stash
+    // becomes durable, fascia by fascia. A store the disk refuses there comes back as
+    // StockNotStored (CC-101, stock_store), which is the retryable Error::IO. A consume that fails
+    // half way stores nothing: the runtime's drop, which would store it, is turned off. A bundle
+    // the stash already holds (S2, or a completion that did not commit) is not consumed again.
     runtime.require_explicit_persistence();
     for spend in &plan.spends {
         let PlannedRecord::Send {
@@ -496,6 +498,8 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
             }
         })?;
     }
+    // with everything stored by the commits above, this finds nothing to write on this base; it
+    // stays as the durability point of a base whose stock does not store at each commit
     runtime.persist()?;
 
     // phase 5, the database: what the operation's commit would have written

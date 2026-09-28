@@ -865,13 +865,6 @@ impl RgbRuntime {
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn persist(&mut self) -> Result<(), Error> {
         self.persist_on_drop = false;
-        // ERA fork (CC-99, tests): a stash that cannot be written
-        #[cfg(test)]
-        if crate::wallet::test::mock_stash_persist_fail() {
-            return Err(Error::IO {
-                details: s!("simulated stash write failure"),
-            });
-        }
         self.stock.store().map_err(|error| Error::IO {
             details: error.to_string(),
         })?;

@@ -813,33 +813,40 @@ fn a_stash_that_refuses_the_transitions_keeps_nothing() {
     assert_eq!(state_digest(&party), digest);
 }
 
-// a stash write that fails is an error, not a panic, and comes before the database: nothing is
-// committed, and the next go_online completes the spend
+// a stash the disk will not take while a spend is completed (here the wallet's rgb/ directory
+// read-only, so no store can create its new file): the go_online fails with the retryable
+// Error::IO rather than a panic, nothing is committed and the stash is as it was; once the disk
+// takes it again, the next go_online completes the spend and it settles
+#[cfg(unix)]
 #[test]
 #[parallel]
-fn a_stash_write_that_fails_commits_nothing() {
+fn a_stash_the_disk_will_not_take_commits_nothing() {
+    use std::os::unix::fs::PermissionsExt;
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (idx, _) = donation_answer_lost(&chain, &mut party);
-    let db_digest = |party: &Issuer| {
-        state_digest(party)
-            .lines()
-            .filter(|l| l.ends_with("/rgb_lib_db"))
-            .collect::<String>()
-    };
-    let digest = db_digest(&party);
-
-    MOCK_STASH_PERSIST_FAIL.replace(Some(()));
+    let rgb_dir = party.wallet.get_wallet_dir().join("rgb");
+    let digest = state_digest(&party);
+    fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::File::create(rgb_dir.join("probe")).is_ok() {
+        // running as root
+        let _ = fs::remove_file(rgb_dir.join("probe"));
+        fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
     let result = reopen(&chain, &mut party, completing_options(&chain));
-    assert_matches!(result, Err(Error::IO { details }) if details.contains("simulated"));
-    assert_eq!(db_digest(&party), digest);
+    fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_matches!(result, Err(Error::IO { details }) if details.contains("stash.dat"));
+    assert_eq!(state_digest(&party), digest);
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
 
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
     assert_eq!(party.wallet.completed_spends().len(), 1);
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
     assert_eq!(
-        status_of(&party.wallet, idx),
-        TransferStatus::WaitingConfirmations
+        spendable(&party.wallet, &party.asset_id),
+        AMOUNT - AMOUNT_SMALL
     );
 }
 
