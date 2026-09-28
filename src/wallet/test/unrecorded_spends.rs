@@ -786,11 +786,11 @@ fn damage_second_bundle(party: &Issuer, txid: &str) {
     fs::write(&fascia_path, json.to_string()).unwrap();
 }
 
-// a stash that refuses the transitions half way (the second of two bundles) keeps nothing of
-// the attempt, and the refusal has its reason instead of a panic
+// a stash that refuses a spend half way (the second of its two bundles) keeps nothing of that
+// spend, and the refusal has its reason instead of a panic
 #[test]
 #[parallel]
-fn a_stash_that_refuses_the_transitions_keeps_nothing() {
+fn a_stash_that_refuses_a_spend_keeps_nothing_of_it() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (begin, signed) = begin_two_asset_donation(&chain, &mut party);
@@ -1787,4 +1787,85 @@ fn a_failed_lookup_leaves_its_text_out_of_the_log() {
     let log = fs::read_to_string(log_path).unwrap();
     assert!(log.contains("CC-99: not completing the spends of divergent coins"));
     assert!(!log.contains(SECRET));
+}
+
+// two spends in one plan, the stash refusing one of them: rgb-ops commits each fascia on its own,
+// so a spend consumed before the refused one stays in the stash while the database rolls back
+// (S2's state), and one refused first leaves the stash as it was. Either way the refusal is the
+// same on every go_online while the damage lasts, and once the fascia is whole the next one
+// completes both, skipping what the stash holds
+#[test]
+#[parallel]
+fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
+    for refused in [1, 0] {
+        let chain = ScriptedChain::start();
+        let (wallet, online) = funded(&chain, 8);
+        let asset_id = issue(&wallet, vec![AMOUNT, AMOUNT]);
+        let mut party = Issuer {
+            wallet,
+            online,
+            asset_id,
+        };
+        let mut spends = vec![];
+        for _ in 0..2 {
+            let (begin, signed) = begin_two_asset_donation(&chain, &mut party);
+            let txid = psbt_txid(&signed);
+            lose_the_answer(&chain, &txid);
+            let result = party.wallet.send_end(party.online, signed);
+            assert_matches!(result, Err(Error::Indexer { .. }));
+            spends.push((txid, begin.batch_transfer_idx.unwrap()));
+        }
+        // the plan consumes them in TXID order
+        spends.sort();
+        let fascia_path = party
+            .wallet
+            .get_transfers_dir()
+            .join(&spends[refused].0)
+            .join("fascia");
+        let whole = fs::read_to_string(&fascia_path).unwrap();
+        damage_second_bundle(&party, &spends[refused].0);
+        let db_digest = |party: &Issuer| {
+            state_digest(party)
+                .lines()
+                .filter(|l| l.ends_with("/rgb_lib_db"))
+                .collect::<String>()
+        };
+        let (db_before, stash_before) = (db_digest(&party), stash_digest(&party));
+
+        let refusal = Error::UnrecordedSpend {
+            txid: spends[refused].0.clone(),
+            reason: s!("stash-refused"),
+            batch_transfer_idx: Some(spends[refused].1),
+        };
+        let result = reopen(&chain, &mut party, completing_options(&chain));
+        assert_eq!(result.unwrap_err(), refusal);
+        assert_eq!(db_digest(&party), db_before);
+        for (_, idx) in &spends {
+            assert_eq!(status_of(&party.wallet, *idx), TransferStatus::Initiated);
+        }
+        assert!(stash_witness(&party, &spends[refused].0).is_none());
+        if refused == 1 {
+            assert!(is_signed(&stash_witness(&party, &spends[0].0)));
+        } else {
+            assert_eq!(stash_digest(&party), stash_before);
+        }
+        let result = reopen(&chain, &mut party, completing_options(&chain));
+        assert_eq!(result.unwrap_err(), refusal);
+
+        fs::write(&fascia_path, whole).unwrap();
+        reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+        assert_eq!(party.wallet.completed_spends().len(), 2);
+        for (txid, idx) in &spends {
+            assert!(is_signed(&stash_witness(&party, txid)));
+            assert_eq!(
+                status_of(&party.wallet, *idx),
+                TransferStatus::WaitingConfirmations
+            );
+        }
+        settle(&chain, &mut party);
+        assert_eq!(
+            spendable(&party.wallet, &party.asset_id),
+            2 * AMOUNT - 2 * AMOUNT_SMALL
+        );
+    }
 }
