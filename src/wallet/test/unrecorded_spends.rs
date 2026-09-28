@@ -892,6 +892,121 @@ fn a_signed_psbt_of_another_tx_is_not_broadcast() {
     );
 }
 
+/// Two sends waiting for their ACKs, the first one's signed.psbt replaced by the second one's and
+/// the first one ACKed (as in W11). `before_the_swap` runs between the two sends. Returns the
+/// first send's batch transfer and TXID.
+fn a_send_holding_another_tx(
+    chain: &ScriptedChain,
+    party: &mut Issuer,
+    before_the_swap: impl FnOnce(&Issuer),
+) -> (i32, String) {
+    let (first, first_signed, first_recipient) = begin_send(chain, party, AMOUNT_SMALL, false);
+    let first_txid = psbt_txid(&first_signed);
+    party.wallet.send_end(party.online, first_signed).unwrap();
+    before_the_swap(party);
+    let (_, second_signed, _) = begin_send(chain, party, AMOUNT_SMALL, false);
+    let second_txid = psbt_txid(&second_signed);
+    party.wallet.send_end(party.online, second_signed).unwrap();
+    let transfers_dir = party.wallet.get_transfers_dir();
+    fs::copy(
+        transfers_dir.join(&second_txid).join("signed.psbt"),
+        transfers_dir.join(&first_txid).join("signed.psbt"),
+    )
+    .unwrap();
+    chain.set_ack(&first_recipient.recipient_id, true);
+    (first.batch_transfer_idx.unwrap(), first_txid)
+}
+
+// A send the W11 guard refuses at every refresh can still be failed before it expires (it was
+// locked until then, its coins reserved), and nothing is broadcast
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_refused_can_be_failed() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let (idx, txid) = a_send_holding_another_tx(&chain, &mut party, |_| {});
+    let before = spendable(&party.wallet, &party.asset_id);
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Ok(true));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+    assert!(!chain.knows(&txid));
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+}
+
+// ... but not when its own TX is on chain (another copy of the wallet broadcast it): that send
+// happened, and failing it would stop crediting its change
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_refused_is_not_failed_with_its_tx_on_chain() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let mut copy = None;
+    let (idx, txid) =
+        a_send_holding_another_tx(&chain, &mut party, |party| copy = Some(control(party)));
+    let (mut other, _other_dir) = copy.unwrap();
+    other.online = other.wallet.go_online(online_options(&chain)).unwrap();
+    other
+        .wallet
+        .refresh(other.online, None, vec![], false)
+        .unwrap();
+    assert!(chain.knows(&txid));
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+}
+
+// Upstream's own lock of the same kind: a signed.psbt left empty (send_end writes it without a
+// sync) fails every refresh; the send can be failed, and nothing is broadcast
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_empty_can_be_failed() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let (begin, signed, recipient) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    let idx = begin.batch_transfer_idx.unwrap();
+    fs::write(
+        party
+            .wallet
+            .get_transfers_dir()
+            .join(&txid)
+            .join("signed.psbt"),
+        "",
+    )
+    .unwrap();
+    chain.set_ack(&recipient.recipient_id, true);
+    let refreshed = party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
+    assert_matches!(&refreshed[&idx].failure, Some(Error::InvalidPsbt { .. }));
+    let before = spendable(&party.wallet, &party.asset_id);
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Ok(true));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+    assert!(!chain.knows(&txid));
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+}
+
 // Planner table (design section 5.1): `plan` over a real wallet state (database, BDK view, transfer
 // files), changed one way per case in a transaction that is rolled back and a copy of the
 // transfer files, with the indexer's answers given by the case. Every refusal must also leave the

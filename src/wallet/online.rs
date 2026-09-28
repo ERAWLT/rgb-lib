@@ -535,6 +535,19 @@ pub trait WalletOnline: WalletOffline {
                 {
                     Ok(None)
                 }
+                // ERA fork: a send whose signed.psbt this wallet will not broadcast, because it does
+                // not parse (upstream: a file cut short or emptied, as a power loss after send_end's
+                // unsynced write can leave it) or because it holds another TX (27d2a5a's guard in
+                // try_complete_batch), would otherwise stay unfailable until it expires, its coins
+                // reserved: that counts as no change too, and the send is failed below if its own
+                // TX is not on chain. Nothing was broadcast from that file. In a refresh of such a
+                // send these are the only sources of InvalidPsbt.
+                Err(Error::InvalidPsbt { .. })
+                    if !batch_transfer.incoming
+                        && batch_transfer.status == TransferStatus::WaitingCounterparty =>
+                {
+                    Ok(None)
+                }
                 Err(e) => Err(e),
                 Ok(v) => Ok(v),
             }?;
