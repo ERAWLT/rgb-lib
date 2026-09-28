@@ -2150,8 +2150,37 @@ fn an_unreadable_transfer_file_is_an_io_error() {
     );
 }
 
-// upstream's asset and media checks still run after a completion, and still refuse: nothing is
-// committed
+// upstream's asset check refuses a stock without an asset the database has, with the option or
+// without it. Since the stock loads only as a whole set, such a stock is a whole one (here a fresh
+// wallet's); a missing one is refused before (the upstream tests of this check reach it the same
+// way now)
+#[test]
+#[parallel]
+fn the_asset_check_refuses_a_stock_without_the_asset() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let fresh = get_test_wallet(true, None);
+    let fresh_rgb_dir = fresh.get_wallet_dir().join(crate::utils::RGB_RUNTIME_DIR);
+    drop(fresh);
+    let rgb_dir = party
+        .wallet
+        .get_wallet_dir()
+        .join(crate::utils::RGB_RUNTIME_DIR);
+    party.wallet.go_offline();
+    fs::remove_dir_all(&rgb_dir).unwrap();
+    copy_dir(&fresh_rgb_dir, &rgb_dir);
+    for options in [online_options(&chain), completing_options(&chain)] {
+        let result = party.wallet.go_online(options);
+        assert_matches!(
+            &result,
+            Err(Error::Inconsistency { details })
+                if details == "DB assets do not match with ones stored in RGB"
+        );
+    }
+}
+
+// upstream's media check, the last one, still runs after a completion, and still refuses: nothing
+// is committed
 #[test]
 #[parallel]
 fn the_media_check_runs_after_a_completion() {

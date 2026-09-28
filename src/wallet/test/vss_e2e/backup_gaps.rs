@@ -124,19 +124,44 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
 
     let mut restored_data = wallet_a.get_wallet_data();
     restored_data.data_dir = restore_tmp_broken.path().to_string_lossy().to_string();
-    // ERA fork (CC-101): the stock is loaded only as a whole set, so the broken restore is refused
-    // at Wallet::new, attributed to the restored backup (upstream made an empty stock, and
-    // go_online's consistency check refused it)
+    // ERA fork (CC-101): the stock is loaded only as a whole set, so a restore without it is
+    // refused at Wallet::new, attributed to the restored backup (upstream made an empty stock
+    // there, which go_online's consistency check then refused)
     let err = match Wallet::new(restored_data.clone(), wallet_a.get_keys()) {
-        Ok(_) => panic!("Wallet::new must refuse the broken restore"),
+        Ok(_) => panic!("Wallet::new must refuse the restore without its stock"),
         Err(err) => err,
     };
     assert!(
         matches!(&err, Error::RestoredBackupInconsistent { details } if details.starts_with("RGB state: ")),
         "restore-attributed failure must use the dedicated variant, got: {err:?}"
     );
+    // ERA fork (CC-101): the stock without the asset is then a whole one, a fresh wallet's
+    let fresh = get_test_wallet(true, None);
+    let fresh_rgb_dir = fresh.get_wallet_dir().join(crate::utils::RGB_RUNTIME_DIR);
+    drop(fresh);
+    let copied = copy_dir::copy_dir(
+        fresh_rgb_dir,
+        restored_dir.join(crate::utils::RGB_RUNTIME_DIR),
+    )
+    .expect("copy a fresh stock");
+    assert!(copied.is_empty());
+    let mut wallet_r =
+        Wallet::new(restored_data.clone(), wallet_a.get_keys()).expect("Wallet::new restored");
     let mut online_opts = test_go_online_options(None);
     online_opts.skip_consistency_check = false;
+    let err = wallet_r
+        .go_online(online_opts.clone())
+        .expect_err("consistency check must fail on the broken restore");
+    assert!(
+        matches!(err, Error::RestoredBackupInconsistent { .. }),
+        "restore-attributed failure must use the dedicated variant, got: {err:?}"
+    );
+    assert!(
+        restored_dir
+            .join(crate::wallet::vss::VSS_RESTORE_MARKER)
+            .exists(),
+        "marker must stay after a refused restore"
+    );
 
     // A healthy restore passes the check and clears the marker.
     let restore_tmp_ok = tempfile::tempdir().expect("tempdir");
