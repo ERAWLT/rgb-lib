@@ -340,19 +340,17 @@ fn consistency_check_fail_asset_ids() {
     fs::remove_dir_all(wallet_dir_prefill_2.join(RGB_RUNTIME_DIR)).unwrap();
 
     // detect inconsistency
-    let err = "DB assets do not match with ones stored in RGB";
-    let mut party_prefill_2 =
-        offline_party!(Wallet::new(wallet_data_prefill_2, keys.clone()).unwrap());
-    let result = party_prefill_2.go_online_result(false, None);
-    assert!(matches!(result, Err(Error::Inconsistency { details: e }) if e == err));
+    // ERA fork (CC-101): the stock is loaded only as a whole set, so a wallet that was set up and
+    // has no stock file is refused at Wallet::new, before any consistency check (upstream made an
+    // empty stock, and go_online found the assets missing from it)
+    let result = Wallet::new(wallet_data_prefill_2, keys.clone());
+    assert!(matches!(result, Err(Error::RgbStockDamaged { ref kind, .. }) if kind == "missing"));
 
     // make sure detection works multiple times
     let result = copy_dir::copy_dir(wallet_dir_prefill_2, wallet_dir_prefill_3);
     assert!(result.unwrap().is_empty());
-    let mut party_prefill_3 =
-        offline_party!(Wallet::new(wallet_data_prefill_3, keys.clone()).unwrap());
-    let result = party_prefill_3.go_online_result(false, None);
-    assert!(matches!(result, Err(Error::Inconsistency { details: e }) if e == err));
+    let result = Wallet::new(wallet_data_prefill_3, keys.clone());
+    assert!(matches!(result, Err(Error::RgbStockDamaged { ref kind, .. }) if kind == "missing"));
 }
 
 #[cfg(feature = "electrum")]

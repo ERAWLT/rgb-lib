@@ -270,7 +270,24 @@ pub(crate) fn setup_rgb<P: AsRef<Path>>(
         fs::symlink_metadata(wallet_dir.as_ref().join(WALLET_MANIFEST_FILE)),
         Err(e) if e.kind() == io::ErrorKind::NotFound
     );
-    let mut runtime = load_or_create_rgb_runtime(wallet_dir, new_allowed)?;
+    let mut runtime = match load_or_create_rgb_runtime(wallet_dir.as_ref(), new_allowed) {
+        Ok(runtime) => runtime,
+        // ERA fork (CC-101): a wallet just restored from a VSS backup whose stock cannot be opened
+        // is the backup's failure, as the consistency check attributes an inconsistency (whether
+        // the backup was encrypted, which keeps the manifest, or not)
+        #[cfg(feature = "vss")]
+        Err(Error::RgbStockDamaged { details, .. })
+            if wallet_dir
+                .as_ref()
+                .join(crate::wallet::vss::VSS_RESTORE_MARKER)
+                .exists() =>
+        {
+            return Err(Error::RestoredBackupInconsistent {
+                details: format!("RGB state: {details}"),
+            });
+        }
+        Err(e) => return Err(e),
+    };
     let known_schemas = runtime.schemata()?;
     if known_schemas.len() < NUM_KNOWN_SCHEMAS {
         let known: HashSet<_> = known_schemas.iter().map(|s| s.id).collect();

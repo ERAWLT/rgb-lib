@@ -969,6 +969,34 @@ mod tests {
         assert!(!rgb(&wallet_dir).exists());
     }
 
+    // a wallet just restored from a VSS backup (its marker there) whose stock cannot be opened: the
+    // refusal is the backup's, as the consistency check attributes an inconsistency; without the
+    // marker it is the stock's own
+    #[cfg(feature = "vss")]
+    #[test]
+    #[parallel]
+    fn a_restored_wallet_whose_stock_cannot_be_opened_is_the_backups_failure() {
+        use crate::wallet::{RgbWalletOpsOffline, test::get_test_wallet, vss::VSS_RESTORE_MARKER};
+        let wallet = get_test_wallet(true, None);
+        let (wallet_data, keys, wallet_dir) = (
+            wallet.get_wallet_data(),
+            wallet.get_keys(),
+            wallet.get_wallet_dir(),
+        );
+        drop(wallet);
+        fs::remove_file(rgb(&wallet_dir).join("index.dat")).unwrap();
+        let result = Wallet::new(wallet_data.clone(), keys.clone());
+        assert!(matches!(result, Err(Error::RgbStockDamaged { .. })));
+        fs::write(wallet_dir.join(VSS_RESTORE_MARKER), b"").unwrap();
+        let result = Wallet::new(wallet_data, keys);
+        assert!(matches!(
+            result,
+            Err(Error::RestoredBackupInconsistent { ref details })
+                if details == "RGB state: index.dat missing"
+        ));
+        assert!(wallet_dir.join(VSS_RESTORE_MARKER).exists());
+    }
+
     // the child of a_kill_mid_store_never_leaves_a_file_cut_short; a no-op unless it is that child
     #[test]
     fn store_in_a_loop() {

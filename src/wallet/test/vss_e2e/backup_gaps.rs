@@ -124,17 +124,19 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
 
     let mut restored_data = wallet_a.get_wallet_data();
     restored_data.data_dir = restore_tmp_broken.path().to_string_lossy().to_string();
-    let mut wallet_r =
-        Wallet::new(restored_data.clone(), wallet_a.get_keys()).expect("Wallet::new restored");
-    let mut online_opts = test_go_online_options(None);
-    online_opts.skip_consistency_check = false;
-    let err = wallet_r
-        .go_online(online_opts.clone())
-        .expect_err("consistency check must fail on the broken restore");
+    // ERA fork (CC-101): the stock is loaded only as a whole set, so the broken restore is refused
+    // at Wallet::new, attributed to the restored backup (upstream made an empty stock, and
+    // go_online's consistency check refused it)
+    let err = match Wallet::new(restored_data.clone(), wallet_a.get_keys()) {
+        Ok(_) => panic!("Wallet::new must refuse the broken restore"),
+        Err(err) => err,
+    };
     assert!(
-        matches!(err, Error::RestoredBackupInconsistent { .. }),
+        matches!(&err, Error::RestoredBackupInconsistent { details } if details.starts_with("RGB state: ")),
         "restore-attributed failure must use the dedicated variant, got: {err:?}"
     );
+    let mut online_opts = test_go_online_options(None);
+    online_opts.skip_consistency_check = false;
 
     // A healthy restore passes the check and clears the marker.
     let restore_tmp_ok = tempfile::tempdir().expect("tempdir");
