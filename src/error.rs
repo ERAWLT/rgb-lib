@@ -155,17 +155,27 @@ pub enum Error {
         details: String,
     },
 
-    /// ERA fork (CC-101): the wallet's RGB state files (`rgb/stash.dat`, `state.dat`,
-    /// `index.dat`) are not a whole, readable set: one is missing, cut short, longer than its
-    /// content or does not decode, or all are missing for a wallet that has a manifest.
+    /// ERA fork (CC-101): rgb-lib refuses to open the wallet's RGB state files (`rgb/stash.dat`,
+    /// `state.dat`, `index.dat`), which are not a whole set it can read: one is missing, runs
+    /// out of bytes, holds bytes past its content or does not decode, a stock file or `rgb`
+    /// itself is not what it should be, or all three are missing for a wallet that was already
+    /// set up.
     ///
-    /// Nothing was written: rgb-lib no longer replaces the files that are there with an empty
-    /// stock. The RGB state has to come back from a backup. A file the system refuses to read
-    /// (permissions) is `IO`, not this.
-    #[error("The wallet's RGB state is damaged: {details}")]
+    /// This is a refusal to open, not a verdict that the files are damaged, and not a signal to
+    /// discard them. Nothing was written: rgb-lib no longer replaces the files that are there
+    /// with an empty stock. Files written by another version of rgb-ops (a newer or older format,
+    /// a base with other RGB libraries) fail the same way while being intact, and interrupted
+    /// writes no longer happen (stores are atomic). A host keeps the directory; it may replace it
+    /// with a backup only when it can rule out a format change, for example because that backup
+    /// was written by the same build. A file the system refuses to read (permissions) is `IO`,
+    /// not this. There is no integrity check: a file that still decodes is accepted as it is.
+    #[error("The wallet's RGB state cannot be opened ({kind}): {details}")]
     RgbStockDamaged {
         /// Which file, and how
         details: String,
+        /// One of the codes of [`RgbStockDamage`]: a hint for diagnostics, not a way to tell a
+        /// format change from damage (random corruption reads as `cut_short` too)
+        kind: String,
     },
 
     /// The consistency check failed on a wallet that was just restored from a VSS backup,
@@ -860,6 +870,57 @@ impl Error {
                 "{details}; spenders: {spenders:?}{INCONSISTENCY_REASON_PREFIX}{}",
                 reason.code()
             ),
+        }
+    }
+}
+
+/// ERA fork (CC-101): how the RGB state files failed to open (the `kind` of
+/// [`Error::RgbStockDamaged`]). A diagnostic hint only: every kind can come from files another
+/// version of rgb-ops wrote as well as from damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RgbStockDamage {
+    /// A stock file, or all three, missing
+    Missing,
+    /// A file that runs out of bytes before its content ends
+    CutShort,
+    /// A file with bytes after its content
+    Trailing,
+    /// A file whose content does not decode
+    Undecodable,
+    /// A stock file that is not a regular file, or `rgb` that is not a directory
+    NotAFile,
+}
+
+impl RgbStockDamage {
+    /// The stable code of the kind.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RgbStockDamage::Missing => "missing",
+            RgbStockDamage::CutShort => "cut_short",
+            RgbStockDamage::Trailing => "trailing",
+            RgbStockDamage::Undecodable => "undecodable",
+            RgbStockDamage::NotAFile => "not_a_file",
+        }
+    }
+
+    /// The kind with this code, if any.
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            RgbStockDamage::Missing,
+            RgbStockDamage::CutShort,
+            RgbStockDamage::Trailing,
+            RgbStockDamage::Undecodable,
+            RgbStockDamage::NotAFile,
+        ]
+        .into_iter()
+        .find(|k| k.code() == code)
+    }
+
+    /// The error for this kind of refusal.
+    pub(crate) fn error(self, details: String) -> Error {
+        Error::RgbStockDamaged {
+            details,
+            kind: self.code().to_string(),
         }
     }
 }

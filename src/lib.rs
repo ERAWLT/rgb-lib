@@ -125,7 +125,7 @@ pub use crate::{
     database::enums::{
         AssetSchema, Assignment, TransferStatus, TransportType, WalletTransactionType,
     },
-    error::{Error, InconsistencyReason, UnrecordedSpendReason},
+    error::{Error, InconsistencyReason, RgbStockDamage, UnrecordedSpendReason},
     keys::{generate_keys, restore_keys},
     utils::{BitcoinNetwork, block_on},
     wallet::{

@@ -132,7 +132,7 @@ interface RgbLibError {
   RejectListService(string details);
   RestClientBuild(string details);
   RestoredBackupInconsistent(string details);
-  RgbStockDamaged(string details);
+  RgbStockDamaged(string details, string kind);
   RgbInspection(string details);
   TooHighInflationAmounts();
   TooHighIssuanceAmounts();

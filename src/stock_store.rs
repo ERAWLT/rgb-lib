@@ -200,8 +200,9 @@ fn sync_dir(dir: &Path, name: &str) -> io::Result<()> {
 /// Why a file of the stock could not be loaded.
 #[derive(Debug)]
 pub(crate) enum LoadFailure {
-    /// The file is not a whole stock file: cut short, longer than its content, or not decoding
-    Damaged(String),
+    /// The file is not a whole stock file this rgb-ops reads: cut short, longer than its content,
+    /// or not decoding
+    Damaged(RgbStockDamage, String),
     /// The file system refused the read (permissions, I/O)
     Io(String),
 }
@@ -210,16 +211,22 @@ impl LoadFailure {
     fn from_deserialize(name: &str, e: DeserializeError) -> Self {
         match e {
             DeserializeError::Decode(DecodeError::Io(io)) => match io.kind() {
-                ErrorKind::UnexpectedEof => LoadFailure::Damaged(format!("{name} is cut short")),
-                ErrorKind::NotFound => LoadFailure::Damaged(format!("{name} is missing")),
+                ErrorKind::UnexpectedEof => {
+                    LoadFailure::Damaged(RgbStockDamage::CutShort, format!("{name} is cut short"))
+                }
+                ErrorKind::NotFound => {
+                    LoadFailure::Damaged(RgbStockDamage::Missing, format!("{name} is missing"))
+                }
                 _ => LoadFailure::Io(format!("{name}: {io}")),
             },
-            DeserializeError::DataNotEntirelyConsumed => {
-                LoadFailure::Damaged(format!("{name} is longer than its content"))
-            }
-            DeserializeError::Decode(e) => {
-                LoadFailure::Damaged(format!("{name} does not decode: {e}"))
-            }
+            DeserializeError::DataNotEntirelyConsumed => LoadFailure::Damaged(
+                RgbStockDamage::Trailing,
+                format!("{name} is longer than its content"),
+            ),
+            DeserializeError::Decode(e) => LoadFailure::Damaged(
+                RgbStockDamage::Undecodable,
+                format!("{name} does not decode: {e}"),
+            ),
         }
     }
 }
@@ -227,7 +234,7 @@ impl LoadFailure {
 impl fmt::Display for LoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadFailure::Damaged(details) | LoadFailure::Io(details) => f.write_str(details),
+            LoadFailure::Damaged(_, details) | LoadFailure::Io(details) => f.write_str(details),
         }
     }
 }
@@ -237,7 +244,7 @@ impl std::error::Error for LoadFailure {}
 impl From<LoadFailure> for Error {
     fn from(failure: LoadFailure) -> Self {
         match failure {
-            LoadFailure::Damaged(details) => Error::RgbStockDamaged { details },
+            LoadFailure::Damaged(kind, details) => kind.error(details),
             LoadFailure::Io(details) => Error::IO { details },
         }
     }
@@ -256,14 +263,26 @@ pub(crate) enum StockFiles {
 
 impl StockFiles {
     pub(crate) fn of(dir: &Path) -> Result<Self, Error> {
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(
+                    RgbStockDamage::NotAFile.error(format!("{RGB_RUNTIME_DIR} is not a directory"))
+                );
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(StockFiles::None),
+            Err(e) => {
+                return Err(Error::IO {
+                    details: format!("{RGB_RUNTIME_DIR}: {e}"),
+                });
+            }
+        }
         let mut missing = vec![];
         for name in STOCK_FILES {
             match fs::symlink_metadata(dir.join(name)) {
                 Ok(metadata) if metadata.is_file() => {}
                 Ok(_) => {
-                    return Err(Error::RgbStockDamaged {
-                        details: format!("{name} is not a file"),
-                    });
+                    return Err(RgbStockDamage::NotAFile.error(format!("{name} is not a file")));
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => missing.push(name),
                 Err(e) => {
@@ -312,14 +331,11 @@ pub(crate) fn open_stock(
     match StockFiles::of(rgb_dir)? {
         StockFiles::Whole => {}
         StockFiles::Partial(missing) => {
-            return Err(Error::RgbStockDamaged {
-                details: format!("{} missing", missing.join(", ")),
-            });
+            return Err(RgbStockDamage::Missing.error(format!("{} missing", missing.join(", "))));
         }
         StockFiles::None if !new_allowed => {
-            return Err(Error::RgbStockDamaged {
-                details: s!("no stock file for a wallet that has a manifest"),
-            });
+            return Err(RgbStockDamage::Missing
+                .error(s!("no stock file for a wallet that was already set up")));
         }
         StockFiles::None => make_new_stock(wallet_dir, rgb_dir, &staging)?,
     }
@@ -486,7 +502,7 @@ mod tests {
 
     fn damaged(result: Result<RgbRuntime, Error>) -> String {
         match result {
-            Err(Error::RgbStockDamaged { details }) => details,
+            Err(Error::RgbStockDamaged { details, kind }) => format!("{kind}: {details}"),
             Err(e) => panic!("expected RgbStockDamaged, got {e:?}"),
             Ok(_) => panic!("expected RgbStockDamaged, got a runtime"),
         }
@@ -695,7 +711,7 @@ mod tests {
             let before = files(dir.path());
             for new_allowed in [EXISTING, NEW] {
                 let details = damaged(load_or_create_rgb_runtime(dir.path(), new_allowed));
-                assert_eq!(details, format!("{name} missing"));
+                assert_eq!(details, format!("missing: {name} missing"));
                 assert_eq!(files(dir.path()), before, "{name}");
                 // the refused load released the runtime's lock
                 assert!(!dir.path().join("rgb_runtime.lock").exists());
@@ -708,43 +724,71 @@ mod tests {
     #[test]
     #[parallel]
     fn a_damaged_file_is_refused_and_nothing_written() {
-        type Damage = fn(&Path, &str);
-        let damages: [(Damage, &str); 5] = [
+        type Damage = fn(&Path);
+        let damages: [(Damage, Option<&str>, &str); 5] = [
             (
-                |path, _| {
+                |path| {
                     let data = fs::read(path).unwrap();
                     fs::write(path, &data[..data.len() / 2]).unwrap();
                 },
+                Some("cut_short"),
                 "is cut short",
             ),
-            (|path, _| fs::write(path, b"").unwrap(), "is cut short"),
             (
-                |path, _| {
+                |path| fs::write(path, b"").unwrap(),
+                Some("cut_short"),
+                "is cut short",
+            ),
+            (
+                |path| {
                     let mut data = fs::read(path).unwrap();
                     data.push(0);
                     fs::write(path, data).unwrap();
                 },
+                Some("trailing"),
                 "is longer than its content",
             ),
-            (|path, _| fs::write(path, [0xffu8; 64]).unwrap(), ""),
+            // whatever it reads as
+            (|path| fs::write(path, [0xffu8; 64]).unwrap(), None, ""),
             (
-                |path, _| {
+                |path| {
                     fs::remove_file(path).unwrap();
                     fs::create_dir(path).unwrap();
                 },
+                Some("not_a_file"),
                 "is not a file",
             ),
         ];
         for name in STOCK_FILES {
-            for (damage, expected) in damages {
+            for (damage, kind, expected) in damages {
                 let dir = with_stock();
-                damage(&rgb(dir.path()).join(name), name);
+                damage(&rgb(dir.path()).join(name));
                 let before = files(dir.path());
                 let details = damaged(load_rgb_runtime(dir.path()));
-                assert!(details.starts_with(name), "{name}: {details}");
-                assert!(details.contains(expected), "{name}: {details}");
+                if let Some(kind) = kind {
+                    assert!(
+                        details.starts_with(&format!("{kind}: ")),
+                        "{name}: {details}"
+                    );
+                }
+                assert!(
+                    details.contains(&format!("{name} {expected}")),
+                    "{name}: {details}"
+                );
                 assert_eq!(files(dir.path()), before, "{name}: {details}");
             }
+        }
+        // rgb itself a file, whether a new stock is allowed or not
+        let dir = with_stock();
+        fs::remove_dir_all(rgb(dir.path())).unwrap();
+        fs::write(rgb(dir.path()), b"x").unwrap();
+        let before = files(dir.path());
+        for new_allowed in [EXISTING, NEW] {
+            assert_eq!(
+                damaged(load_or_create_rgb_runtime(dir.path(), new_allowed)),
+                "not_a_file: rgb is not a directory"
+            );
+            assert_eq!(files(dir.path()), before);
         }
     }
 
@@ -913,7 +957,8 @@ mod tests {
         let result = Wallet::new(wallet_data.clone(), keys.clone());
         assert!(matches!(
             result,
-            Err(Error::RgbStockDamaged { ref details }) if details == "index.dat missing"
+            Err(Error::RgbStockDamaged { ref details, ref kind })
+                if details == "index.dat missing" && kind == "missing"
         ));
         let after = files(&wallet_dir);
         assert_eq!(after.get("rgb/stash.dat"), before.get("rgb/stash.dat"));
