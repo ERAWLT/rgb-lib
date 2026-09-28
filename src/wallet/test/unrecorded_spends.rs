@@ -1869,3 +1869,106 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
         );
     }
 }
+
+// P1, CC-27 offline: this wallet's own TX spent a coin and left every mempool, while another
+// install of the same wallet spent that coin with another TX. BDK's graph holds both; only the
+// canonical one spends the coin, and it is not this wallet's record, so the check refuses as an
+// unrecorded spend (not as a spend of its own the indexer does not know yet, which would be
+// retried forever)
+#[test]
+#[parallel]
+fn a_conflicting_spend_of_another_install_is_not_completed() {
+    for mined in [false, true] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (mut other, _other_dir) = control(&party);
+        other.online = other.wallet.go_online(online_options(&chain)).unwrap();
+
+        let (_, signed_a, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, true);
+        let txid_a = psbt_txid(&signed_a);
+        MOCK_SEND_END_CRASH.replace(Some(()));
+        let crashed = party.wallet.send_end(party.online, signed_a);
+        assert_matches!(crashed, Err(Error::Internal { .. }));
+        chain.evict(&txid_a);
+
+        let (_, signed_b, _) = begin_send(&chain, &mut other, AMOUNT_SMALL * 2, true);
+        let txid_b = psbt_txid(&signed_b);
+        other.wallet.send_end(other.online, signed_b).unwrap();
+        assert!(chain.knows(&txid_b));
+        if mined {
+            chain.mine(1);
+        }
+
+        let digest = state_digest(&party);
+        let error = reopen(&chain, &mut party, completing_options(&chain)).unwrap_err();
+        assert_eq!(
+            error.inconsistency_reason(),
+            Some(InconsistencyReason::SpenderNotRecorded),
+            "{error:?}"
+        );
+        assert_matches!(&error, Error::Inconsistency { details } if details.contains(&txid_b));
+        assert_eq!(state_digest(&party), digest);
+
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let bdk_wallet = party.wallet.bdk_wallet();
+        let divergence = colored_divergence(bdk_wallet, &txn).unwrap();
+        let view = SpendView::from_bdk(bdk_wallet, &divergence);
+        assert!(
+            bdk_wallet
+                .tx_graph()
+                .get_tx(bdk_wallet::bitcoin::Txid::from_str(&txid_a).unwrap())
+                .is_some()
+        );
+        assert_eq!(view.txs.keys().cloned().collect::<Vec<_>>(), vec![txid_b]);
+    }
+}
+
+// a completion beside a send of this wallet that is pending and not broadcast (its coins exist
+// and are unspent everywhere): only the lost spend is completed, and both settle
+#[test]
+#[parallel]
+fn a_completion_beside_a_pending_send() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let (pending, signed, recipient) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
+    let pending_idx = pending.batch_transfer_idx.unwrap();
+    let pending_txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    assert_eq!(
+        status_of(&party.wallet, pending_idx),
+        TransferStatus::WaitingCounterparty
+    );
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(
+        party
+            .wallet
+            .completed_spends()
+            .into_iter()
+            .map(|c| c.txid)
+            .collect::<Vec<_>>(),
+        vec![txid]
+    );
+    assert_eq!(
+        status_of(&party.wallet, pending_idx),
+        TransferStatus::WaitingCounterparty
+    );
+    chain.set_ack(&recipient.recipient_id, true);
+    party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
+    assert!(chain.knows(&pending_txid));
+    settle(&chain, &mut party);
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+    assert_eq!(
+        status_of(&party.wallet, pending_idx),
+        TransferStatus::Settled
+    );
+    assert_eq!(
+        spendable(&party.wallet, &party.asset_id),
+        2 * AMOUNT - 2 * AMOUNT_SMALL
+    );
+}
