@@ -892,6 +892,121 @@ fn a_signed_psbt_of_another_tx_is_not_broadcast() {
     );
 }
 
+/// Two sends waiting for their ACKs, the first one's signed.psbt replaced by the second one's and
+/// the first one ACKed (as in W11). `before_the_swap` runs between the two sends. Returns the
+/// first send's batch transfer and TXID.
+fn a_send_holding_another_tx(
+    chain: &ScriptedChain,
+    party: &mut Issuer,
+    before_the_swap: impl FnOnce(&Issuer),
+) -> (i32, String) {
+    let (first, first_signed, first_recipient) = begin_send(chain, party, AMOUNT_SMALL, false);
+    let first_txid = psbt_txid(&first_signed);
+    party.wallet.send_end(party.online, first_signed).unwrap();
+    before_the_swap(party);
+    let (_, second_signed, _) = begin_send(chain, party, AMOUNT_SMALL, false);
+    let second_txid = psbt_txid(&second_signed);
+    party.wallet.send_end(party.online, second_signed).unwrap();
+    let transfers_dir = party.wallet.get_transfers_dir();
+    fs::copy(
+        transfers_dir.join(&second_txid).join("signed.psbt"),
+        transfers_dir.join(&first_txid).join("signed.psbt"),
+    )
+    .unwrap();
+    chain.set_ack(&first_recipient.recipient_id, true);
+    (first.batch_transfer_idx.unwrap(), first_txid)
+}
+
+// A send the W11 guard refuses at every refresh can still be failed before it expires (it was
+// locked until then, its coins reserved), and nothing is broadcast
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_refused_can_be_failed() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let (idx, txid) = a_send_holding_another_tx(&chain, &mut party, |_| {});
+    let before = spendable(&party.wallet, &party.asset_id);
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Ok(true));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+    assert!(!chain.knows(&txid));
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+}
+
+// ... but not when its own TX is on chain (another copy of the wallet broadcast it): that send
+// happened, and failing it would stop crediting its change
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_refused_is_not_failed_with_its_tx_on_chain() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let mut copy = None;
+    let (idx, txid) =
+        a_send_holding_another_tx(&chain, &mut party, |party| copy = Some(control(party)));
+    let (mut other, _other_dir) = copy.unwrap();
+    other.online = other.wallet.go_online(online_options(&chain)).unwrap();
+    other
+        .wallet
+        .refresh(other.online, None, vec![], false)
+        .unwrap();
+    assert!(chain.knows(&txid));
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+}
+
+// Upstream's own lock of the same kind: a signed.psbt left empty (send_end writes it without a
+// sync) fails every refresh; the send can be failed, and nothing is broadcast
+#[test]
+#[parallel]
+fn a_send_whose_signed_psbt_is_empty_can_be_failed() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
+    let (begin, signed, recipient) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    let idx = begin.batch_transfer_idx.unwrap();
+    fs::write(
+        party
+            .wallet
+            .get_transfers_dir()
+            .join(&txid)
+            .join("signed.psbt"),
+        "",
+    )
+    .unwrap();
+    chain.set_ack(&recipient.recipient_id, true);
+    let refreshed = party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
+    assert_matches!(&refreshed[&idx].failure, Some(Error::InvalidPsbt { .. }));
+    let before = spendable(&party.wallet, &party.asset_id);
+    chain.clear_requests();
+
+    let result = party
+        .wallet
+        .fail_transfers(party.online, Some(idx), false, false);
+    assert_matches!(result, Ok(true));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert!(!chain.requests().contains(&s!("POST /tx")));
+    assert!(!chain.knows(&txid));
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+}
+
 // Planner table (design section 5.1): `plan` over a real wallet state (database, BDK view, transfer
 // files), changed one way per case in a transaction that is rolled back and a copy of the
 // transfer files, with the indexer's answers given by the case. Every refusal must also leave the
@@ -2055,4 +2170,96 @@ fn the_media_check_runs_after_a_completion() {
     assert_matches!(&result, Err(Error::Inconsistency { details }) if details.contains("media"));
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
     assert!(party.wallet.completed_spends().is_empty());
+}
+
+/// Spend the change of the issued asset once more, and settle: the stash knows every transition
+/// the change comes from.
+fn spend_the_change(chain: &ScriptedChain, party: &mut Issuer, spent_before: u64) {
+    let (_, signed, _) = begin_send(chain, party, AMOUNT_SMALL, true);
+    let next = party.wallet.send_end(party.online, signed).unwrap();
+    assert!(chain.knows(&next.txid));
+    settle(chain, party);
+    assert_eq!(
+        spendable(&party.wallet, &party.asset_id),
+        AMOUNT - spent_before - AMOUNT_SMALL
+    );
+}
+
+// CC-101: one of the three stock files failing to store while the stash consumes a spend, during
+// the completion or during send_end itself: Error::IO, the stash no newer than the file that
+// failed (it is held back), the next go_online completes the spend, it settles, and its change
+// is spent again. Were the stash written after a failed index or state, the completion would
+// skip the consume and the change could never be spent.
+#[test]
+#[parallel]
+fn a_stock_file_that_fails_to_store_keeps_the_stash_behind() {
+    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
+    for in_send_end in [false, true] {
+        for name in ["index.dat", "state.dat", "stash.dat"] {
+            let chain = ScriptedChain::start();
+            let mut party = issuer(&chain, vec![AMOUNT]);
+            let stash_path = party.wallet.get_wallet_dir().join("rgb").join("stash.dat");
+            let (idx, stash_before) = if in_send_end {
+                let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, true);
+                let stash_before = fs::read(&stash_path).unwrap();
+                STORE_FAILURES.with_borrow_mut(|f| {
+                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
+                });
+                let result = party.wallet.send_end(party.online, signed.clone());
+                STORE_FAILURES.with_borrow_mut(|f| f.clear());
+                assert!(
+                    matches!(result, Err(Error::IO { .. })),
+                    "{name}: {result:?}"
+                );
+                assert!(chain.knows(&psbt_txid(&signed)));
+                (begin.batch_transfer_idx.unwrap(), stash_before)
+            } else {
+                let (idx, _) = donation_answer_lost(&chain, &mut party);
+                let stash_before = fs::read(&stash_path).unwrap();
+                STORE_FAILURES.with_borrow_mut(|f| {
+                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
+                });
+                let result = reopen(&chain, &mut party, completing_options(&chain));
+                STORE_FAILURES.with_borrow_mut(|f| f.clear());
+                assert!(
+                    matches!(result, Err(Error::IO { .. })),
+                    "{name}: {result:?}"
+                );
+                (idx, stash_before)
+            };
+            assert_eq!(fs::read(&stash_path).unwrap(), stash_before, "{name}");
+            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+            reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+            assert_eq!(party.wallet.completed_spends().len(), 1, "{name}");
+            settle(&chain, &mut party);
+            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+            spend_the_change(&chain, &mut party, AMOUNT_SMALL);
+        }
+    }
+}
+
+// CC-101, second line: a stash that holds a spend's bundle while the index does not (as the
+// index and state were written before the stash, a set older than the hold-back could be left
+// so) counts as not holding it: the completion consumes again, and the change is spent
+#[test]
+#[parallel]
+fn a_bundle_the_index_does_not_know_is_consumed_again() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, _) = donation_answer_lost(&chain, &mut party);
+    let index_path = party.wallet.get_wallet_dir().join("rgb").join("index.dat");
+    let old_index = fs::read(&index_path).unwrap();
+    // the completion consumes (all three files stored) and does not commit
+    MOCK_FAIL_BEFORE_COMPLETION_COMMIT.replace(Some(()));
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    assert_matches!(result, Err(Error::Internal { .. }));
+    party.wallet.go_offline();
+    fs::write(&index_path, old_index).unwrap();
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+    spend_the_change(&chain, &mut party, AMOUNT_SMALL);
 }
