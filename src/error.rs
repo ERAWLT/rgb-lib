@@ -180,6 +180,11 @@ pub enum Error {
 
     /// The consistency check failed on a wallet that was just restored from a VSS backup,
     /// meaning the backup itself is inconsistent or older than other wallet state
+    ///
+    /// ERA fork (CC-101): with the `vss` feature this also comes from `Wallet::new`, not only from
+    /// `go_online`: a wallet whose restore marker is still there and whose RGB state cannot be
+    /// opened gets this instead of [`Error::RgbStockDamaged`], with `details` "RGB state: " and that
+    /// error's details (its `kind` is not carried)
     #[error(
         "The restored VSS backup is inconsistent ({details}). The backup is likely stale or was \
          taken mid-operation; restore a newer backup or recover from the original wallet data."
