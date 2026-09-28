@@ -2005,3 +2005,54 @@ fn the_option_is_off_unless_named() {
     .unwrap();
     assert!(!options.complete_unrecorded_spends);
 }
+
+// a transfer file the system refuses to read is the retryable Error::IO, not a refusal of the
+// spend: once it can be read, the next go_online completes it
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn an_unreadable_transfer_file_is_an_io_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+    let fascia = party.wallet.get_transfers_dir().join(&txid).join("fascia");
+    fs::set_permissions(&fascia, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&fascia).is_ok() {
+        // running as root
+        fs::set_permissions(&fascia, fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    fs::set_permissions(&fascia, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_matches!(result, Err(Error::IO { .. }));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+}
+
+// upstream's asset and media checks still run after a completion, and still refuse: nothing is
+// committed
+#[test]
+#[parallel]
+fn the_media_check_runs_after_a_completion() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, _) = donation_answer_lost(&chain, &mut party);
+    let txn = party.wallet.database().begin_transaction().unwrap();
+    txn.set_media(DbMediaActMod {
+        digest: ActiveValue::Set("ab".repeat(32)),
+        mime: ActiveValue::Set(s!("text/plain")),
+        ..Default::default()
+    })
+    .unwrap();
+    txn.commit().unwrap();
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    assert_matches!(&result, Err(Error::Inconsistency { details }) if details.contains("media"));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    assert!(party.wallet.completed_spends().is_empty());
+}
