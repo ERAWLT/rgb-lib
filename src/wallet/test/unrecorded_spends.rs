@@ -2123,3 +2123,28 @@ fn a_stock_file_that_fails_to_store_keeps_the_stash_behind() {
         }
     }
 }
+
+// CC-101, second line: a stash that holds a spend's bundle while the index does not (as the
+// index and state were written before the stash, a set older than the hold-back could be left
+// so) counts as not holding it: the completion consumes again, and the change is spent
+#[test]
+#[parallel]
+fn a_bundle_the_index_does_not_know_is_consumed_again() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, _) = donation_answer_lost(&chain, &mut party);
+    let index_path = party.wallet.get_wallet_dir().join("rgb").join("index.dat");
+    let old_index = fs::read(&index_path).unwrap();
+    // the completion consumes (all three files stored) and does not commit
+    MOCK_FAIL_BEFORE_COMPLETION_COMMIT.replace(Some(()));
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    assert_matches!(result, Err(Error::Internal { .. }));
+    party.wallet.go_offline();
+    fs::write(&index_path, old_index).unwrap();
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+    spend_the_change(&chain, &mut party, AMOUNT_SMALL);
+}

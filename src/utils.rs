@@ -893,15 +893,24 @@ impl RgbRuntime {
     /// commit. A second consume is a merge on rgb-ops 0.11.1-rc.11, but that is a property of the
     /// stash implementation, so it is not relied on. A bundle in the stash implies its index and
     /// state: `consume_fascia` commits the three in the order index, state, stash, and
-    /// `StockStore` holds the stash back while either of the others failed to store (CC-101).
+    /// `StockStore` holds the stash back while either of the others failed to store (CC-101). As a
+    /// second line, a bundle counts as held only when the index knows it too.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
+        use rgbstd::persistence::IndexReadProvider;
         let seal_witness = fascia.seal_witness().clone();
         let stash = self.stock.as_stash_provider();
+        let index = self.stock.as_index_provider();
+        // by the bundle's ID alone, which commits to its input map: what the fascia file says of
+        // its transitions is not read here (the stash is trusted over the file)
+        let held = |bundle: &rgbstd::TransitionBundle| {
+            let bundle_id = bundle.bundle_id();
+            stash.bundle(bundle_id).is_ok() && index.bundle_info(bundle_id).is_ok()
+        };
         let unknown: BTreeMap<ContractId, rgbstd::TransitionBundle> = fascia
             .into_bundles()
             .into_iter()
-            .filter(|(_, bundle)| stash.bundle(bundle.bundle_id()).is_err())
+            .filter(|(_, bundle)| !held(bundle))
             .collect();
         Confined::try_from(unknown)
             .ok()
