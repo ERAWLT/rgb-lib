@@ -1332,11 +1332,18 @@ number at merge under the bridge's merge rule (`3e48ae71`).
 - The bridge never calls rgb-lib's public `sync`: its orphan reconcile would mark the inputs
   spent without the transition or the status, and the completion would never see them (a guard
   keeps it that way).
-- For the app (T1.3): R5 never aborts a pending Drain before `goOnline`. After a `goOnline` that
-  passed, it aborts one only when the report did not name it, the keeper holds no signed PSBT
-  for it and `listPendingVanillaTxs` still shows it. `BroadcastFailed` / `IndexerUnavailable`
-  from `sendEnd` / `drainToEnd` mean "outcome unknown": keep the signed PSBT, offer no cancel. The
-  retry cadence of `UnrecordedSpendUnseen` is the app's (design question 3).
+- For the app (T1.3, design rev. 6.1, accepted): R5, the offline tail of opening a wallet, never
+  cancels a pending Drain whose PSBT was handed out to the device (the app's keeper holds it as
+  handed out or signed), nor one the keeper does not know (a VSS copy from another phone, where it
+  may have been handed out): such a Drain is left to `goOnline`, which completes it if it
+  reached the network, and is cancelled only on proof (T3.3). A Drain the app's handout rule
+  withheld (its `drain_to_begin` succeeded, the seal before the handout did not, so the PSBT
+  never left the app) is cancelled with `abort_pending_vanilla_tx` at once: at the failed
+  handout, and by R5 if the process died first. Other vanilla TXs are cancelled when the keeper
+  holds no handed-out or signed record of them.
+  `BroadcastFailed` / `IndexerUnavailable` from `sendEnd` / `drainToEnd` mean "outcome unknown":
+  keep the signed PSBT, offer no cancel. The retry cadence of `UnrecordedSpendUnseen` is the
+  app's (design question 3).
 
 ### Tests
 
@@ -1604,7 +1611,8 @@ Error::RgbStockDamaged { details: String, kind: String }
   format, a base with other RGB libraries such as the `-bfa` carry) fails the same way, and the
   interrupted writes it would otherwise point to no longer happen (stores are atomic). A host
   keeps the directory as it is, and replaces it with a backup only when it can rule out a format
-  change, for example because that backup was written by the same build. There is no integrity
+  change, for example because that backup was written by the same build, or when it keeps the
+  directory's content to go back to (what the ERA app does, below). There is no integrity
   check: a file that still decodes is accepted as it is (see [Not done](#not-done)).
 - **After a VSS restore it is reported against the backup** (`5dd72f3`, `50a470b`, `vss`
   feature). While the restore marker (`.vss_restored`) is in the wallet directory, `setup_rgb`
@@ -1631,6 +1639,48 @@ Error::RgbStockDamaged { details: String, kind: String }
   `RgbStockDamaged`.
 
 The ERA bridge takes both with CC-99's report (§6) in era_rgb API 16.
+
+**What the ERA app does with a wallet it cannot open** (T1.3, design rev. 6.1, accepted). The
+app keeps an rgb-lib wallet directory open only between unlock and lock; the rest of the time
+the wallet exists as its seal, rgb-lib's own encrypted `backup` of the directory under a key
+derived from the app's data key, taken at lock and after mutations. The handout rule seals
+before a PSBT or an invoice leaves the app, so every spend record and every handed-out invoice
+secret is in the seal. "Cannot open" is `RgbStockDamaged` (as the bridge's `WalletDamaged`, or
+`RestoredBackupInconsistent` with the `RGB state (` prefix) and every other deterministic
+refusal of `open` but a missing or already open wallet (a database migration this build lacks,
+a panic, a mismatched setting), plus the breaker below and an I/O error that lasts two starts while a
+seal exists.
+
+- **Never deleted, never left open in plaintext.** The directory goes to an encrypted
+  quarantine: streamed as tar through AES-256-GCM under a key of its own, synced, and only then
+  removed; the same content is never written twice. Nothing deletes a quarantined directory
+  but "Clear all data".
+- **Then a restore from the seal, with no pre-check of the build that wrote it** (no seal: the
+  wallet is blocked, its exits a VSS restore or starting empty). Nothing is
+  lost by trying (the directory is in quarantine, and it holds nothing that cannot be recovered
+  beyond the seal), and a restored copy that does not open is itself the sign of a format
+  change. A check by build id would not have caught the one dangerous case, and would have
+  blocked the wallet after every app update.
+- **If the restored copy does not open either,** it is deleted (it came from the seal) and the
+  app reads which build wrote the seal (version and build number, e.g. `1.20.0+92`, from its own
+  note in the copy, not through rgb-lib). **The same build**: no format change is possible, so
+  the seal is damaged; it is set aside (renamed, never deleted) and the wallet is blocked with
+  the exits of a wallet without a live seal (a VSS restore, or starting empty, both confirmed by
+  the user). **Another build**, or a note it cannot read: a format or schema change is possible;
+  the seal stays, and the wallet stays blocked until a newer app version, which tries once.
+- **A process death inside `open`** is bounded by the app's breaker. rgb-strict-encoding
+  allocates what a length in the data asks for, so a flipped bit in `stash.dat`, or a stash of
+  another format, can abort the process on the allocation: no panic to catch, no error. The
+  breaker counts, per wallet and app build, the opens that never returned (on disk, around
+  each `open`): at most 3 per app version (version and build number). One changes nothing, two
+  send the directory to quarantine, and the third, on the seal's copy, is decided by the seal's
+  build as above. A copy restored from VSS gets at most 2, then it is deleted (the server's copy
+  stays) and the wallet goes back to its block.
+- **A process death outside `open`** is not bounded by the app: a payer's consignment decoded in
+  `refresh` (CC-103) can kill it on every unlock, and the breaker does not see it. Only the
+  decoder patch closes it (rgb-strict-encoding allocating no more than the bytes left; not in
+  this series), and that patch gates Receive in the app: there are no incoming transfers
+  before it.
 
 ### What does not change
 
