@@ -132,7 +132,7 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
         Err(err) => err,
     };
     assert!(
-        matches!(&err, Error::RestoredBackupInconsistent { details } if details.starts_with("RGB state: ")),
+        matches!(&err, Error::RestoredBackupInconsistent { details } if details.starts_with("RGB state (missing): ")),
         "restore-attributed failure must use the dedicated variant, got: {err:?}"
     );
     // ERA fork (CC-101): the stock without the asset is then a whole one, a fresh wallet's

@@ -273,17 +273,21 @@ pub(crate) fn setup_rgb<P: AsRef<Path>>(
     let mut runtime = match load_or_create_rgb_runtime(wallet_dir.as_ref(), new_allowed) {
         Ok(runtime) => runtime,
         // ERA fork (CC-101): a wallet just restored from a VSS backup whose stock cannot be opened
-        // is the backup's failure, as the consistency check attributes an inconsistency (whether
-        // the backup was encrypted, which keeps the manifest, or not)
+        // is reported against the backup, as the consistency check attributes an inconsistency
+        // (whether the backup was encrypted, which keeps the manifest, or not). The kind goes
+        // along: a format change reads the same as a torn backup (see Error::rgb_stock_damage)
         #[cfg(feature = "vss")]
-        Err(Error::RgbStockDamaged { details, .. })
+        Err(Error::RgbStockDamaged { details, kind })
             if wallet_dir
                 .as_ref()
                 .join(crate::wallet::vss::VSS_RESTORE_MARKER)
                 .exists() =>
         {
             return Err(Error::RestoredBackupInconsistent {
-                details: format!("RGB state: {details}"),
+                details: format!(
+                    "{}{kind}): {details}",
+                    crate::error::RESTORED_RGB_STATE_PREFIX
+                ),
             });
         }
         Err(e) => return Err(e),

@@ -183,8 +183,12 @@ pub enum Error {
     ///
     /// ERA fork (CC-101): with the `vss` feature this also comes from `Wallet::new`, not only from
     /// `go_online`: a wallet whose restore marker is still there and whose RGB state cannot be
-    /// opened gets this instead of [`Error::RgbStockDamaged`], with `details` "RGB state: " and that
-    /// error's details (its `kind` is not carried)
+    /// opened gets this instead of [`Error::RgbStockDamaged`], with `details`
+    /// `RGB state (<kind>): <details>`, the kind and the details of that error
+    /// ([`Error::rgb_stock_damage`] reads the kind back). That refusal is not a verdict on the
+    /// backup: the files may be intact and written by another version of rgb-ops, and then a
+    /// newer backup fails the same way, so the advice of this error's message to restore one does
+    /// not apply (see [`Error::RgbStockDamaged`]).
     #[error(
         "The restored VSS backup is inconsistent ({details}). The backup is likely stale or was \
          taken mid-operation; restore a newer backup or recover from the original wallet data."
@@ -846,6 +850,10 @@ pub enum Error {
 // refused to complete an unrecorded spend
 const INCONSISTENCY_REASON_PREFIX: &str = "; reason=";
 
+// ERA fork (CC-101): what `details` of a RestoredBackupInconsistent starts with when Wallet::new
+// could not open the restored RGB state, before `<kind>): <details>`
+pub(crate) const RESTORED_RGB_STATE_PREFIX: &str = "RGB state (";
+
 impl Error {
     /// ERA fork (CC-99): why the consistency check of `go_online` with
     /// `OnlineOptions::complete_unrecorded_spends` refused, as [`Error::Inconsistency`] or
@@ -858,6 +866,25 @@ impl Error {
             Error::Inconsistency { details } | Error::RestoredBackupInconsistent { details } => {
                 let (_, code) = details.rsplit_once(INCONSISTENCY_REASON_PREFIX)?;
                 InconsistencyReason::from_code(code)
+            }
+            _ => None,
+        }
+    }
+
+    /// ERA fork (CC-101): how the RGB state failed to open, from [`Error::RgbStockDamaged`] or
+    /// from the [`Error::RestoredBackupInconsistent`] that `Wallet::new` returns for it on a
+    /// wallet just restored from a VSS backup (`details` starting `RGB state (<kind>): `).
+    ///
+    /// `None` for every other error, including a restored backup that failed the consistency
+    /// check at `go_online`.
+    pub fn rgb_stock_damage(&self) -> Option<RgbStockDamage> {
+        match self {
+            Error::RgbStockDamaged { kind, .. } => RgbStockDamage::from_code(kind),
+            Error::RestoredBackupInconsistent { details } => {
+                let (kind, _) = details
+                    .strip_prefix(RESTORED_RGB_STATE_PREFIX)?
+                    .split_once("): ")?;
+                RgbStockDamage::from_code(kind)
             }
             _ => None,
         }
