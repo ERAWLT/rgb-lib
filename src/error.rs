@@ -714,8 +714,11 @@ pub enum Error {
     /// ERA fork (CC-99): a colored spend this wallet recorded, which the indexer knows, cannot be
     /// completed by `go_online` (`OnlineOptions::complete_unrecorded_spends`).
     ///
-    /// Nothing was written. The same wallet state gives the same answer, so retrying does not
-    /// help; `reason` ([`UnrecordedSpendReason`]) says what is in the way.
+    /// Nothing of this spend was written, and the database is unchanged. With `stash-refused`,
+    /// spends of the same `go_online` consumed before this one may stay in the stash (the state
+    /// of an operation that stopped after its consume, S2 in the fork's `ERA.md`), which the next
+    /// `go_online` skips. The same wallet state gives the same answer, so retrying does not help;
+    /// `reason` ([`UnrecordedSpendReason`]) says what is in the way.
     #[error("Cannot complete a spend recorded by this wallet (TX {txid}): {reason}")]
     UnrecordedSpend {
         /// ID of the spending transaction

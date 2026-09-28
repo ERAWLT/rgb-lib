@@ -140,9 +140,11 @@ pub struct OnlineOptions {
     /// question is spent by such a transaction and the indexer knows it; it broadcasts nothing
     /// and contacts no RGB proxy. What it completed is read with
     /// [`Wallet::completed_spends`](crate::wallet::Wallet::completed_spends). Anything it cannot
-    /// prove is refused as before, with nothing written: [`Error::Inconsistency`] (whose
-    /// [`Error::inconsistency_reason`] says why), [`Error::UnrecordedSpendUnseen`],
-    /// [`Error::UnrecordedSpend`] or the indexer's error.
+    /// prove is refused as before, with nothing committed to the database (a `stash-refused`
+    /// [`Error::UnrecordedSpend`] can leave spends consumed before it in the stash, see the fork's
+    /// `ERA.md`, section 6): [`Error::Inconsistency`] (whose [`Error::inconsistency_reason`] says
+    /// why), [`Error::UnrecordedSpendUnseen`], [`Error::UnrecordedSpend`] or the indexer's
+    /// error.
     ///
     /// `false` (the default, and what a missing field deserializes to) keeps upstream's check.
     /// Ignored with `skip_consistency_check`, and on multisig and MPC wallets. The contract is
