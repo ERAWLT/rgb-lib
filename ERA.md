@@ -100,6 +100,7 @@ Rules for the branch:
 | `3889751` | Say a linked rgb is a symbolic link, and touch nothing behind it | To propose to UTEXO (with `7d07452`) |
 | `f5d6522` | Pin the undecodable kind and the kinds' codes | To propose to UTEXO (with `7d07452`) |
 | `df04de0` | Stop promising in rustdoc that a refused completion writes nothing | To propose to UTEXO (with `c1feef6`) |
+| `d326033` | Build reqwest without HTTP/2 | Fork-only (a size choice for the app; UTEXO's other hosts may want HTTP/2) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
@@ -109,7 +110,7 @@ Later commits that touch only this file are part of the series too. `3f0a555` to
 `690f041` and, after their verification, `1ee1caf` and `df04de0` are
 [§6](#6-completing-an-own-unrecorded-spend-cc-99); `ac6724d`, `7d07452`, after their review
 `5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
-[§7](#7-the-rgb-stock-on-disk-cc-101).
+[§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -188,7 +189,7 @@ layout from xpubs and from a mnemonic, unchanged default descriptors).
 ## 2. CI
 
 `.github/workflows/era.yml` (`1d26404`, extended in `f808c7f`, `07e16e5`, `e7bdaa4`, `bef0c03`,
-`87d5e88`, `45c3b39`, `dcc9654`, `8692b69`, `a140543`, `f82b1c1` and `27d2a5a`) has two jobs.
+`87d5e88`, `45c3b39`, `dcc9654`, `8692b69`, `a140543`, `f82b1c1`, `27d2a5a` and `d326033`) has two jobs.
 
 - **check** runs on push / PR to `era/**` and on manual dispatch: rustfmt, `cargo check`
   with the app's feature set and with the upstream default on top, a check of the uniffi
@@ -309,6 +310,25 @@ whenever `forwarder_url` is unset, [§4](#4-proxy-forwarder-e7bdaa4)).
 - Two features the library used but never declared are now explicit: `hex/std`
   (arrived only through sqlx-postgres) and `tokio/rt-multi-thread` (only through
   sea-orm-cli). Without them the library does not compile once those crates are gone.
+- **HTTP/1.1 only** (`d326033`, from the app's size pass T4.8, 2026-09-29): reqwest is built
+  without `http2`, so h2 and hyper's HTTP/2 client are gone from the app's graph (0.28 MB of
+  the Android arm64 library at the app's opt-level `"s"`). The app does not lose anything by
+  it: with a forwarder ([§4](#4-proxy-forwarder-e7bdaa4)), which every release build of the
+  app has, each RGB proxy and reject-list request is plain HTTP/1.1 to loopback, which
+  reqwest never upgrades; the direct https route negotiates HTTP/1.1, which RGB proxies
+  serve. `rest_client_builder` builds the TLS config itself, so its ALPN is kept in step by
+  hand: `http/1.1` alone. Offering `h2` to a client that cannot speak it would let a server
+  pick it, and hyper-util then panics in reqwest's connection task ("http2 feature is not
+  enabled", `client/legacy/client.rs`) instead of sending the request;
+  `tests_rest_client_tls::rest_clients_offer_only_http1_in_alpn` pins the list, and the
+  dependency guard in `era.yml` bans `h2` from the mobile graphs. `h2` stays in the root
+  `Cargo.lock` because mockito (a dev-dependency) needs hyper's HTTP/2 server; that
+  unification reaches `cargo test` builds only. UTEXO's signet RGB proxy does not offer h2
+  at all (it answers HTTP/1.1 to a client offering h2, `curl --http2`, 2026-09-29), so the
+  direct route to it was HTTP/1.1 before this change too, and the https test cannot notice
+  an `h2` in the ALPN: a unit test pins it.
+  Checked against UTEXO's `-bfa` tags with `git merge-tree` as the rest of the series
+  (2026-09-29): no conflict region beyond those the series already has.
 
 ### Side effect: VSS over https works
 
@@ -330,11 +350,30 @@ Electrum indexer) — worth reporting to UTEXO separately.
   `rgb-ops`) and bitreq (behind `vss-client`) hard-wire rustls on ring; aws-lc would
   have been a second backend, not a replacement.
 - **Two rustls versions**, 0.21 (minreq) and 0.23 (everything else), both on ring.
-  Unifying them needs an esplora-client without minreq under rgb-ops.
+  Unifying them needs an esplora-client without minreq under rgb-ops, which enables
+  `esplora-client/blocking-https` itself (0.21 with its webpki is about 0.14 MB of the
+  Android arm64 library at the app's opt-level `"s"`).
 - **rustls-platform-verifier** is still compiled: reqwest's `rustls-no-provider`
-  depends on it unconditionally. It is never called.
+  depends on it unconditionally, and reqwest's builder references it in a branch our
+  prebuilt config never takes, so the linker keeps it. It is never called. On Android it
+  brings the `jni` crate: about 0.08 MB of the arm64 library at opt-level `"s"` (0.12 MB
+  at 3). Dropping it means patching reqwest.
+- **reqwest `json` and `multipart`** are used: the RGB proxy is JSON-RPC
+  (`ProxyClient`), and `consignment.post` / `media.post` upload multipart forms.
+- **reqwest `charset`** stays (encoding_rs: a build without it was 0.18 MB smaller on
+  Android arm64 at `"s"`, 2026-09-29). Without it `Response::text()` is `from_utf8_lossy`: a reject list
+  served with a UTF-8 BOM would keep it on its first line, which would then not parse as
+  an opout and be skipped, and the list would lose that entry silently. Keeping the
+  decoder is cheaper than carrying a decoder of our own on that path.
+- **zip with zstd** stays: backups (`backup.rs`, `vss.rs`) are written with
+  `CompressionMethod::Zstd`, so reading an existing backup needs it; zstd is already
+  built without its default features (no legacy formats, no dictionary builder).
 - **Electrum builds keep aws-lc**: `rgb-ops` depends on `electrum-client` with its
   default features (rustls on aws-lc). The app does not build `electrum`.
+- **The app's own size settings are not here.** Cargo applies profiles only from the
+  top-level crate, so the optimisation level and the `lowmemory` switch of both
+  libsecp256k1 copies in this graph (2 MB of precomputed tables) are set in the app's
+  `packages/era_rgb/rust/Cargo.toml` (T4.8).
 
 ### Evidence (aarch64-linux-android, `--no-default-features --features esplora,vss`)
 
