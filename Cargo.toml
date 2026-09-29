@@ -52,11 +52,13 @@ rand = { version = "0.10.1", default-features = false, features = [
 # and rustls-platform-verifier (JNI setup on Android), and the Android build used to add a
 # vendored OpenSSL through native-tls on top. "rustls-no-provider" plus the ring-based config
 # built in api::rest_client_builder leaves rustls on ring, the stack minreq (esplora) and bitreq
-# (vss) already use. The other reqwest defaults are kept as they were.
+# (vss) already use. The other reqwest defaults are kept as they were, except "http2": HTTP/1.1
+# only (h2 and hyper's HTTP/2 client are not built), which api::rest_client_builder's ALPN has to
+# match. In the ERA app every proxy request is plain HTTP/1.1 to its loopback forwarder anyway;
+# the direct https route negotiates HTTP/1.1, which every RGB proxy serves.
 reqwest = { version = "0.13", optional = true, default-features = false, features = [
     "blocking",
     "charset",
-    "http2",
     "json",
     "multipart",
     "rustls-no-provider",
