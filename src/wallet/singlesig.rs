@@ -4,6 +4,28 @@
 
 use super::*;
 
+/// Overrides of the keychain layout of a singlesig wallet: the coin type of each side's account
+/// and the keychain of the colored side. Every field left `None` keeps rgb-lib's default for the
+/// wallet network. The vanilla keychain is [`SinglesigKeys::vanilla_keychain`].
+///
+/// A host whose signer only exports the standard BIP-86 account can put both sides under that
+/// account: set both coin types to the standard one and give the two sides distinct keychains
+/// (`colored_keychain` and [`SinglesigKeys::vanilla_keychain`]); both account xPubs are then that
+/// account's xPub.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct KeychainLayoutOverrides {
+    /// Keychain index for the colored side of the wallet (default: 0)
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub colored_keychain: Option<u8>,
+    /// Coin type of the colored-side account (default: 827166 on mainnet, 827167 otherwise)
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub colored_coin_type: Option<u32>,
+    /// Coin type of the vanilla-side account (default: 0 on mainnet, 1 otherwise)
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
+    pub vanilla_coin_type: Option<u32>,
+}
+
 /// Keys for the singlesig wallet.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -15,19 +37,11 @@ pub struct SinglesigKeys {
     /// Keychain index for the vanilla-side of the wallet (default: 0)
     #[serde(deserialize_with = "from_str_or_number_optional")]
     pub vanilla_keychain: Option<u8>,
-    /// Keychain index for the colored side of the wallet (default: 0)
-    #[serde(default, deserialize_with = "from_str_or_number_optional")]
-    pub colored_keychain: Option<u8>,
-    /// Coin type of the colored-side account (default: 827166 on mainnet, 827167 otherwise).
+    /// Overrides of the default keychain layout (default: none).
     ///
-    /// A host whose signer only exports the standard BIP-86 account can set this to the vanilla
-    /// coin type and give the two sides distinct keychains (`colored_keychain` and
-    /// `vanilla_keychain`); both account xPubs are then the same key.
-    #[serde(default, deserialize_with = "from_str_or_number_optional")]
-    pub colored_coin_type: Option<u32>,
-    /// Coin type of the vanilla-side account (default: 0 on mainnet, 1 otherwise)
-    #[serde(default, deserialize_with = "from_str_or_number_optional")]
-    pub vanilla_coin_type: Option<u32>,
+    /// Flattened when serialized: its fields sit next to `vanilla_keychain`.
+    #[serde(flatten)]
+    pub keychain_layout: KeychainLayoutOverrides,
     /// Wallet master fingerprint
     pub master_fingerprint: String,
     /// Wallet mnemonic phrase
@@ -38,15 +52,13 @@ pub struct SinglesigKeys {
 }
 
 impl SinglesigKeys {
-    pub(crate) fn keychain_layout(
+    pub(crate) fn resolve_keychain_layout(
         &self,
         bitcoin_network: &BitcoinNetwork,
     ) -> Result<KeychainLayout, Error> {
         KeychainLayout::resolve(
             bitcoin_network,
-            self.colored_coin_type,
-            self.vanilla_coin_type,
-            self.colored_keychain,
+            &self.keychain_layout,
             self.vanilla_keychain,
         )
     }
@@ -55,7 +67,7 @@ impl SinglesigKeys {
         &self,
         bitcoin_network: &BitcoinNetwork,
     ) -> Result<(WalletDescriptors, bool), Error> {
-        let layout = self.keychain_layout(bitcoin_network)?;
+        let layout = self.resolve_keychain_layout(bitcoin_network)?;
         let network_kind = bitcoin_network.network_kind();
         let xpub_rgb = str_to_xpub(&self.account_xpub_colored, &network_kind)?;
         let xpub_btc = str_to_xpub(&self.account_xpub_vanilla, &network_kind)?;
@@ -98,9 +110,7 @@ impl SinglesigKeys {
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain,
-            colored_keychain: None,
-            colored_coin_type: None,
-            vanilla_coin_type: None,
+            keychain_layout: KeychainLayoutOverrides::default(),
             master_fingerprint: keys.master_fingerprint.clone(),
             mnemonic: Some(keys.mnemonic.clone()),
             witness_version: keys.witness_version,
@@ -113,27 +123,18 @@ impl SinglesigKeys {
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain,
-            colored_keychain: None,
-            colored_coin_type: None,
-            vanilla_coin_type: None,
+            keychain_layout: KeychainLayoutOverrides::default(),
             master_fingerprint: keys.master_fingerprint.clone(),
             mnemonic: None,
             witness_version: keys.witness_version,
         }
     }
 
-    /// Return a copy of these keys with a non-default keychain layout.
+    /// Return a copy of these keys with the given keychain layout overrides.
     ///
-    /// `None` keeps rgb-lib's default for that setting. See [`SinglesigKeys::colored_coin_type`].
-    pub fn with_keychain_layout(
-        mut self,
-        colored_keychain: Option<u8>,
-        colored_coin_type: Option<u32>,
-        vanilla_coin_type: Option<u32>,
-    ) -> Self {
-        self.colored_keychain = colored_keychain;
-        self.colored_coin_type = colored_coin_type;
-        self.vanilla_coin_type = vanilla_coin_type;
+    /// See [`KeychainLayoutOverrides`].
+    pub fn with_keychain_layout(mut self, keychain_layout: KeychainLayoutOverrides) -> Self {
+        self.keychain_layout = keychain_layout;
         self
     }
 }

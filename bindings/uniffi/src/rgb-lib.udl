@@ -650,13 +650,18 @@ dictionary WalletData {
 };
 
 [Remote]
+dictionary KeychainLayoutOverrides {
+  u8? colored_keychain;
+  u32? colored_coin_type;
+  u32? vanilla_coin_type;
+};
+
+[Remote]
 dictionary SinglesigKeys {
   string account_xpub_vanilla;
   string account_xpub_colored;
   u8? vanilla_keychain;
-  u8? colored_keychain;
-  u32? colored_coin_type;
-  u32? vanilla_coin_type;
+  KeychainLayoutOverrides keychain_layout;
   string master_fingerprint;
   string? mnemonic;
   WitnessVersion witness_version;

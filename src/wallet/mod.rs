@@ -54,7 +54,7 @@ pub use objects::{
 pub use offline::RgbWalletOpsOffline;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use online::RgbWalletOpsOnline;
-pub use singlesig::{SinglesigKeys, Wallet};
+pub use singlesig::{KeychainLayoutOverrides, SinglesigKeys, Wallet};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use unrecorded_spends::CompletedSpend;
 
