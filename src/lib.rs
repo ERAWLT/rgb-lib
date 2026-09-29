@@ -666,7 +666,7 @@ use crate::{
         get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
         setup_logger, str_to_xpub,
     },
-    wallet::{AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS},
+    wallet::{AssetFilter, Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS},
 };
 // the mock electrum server of the validation tests, shared with the wallet ones
 #[cfg(all(test, feature = "electrum"))]
