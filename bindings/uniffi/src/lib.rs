@@ -25,7 +25,7 @@ use rgb_lib::{
         ConsignmentValidation as RgbLibConsignmentValidation, Cosigner as CosignerData,
         DatabaseType, EmbeddedMedia, EvmChain, HubInfo, IndexerConfig as RgbLibIndexerConfig,
         IndexerProtocol, InflateBeginResult, InflateDetails, InitOperationResult,
-        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, LinkBeginResult, LinkDetails,
+        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, KeychainLayoutOverrides, LinkBeginResult, LinkDetails,
         Media, Metadata, MintBeginResult, MintDetails, MultisigKeys, MultisigOnlineOptions,
         MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
         Online, OnlineOptions as RgbLibOnlineOptions, Operation as RgbLibOperation,

@@ -665,7 +665,7 @@ use crate::{
         setup_logger, str_to_xpub,
     },
     wallet::{
-        AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS,
+        AssetFilter, Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS,
         WalletDescriptors,
     },
 };
