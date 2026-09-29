@@ -438,6 +438,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The requested keychain layout (coin types and keychain indexes) is invalid
+    #[error("Invalid keychain layout: {details}")]
+    InvalidKeychainLayout {
+        /// Error details
+        details: String,
+    },
+
     /// The contract that is linked from or to cannot be linked
     #[error("Contract {contract_id} cannot be linked: {details}")]
     InvalidLinkedContract {
@@ -563,13 +570,6 @@ pub enum Error {
     /// The provided vanilla keychain is invalid
     #[error("Invalid vanilla keychain")]
     InvalidVanillaKeychain,
-
-    /// The requested keychain layout (coin types and keychain indexes) is invalid
-    #[error("Invalid keychain layout: {details}")]
-    InvalidKeychainLayout {
-        /// Error details
-        details: String,
-    },
 
     /// The provided forwarder URL is invalid (it must be plain http to a loopback IP literal, with
     /// a path)

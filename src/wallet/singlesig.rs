@@ -121,9 +121,7 @@ impl SinglesigKeys {
             witness_version: keys.witness_version,
         }
     }
-}
 
-impl SinglesigKeys {
     /// Return a copy of these keys with a non-default keychain layout.
     ///
     /// `None` keeps rgb-lib's default for that setting. See [`SinglesigKeys::colored_coin_type`].
