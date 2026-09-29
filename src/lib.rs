@@ -367,7 +367,8 @@ use crate::{
         load_rgb_runtime, now, parse_address_str, setup_logger, str_to_xpub,
     },
     wallet::{
-        Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_BFA,
-        SCHEMA_ID_CFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA, WalletDescriptors,
+        Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS,
+        Outpoint, SCHEMA_ID_BFA, SCHEMA_ID_CFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA,
+        WalletDescriptors,
     },
 };
