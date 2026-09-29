@@ -71,6 +71,20 @@ impl SinglesigKeys {
         let network_kind = bitcoin_network.network_kind();
         let xpub_rgb = str_to_xpub(&self.account_xpub_colored, &network_kind)?;
         let xpub_btc = str_to_xpub(&self.account_xpub_vanilla, &network_kind)?;
+        // purpose and account index are the same for both sides, so they share an account
+        // exactly when they share a coin type: the account xPubs must then be the same key, and
+        // different keys otherwise. An xPub under the wrong coin type still receives, but PSBTs
+        // spending from it carry key origins the signer won't derive. Compare the key, not its
+        // encoding: str_to_xpub already set the network, and depth, parent fingerprint and child
+        // number play no part in derivation.
+        let same_coin = layout.colored_coin_type == layout.vanilla_coin_type;
+        let same_key = xpub_rgb.public_key == xpub_btc.public_key
+            && xpub_rgb.chain_code == xpub_btc.chain_code;
+        if same_coin != same_key {
+            return Err(Error::InvalidKeychainLayout {
+                details: s!("account xpubs are inconsistent with the configured coin types"),
+            });
+        }
         Ok(if let Some(mnemonic) = &self.mnemonic {
             let descs = get_descriptors(
                 bitcoin_network,
