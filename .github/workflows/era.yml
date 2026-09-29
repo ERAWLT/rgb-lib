@@ -12,8 +12,8 @@ name: ERA fork checks
 #   - the crate still builds with the exact feature set the ERA app uses
 #     (packages/era_rgb: no default features, esplora + vss) and with the
 #     upstream default (electrum) on top;
-#   - the dependency diet holds: no OpenSSL, aws-lc, Postgres or CLI crates
-#     on the app's mobile targets, every HTTP client goes through the one
+#   - the dependency diet holds: no OpenSSL, aws-lc, Postgres, CLI or HTTP/2
+#     crates on the app's mobile targets, every HTTP client goes through the one
 #     prebuilt TLS config, and that config works.
 #   - the proxy forwarder patch: with OnlineOptions::forwarder_url set, every
 #     RGB proxy and reject-list request goes to the loopback forwarder (unit
@@ -96,7 +96,9 @@ jobs:
       # mobile graphs are checked here without an NDK or Xcode
       - name: Dependency diet guard (app feature set, mobile targets)
         run: |
-          banned='^(openssl-sys|openssl-src|native-tls|aws-lc-rs|aws-lc-sys|sqlx-postgres|clap|sea-orm-cli) v'
+          # h2: reqwest is built HTTP/1.1-only (the ALPN in api::rest_client_builder offers
+          # http/1.1 alone, pinned by tests_rest_client_tls)
+          banned='^(openssl-sys|openssl-src|native-tls|aws-lc-rs|aws-lc-sys|sqlx-postgres|clap|sea-orm-cli|h2) v'
           status=0
           for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android aarch64-apple-ios; do
             # a failing cargo tree fails the step here instead of passing an
