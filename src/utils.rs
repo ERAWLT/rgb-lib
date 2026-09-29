@@ -1669,6 +1669,7 @@ mod tests_keychain_layout {
     use super::*;
     use crate::keys::generate_keys;
     use crate::wallet::SinglesigKeys;
+    use bdk_wallet::descriptor::ExtendedDescriptor;
 
     fn norm(desc: &str) -> String {
         desc.replace('h', "'")
@@ -1794,6 +1795,120 @@ mod tests_keychain_layout {
         let fp = &keys.master_fingerprint;
         assert!(norm(&descs.colored).contains(&format!("[{fp}/86'/827167'/0'/0]")));
         assert!(norm(&descs.vanilla).contains(&format!("[{fp}/86'/1'/0'/0]")));
+    }
+
+    fn inconsistent_xpubs(res: Result<(WalletDescriptors, bool), Error>) -> bool {
+        matches!(
+            res,
+            Err(Error::InvalidKeychainLayout { details })
+                if details == "account xpubs are inconsistent with the configured coin types"
+        )
+    }
+
+    #[test]
+    fn account_xpubs_must_match_the_coin_types() {
+        for net in [BitcoinNetwork::Mainnet, BitcoinNetwork::Signet] {
+            let keys = generate_keys(net, WitnessVersion::Taproot);
+            let (_, account_xpub, _) =
+                get_account_data_at_coin_type(&net, &keys.mnemonic, 0, WitnessVersion::Taproot)
+                    .unwrap();
+            let account_xpub = account_xpub.to_string();
+            for with_mnemonic in [false, true] {
+                let default_keys = if with_mnemonic {
+                    SinglesigKeys::from_keys(&keys, None)
+                } else {
+                    SinglesigKeys::from_keys_no_mnemonic(&keys, None)
+                };
+
+                // default layout: two coin types, two account xPubs
+                default_keys.build_descriptors(&net).unwrap();
+
+                // both sides under one account: one coin type, the same account xPub twice
+                let mut single = default_keys.clone().with_keychain_layout(single_account());
+                single.vanilla_keychain = Some(10);
+                single.account_xpub_colored = account_xpub.clone();
+                single.account_xpub_vanilla = account_xpub.clone();
+                single.build_descriptors(&net).unwrap();
+
+                // same xPub for both sides but the colored coin type left to its default: the
+                // colored descriptor would claim 827166'/827167' for a key at 0'
+                let mut forgot_colored_coin = single.clone();
+                forgot_colored_coin.keychain_layout.colored_coin_type = None;
+                assert!(inconsistent_xpubs(
+                    forgot_colored_coin.build_descriptors(&net)
+                ));
+
+                // off mainnet the vanilla default is 1', so the vanilla coin type is needed too
+                let mut forgot_vanilla_coin = single.clone();
+                forgot_vanilla_coin.keychain_layout.vanilla_coin_type = None;
+                let res = forgot_vanilla_coin.build_descriptors(&net);
+                if net == BitcoinNetwork::Mainnet {
+                    res.unwrap();
+                } else {
+                    assert!(inconsistent_xpubs(res));
+                }
+
+                // default coin types with the same xPub for both sides
+                let mut same_xpub = default_keys.clone();
+                same_xpub.account_xpub_colored = same_xpub.account_xpub_vanilla.clone();
+                assert!(inconsistent_xpubs(same_xpub.build_descriptors(&net)));
+
+                // one coin type, but the colored xPub is still the RGB account's
+                let mut other_xpub = single.clone();
+                other_xpub.account_xpub_colored = keys.account_xpub_colored.clone();
+                assert!(inconsistent_xpubs(other_xpub.build_descriptors(&net)));
+            }
+        }
+    }
+
+    #[test]
+    fn account_xpubs_compared_as_keys() {
+        let net = BitcoinNetwork::Signet;
+        let keys = generate_keys(net, WitnessVersion::Taproot);
+        let (_, account_xpub, _) =
+            get_account_data_at_coin_type(&net, &keys.mnemonic, 0, WitnessVersion::Taproot)
+                .unwrap();
+        let mut single = SinglesigKeys::from_keys_no_mnemonic(&keys, Some(10))
+            .with_keychain_layout(single_account());
+        single.account_xpub_colored = account_xpub.to_string();
+        single.account_xpub_vanilla = account_xpub.to_string();
+        let (descs, _) = single.build_descriptors(&net).unwrap();
+
+        // the same key encoded with mainnet version bytes (xpub) on one side
+        let mut mainnet_encoded = account_xpub;
+        mainnet_encoded.network = NetworkKind::Main;
+        assert!(mainnet_encoded.to_string().starts_with("xpub"));
+        let mut mixed = single.clone();
+        mixed.account_xpub_colored = mainnet_encoded.to_string();
+        assert_eq!(mixed.build_descriptors(&net).unwrap().0, descs);
+
+        // the same key with other metadata, as a host that only has the public key and chain
+        // code would build it: accepted, and it derives the same scripts
+        let mut relabelled = account_xpub;
+        relabelled.depth = 0;
+        relabelled.parent_fingerprint = Fingerprint::default();
+        relabelled.child_number = ChildNumber::from_normal_idx(0).unwrap();
+        let mut bare = single.clone();
+        bare.account_xpub_colored = relabelled.to_string();
+        let (bare_descs, _) = bare.build_descriptors(&net).unwrap();
+        let script_at = |desc: &str, index: u32| {
+            ExtendedDescriptor::from_str(desc)
+                .unwrap()
+                .at_derivation_index(index)
+                .unwrap()
+                .script_pubkey()
+        };
+        for index in [0, 1, 100] {
+            assert_eq!(
+                script_at(&bare_descs.colored, index),
+                script_at(&descs.colored, index)
+            );
+        }
+
+        // and it is still the same key when the coin types differ
+        bare.keychain_layout = KeychainLayoutOverrides::default();
+        bare.account_xpub_vanilla = account_xpub.to_string();
+        assert!(inconsistent_xpubs(bare.build_descriptors(&net)));
     }
 
     // Serialized shapes written before SinglesigKeys grouped the overrides into
