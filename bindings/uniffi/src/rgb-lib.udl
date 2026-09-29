@@ -74,7 +74,6 @@ interface RgbLibError {
   InvalidAssignment();
   InvalidAttachments(string details);
   InvalidBitcoinKeys();
-  InvalidKeychainLayout(string details);
   InvalidBitcoinNetwork(string network);
   InvalidBurnRecipient(u64 len);
   InvalidColoringInfo(string details);
@@ -91,6 +90,7 @@ interface RgbLibError {
   InvalidPsbtOperationStatus(string details);
   InvalidIndexer(string details);
   InvalidInvoice(string details);
+  InvalidKeychainLayout(string details);
   InvalidMnemonic(string details);
   InvalidMultisigThreshold(u8 required, u8 total);
   InvalidName(string details);
