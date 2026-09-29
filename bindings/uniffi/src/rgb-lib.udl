@@ -71,7 +71,6 @@ interface RgbLibError {
   InvalidAttachments(string details);
   InvalidBeforeBlock(string details);
   InvalidBitcoinKeys();
-  InvalidKeychainLayout(string details);
   InvalidForwarderUrl(string details);
   InvalidForwardTarget(string details);
   InvalidBitcoinNetwork(string network);
@@ -95,6 +94,7 @@ interface RgbLibError {
   InvalidFingerprint();
   InvalidIndexer(string details);
   InvalidInvoice(string details);
+  InvalidKeychainLayout(string details);
   InvalidLinkedContract(string contract_id, string details);
   InvalidMnemonic(string details);
   InvalidMultisigThreshold(u8 required, u8 total);
