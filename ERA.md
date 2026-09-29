@@ -101,6 +101,9 @@ Rules for the branch:
 | `f5d6522` | Pin the undecodable kind and the kinds' codes | To propose to UTEXO (with `7d07452`) |
 | `df04de0` | Stop promising in rustdoc that a refused completion writes nothing | To propose to UTEXO (with `c1feef6`) |
 | `d326033` | Build reqwest without HTTP/2 | Fork-only (a size choice for the app; UTEXO's other hosts may want HTTP/2) |
+| `1ed4436` | Order InvalidKeychainLayout and merge the SinglesigKeys impls | Review of #104, mirrored (PR branch `c23b140`) |
+| `2319444` | Group the keychain layout overrides into one struct | Review of #104, mirrored (PR branch `eba4d69`) |
+| `e230950` | Refuse account xpubs that contradict the configured coin types | Review of #104, mirrored (PR branch `c1a1ee8`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
@@ -110,7 +113,9 @@ Later commits that touch only this file are part of the series too. `3f0a555` to
 `690f041` and, after their verification, `1ee1caf` and `df04de0` are
 [§6](#6-completing-an-own-unrecorded-spend-cc-99); `ac6724d`, `7d07452`, after their review
 `5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
-[§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f).
+[§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f);
+`1ed4436` to `e230950` answer UTEXO's review of #104 and go with `6ce375e`
+([§1](#1-configurable-keychain-layout-6ce375e)).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -130,17 +135,26 @@ signer like that, rgb-lib cannot build the colored descriptor at all.
 
 ### What changes
 
-- `SinglesigKeys` (`src/wallet/singlesig.rs`) gets three optional fields next to
-  `vanilla_keychain`: `colored_keychain: Option<u8>`, `colored_coin_type: Option<u32>`,
-  `vanilla_coin_type: Option<u32>`. In JSON / C-FFI they are `coloredKeychain`,
-  `coloredCoinType`, `vanillaCoinType` with `camel_case`, and accept a number or a
-  numeric string like the existing fields. `SinglesigKeys::with_keychain_layout(...)`
-  sets them on keys built by `from_keys` / `from_keys_no_mnemonic`.
+- `SinglesigKeys` (`src/wallet/singlesig.rs`) gets a `keychain_layout:
+  KeychainLayoutOverrides` field next to `vanilla_keychain`, holding three optional
+  settings: `colored_keychain: Option<u8>`, `colored_coin_type: Option<u32>`,
+  `vanilla_coin_type: Option<u32>` (three loose fields until the review of #104,
+  `2319444`). The struct is `#[serde(flatten)]`ed, so in JSON / C-FFI the three stay
+  top-level keys next to `vanilla_keychain` (`coloredKeychain`, `coloredCoinType`,
+  `vanillaCoinType` with `camel_case`) and accept a number or a numeric string like the
+  existing fields. `SinglesigKeys::with_keychain_layout(KeychainLayoutOverrides)` sets
+  them on keys built by `from_keys` / `from_keys_no_mnemonic`. `vanilla_keychain` stays
+  a field of `SinglesigKeys`; in the UDL the struct is a dictionary of its own.
 - `KeychainLayout::resolve` (`src/utils.rs`) turns those options into concrete coin
   types and keychains for the wallet's network and validates them: a coin type must
   be a valid hardened index (`< 2^31`), and the colored and vanilla sides must not
   resolve to the same (coin type, keychain) pair, because one BDK keychain feeding
   both sides would make colored UTXOs spendable as vanilla ones.
+- `build_descriptors` requires the two account xpubs to be the same key exactly when the
+  two coin types are equal (`e230950`, from the review of #104): an xpub under a coin
+  type it was not derived at still receives, but its PSBTs carry origins the signer
+  will not derive. It compares public key and chain code, so an `xpub`/`tpub` of one key
+  and a key rebuilt with other depth or parent fingerprint count as the same key.
 - `Error::InvalidKeychainLayout { details }` reports a rejected layout (also added to
   the uniffi UDL).
 - `get_descriptors` / `get_descriptors_from_xpubs` build both descriptors from the
@@ -149,7 +163,9 @@ signer like that, rgb-lib cannot build the colored descriptor at all.
 - `wallet_manifest.json` stores `colored_keychain` / `colored_coin_type` /
   `vanilla_coin_type` **only when they differ from the default** (serde
   `skip_serializing_if`), so manifests of default-layout wallets stay byte-identical;
-  a layout that changes between `new` and `load` is a `WalletSettingMismatch`.
+  a layout that changes between `new` and `load` is a `WalletSettingMismatch`. The
+  manifest keeps these as its own flat snake_case fields rather than flattening
+  `KeychainLayoutOverrides`, which `camel_case` would rename.
 - New public `rgb_lib::utils::get_account_data_at_coin_type(network, mnemonic,
   coin_type, witness_version)`; `get_account_data` delegates to it. Mnemonic-based
   hosts use it to prepare keys for a custom layout.
@@ -180,11 +196,21 @@ vanilla  tr([fp/86'/0'/0'/10]xpub…/*)
 Keychains 9 and 10 stay clear of the receive/change chains (0/1) a regular Bitcoin
 wallet on the same account uses.
 
+From `2319444` the app passes the three through `keychain_layout: KeychainLayoutOverrides
+{ colored_keychain: Some(9), colored_coin_type: Some(0), vanilla_coin_type: Some(0) }`,
+with `vanilla_keychain: Some(10)` where it was. From `e230950` the one account xpub has to
+be passed as both (it always is): two different keys under one coin type are refused as
+`InvalidKeychainLayout`.
+
 ### Tests
 
-`cargo test --locked --lib --features esplora,vss -- tests_keychain_layout` (5 tests:
+`cargo test --locked --lib --features esplora,vss -- tests_keychain_layout` (9 tests:
 defaults per network, shared-keychain and non-hardenable rejections, the single-account
-layout from xpubs and from a mnemonic, unchanged default descriptors).
+layout from xpubs and from a mnemonic, unchanged default descriptors; since the review of
+#104 also the xpub/coin-type check in both directions, and `SinglesigKeys` JSON and
+manifests as `6ce375e` wrote them, read into the struct and written back byte for byte).
+`wallet::test::load::keychain_layout_roundtrip_success` loads a custom layout back from
+the manifest and refuses another.
 
 ## 2. CI
 
@@ -1928,8 +1954,9 @@ git push origin era/<name>                              # the branch only, never
   `WalletOnline::proxy_client`, `reject_list_client` or `check_proxy_endpoint`, and change the
   expected set in `era.yml` only for a line that is not a call site; do not widen the
   exclusion.
-- If UTEXO has merged the layout patch, drop `6ce375e` and check that their field
-  names and defaults match what the app sends.
+- If UTEXO has merged the layout patch, drop `6ce375e` and its review commits
+  `1ed4436` to `e230950`, and check that their field names and defaults match what the
+  app sends.
 - In the app: bump the rev in `packages/era_rgb/rust/Cargo.toml`, copy this
   repository's `Cargo.lock` over the app crate's and run `cargo update --workspace`
   there (the comment next to the dependency explains why). The copy drops the app's
@@ -1949,6 +1976,13 @@ branch `era/pr-configurable-keychain-layout`: `6ce375e` alone, cherry-picked ont
 `dev` at `ca5f6b7` (commit `c7202ee`). UTEXO had agreed to take it. We could not compile
 `dev` (the `*-s-bfa` mirrors in its `[patch.crates-io]` are private for us); the PR says
 so. Once it merges, drop `6ce375e` from the series when carrying it onto the next base.
+
+UTEXO reviewed it on 2026-09-29: fail fast when the account xpubs contradict the coin
+types, one struct instead of loose options, the UDL's error order and one `impl` block. The
+answer is `c23b140`, `eba4d69` and `c1a1ee8` on the PR branch (pushed the same day, no
+rewrite of `c7202ee`), mirrored here as `1ed4436`, `2319444` and `e230950`. Two deviations
+from their suggestion, each explained in its commit: the check compares keys (public key
+and chain code), not whole `Xpub`s, and `vanilla_keychain` stays outside the struct.
 
 ---
 
