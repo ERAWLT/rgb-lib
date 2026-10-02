@@ -236,6 +236,7 @@ jobs:
           wallet::backup::tests::
           wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
           wallet::test::scripted_chain:: wallet::test::unrecorded_spends::
+          wallet::test::get_colored_address::
           stock_store:: utils::tests::test_load_rgb_runtime_corrupt_stock
 
       - name: Migration crate with its CLI (the authoring binary still builds)

@@ -375,6 +375,31 @@ impl Wallet {
         Ok(address.to_string())
     }
 
+    /// Return a new Bitcoin address from the colored wallet.
+    ///
+    /// ERA fork: for a host that pays the wallet's RGB-ready UTXOs from another wallet of its
+    /// own, in a transaction it builds and broadcasts itself, instead of
+    /// [`create_utxos`](Wallet::create_utxos) spending the vanilla wallet. The index is
+    /// revealed and persisted, as [`get_address`](Wallet::get_address) does on the vanilla
+    /// keychain, so no two calls hand out the same address (with `reuse_addresses` off).
+    ///
+    /// A transaction paying this address is seen only by a `FullSync` or a `FullScan` of the
+    /// colored keychain: the fast sync every other call makes asks the indexer about the scripts
+    /// of pending witness receives and of the colored inputs of unconfirmed transactions, and
+    /// such a transaction has neither. After broadcasting it, call
+    /// [`sync`](crate::wallet::RgbWalletOpsOnline::sync) with `SyncKeychain::Colored` and
+    /// `SyncStrategy::FullSync`; `go_online` scans the keychain in full anyway.
+    pub fn get_colored_address(&mut self) -> Result<String, Error> {
+        info!(self.logger(), "Getting colored address...");
+        let address = self.get_new_address()?;
+        let txn = self.database().begin_transaction()?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        self.trigger_auto_backup();
+        info!(self.logger(), "Get colored address completed");
+        Ok(address.to_string())
+    }
+
     /// Rotate the pinned address for the given keychain.
     ///
     /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation

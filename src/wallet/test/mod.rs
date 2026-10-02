@@ -467,6 +467,8 @@ mod get_asset_balance;
 mod get_asset_metadata;
 #[cfg(feature = "electrum")]
 mod get_btc_balance;
+// ERA fork: Wallet::get_colored_address and the sync that sees a payment to it
+mod get_colored_address;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod get_fee_estimation;
 mod get_wallet_data;
