@@ -111,12 +111,12 @@ fn the_fast_sync_sees_a_payment_from_outside() {
 }
 
 /// A payment the indexer has in its mempool only is seen too, the envelope usable as soon as the
-/// TX is known (as `create_utxos_end` makes its own), and the fast sync follows the TX until it
-/// confirms although it spends nothing of the wallet.
+/// TX is known (as `create_utxos_end` makes its own), and from then on the address is asked about
+/// no more, confirmed or not: its confirmation reaches BDK with the next `go_online`.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[test]
 #[parallel]
-fn the_fast_sync_follows_a_payment_from_outside_to_its_confirmation() {
+fn the_fast_sync_stops_watching_an_address_once_paid() {
     let chain = ScriptedChain::start();
     let mut wallet = get_test_wallet(false, None);
     let online = wallet.go_online(online_options(&chain)).unwrap();
@@ -129,14 +129,18 @@ fn the_fast_sync_follows_a_payment_from_outside_to_its_confirmation() {
     assert!(lists_envelope(&mut wallet, online, &txid, false));
     let colored = wallet.get_btc_balance(None, true).unwrap().colored;
     assert_eq!((colored.settled, colored.future), (0, amount));
+    assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
 
-    // the address is used now; the TX is followed through its colored output
     chain.mine(1);
-    wallet.sync_colored_payments(online, vec![]).unwrap();
+    wallet.get_btc_balance(Some(online), false).unwrap();
+    assert_eq!(
+        wallet.get_btc_balance(None, true).unwrap().colored.settled,
+        0
+    );
+    wallet.go_offline();
+    let _online = wallet.go_online(online_options(&chain)).unwrap();
     let colored = wallet.get_btc_balance(None, true).unwrap().colored;
     assert_eq!((colored.settled, colored.future), (amount, amount));
-    // and once confirmed it is asked about no more
-    assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
     chain.assert_all_matched();
 }
 
@@ -161,13 +165,13 @@ fn the_fast_sync_asks_about_the_addresses_handed_out_only() {
     let txid = chain.fund(&address, UTXO_SATS as u64).to_string();
     chain.mine(1);
     assert!(lists_envelope(&mut wallet, online, &txid, true));
-    // paid and confirmed: asked about no more
+    // paid: asked about no more
     assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
     chain.assert_all_matched();
 }
 
 /// The watched addresses live in the process. After a restart a payment that comes later is
-/// seen once the host names the address, and followed from then on.
+/// seen once the host names the address, which is then asked about no more.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[test]
 #[parallel]
@@ -188,13 +192,7 @@ fn a_payment_awaited_across_a_restart_is_seen_once_the_host_names_it() {
         .sync_colored_payments(online, vec![address.clone()])
         .unwrap();
     assert!(lists_envelope(&mut wallet, online, &txid, false));
-    let colored = wallet.get_btc_balance(None, true).unwrap().colored;
-    assert_eq!(colored.settled, 0);
-    // watched now: the fast sync follows it to its confirmation
-    chain.mine(1);
-    wallet.get_btc_balance(Some(online), false).unwrap();
-    let colored = wallet.get_btc_balance(None, true).unwrap().colored;
-    assert_eq!(colored.settled, UTXO_SATS as u64);
+    assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
     chain.assert_all_matched();
 }
 
@@ -208,12 +206,48 @@ fn the_colored_payment_sync_refuses_another_address() {
     let online = wallet.go_online(online_options(&chain)).unwrap();
     let vanilla = wallet.get_address().unwrap();
     let other = get_test_wallet(false, None).get_colored_address().unwrap();
-    for address in [vanilla, other, s!("not an address")] {
+    // its own, but not handed out: in BDK's lookahead past the one handed out, where the next own
+    // reveal lands
+    wallet.get_colored_address().unwrap();
+    let ahead = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 3)
+        .address
+        .to_string();
+    for address in [vanilla, other, ahead, s!("not an address")] {
         chain.clear_requests();
         let result = wallet.sync_colored_payments(online, vec![address]);
         assert_matches!(result, Err(Error::InvalidAddress { .. }));
         assert!(chain.requests().is_empty());
     }
+}
+
+/// Under `reuse_addresses` the pinned colored address is rgb-lib's change as well: it is not
+/// watched, and none can be named.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[test]
+#[parallel]
+fn nothing_is_watched_with_reuse_addresses() {
+    let chain = ScriptedChain::start();
+    create_test_data_dir();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet = Wallet::new(
+        WalletData {
+            data_dir: get_test_data_dir_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+            supported_schemas: AssetSchema::VALUES.to_vec(),
+            reuse_addresses: true,
+        },
+        SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+    )
+    .unwrap();
+    let online = wallet.go_online(online_options(&chain)).unwrap();
+    let address = wallet.get_colored_address().unwrap();
+    assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
+    let result = wallet.sync_colored_payments(online, vec![address]);
+    assert_matches!(result, Err(Error::InvalidAddress { .. }));
 }
 
 /// `go_online` scans the colored keychain in full: a payment made while the wallet was closed is

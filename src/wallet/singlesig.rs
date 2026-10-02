@@ -396,16 +396,20 @@ impl Wallet {
     ///
     /// The wallet watches the address in this process: the fast sync every call that syncs
     /// makes, and [`sync_colored_payments`](Wallet::sync_colored_payments), ask the indexer about
-    /// it until a transaction pays it and that transaction confirms. Only the addresses handed
-    /// out here, never the change addresses rgb-lib reveals for its own transactions: asking
-    /// about one of those would teach BDK an own spend whose record was lost, and if that
-    /// transaction then left the mempool, BDK would keep it and every `go_online` would refuse
-    /// (`UnrecordedSpendUnseen`). After a restart, `go_online`'s full scan sees a payment made
-    /// meanwhile; for one still awaited, the host names the addresses.
+    /// it until a transaction pays it, and never after. Only an address handed out here and not
+    /// yet paid: asking about a change address rgb-lib revealed for its own transaction, or about
+    /// a paid one whose UTXO the wallet may have spent, would teach BDK an own spend whose record
+    /// was lost, and if that transaction then left the mempool, BDK would keep it and every
+    /// `go_online` would refuse (`UnrecordedSpendUnseen`). Under `reuse_addresses` the pinned
+    /// address is rgb-lib's change too, and is not watched. After a restart, `go_online`'s full
+    /// scan sees a payment made meanwhile; for one still awaited, the host names the addresses.
     pub fn get_colored_address(&mut self) -> Result<String, Error> {
         info!(self.logger(), "Getting colored address...");
         let address = self.get_new_address()?;
-        self.watched_colored.insert(address.script_pubkey());
+        // the pinned index under reuse_addresses is also rgb-lib's own change: never watched
+        if !self.wallet_data().reuse_addresses {
+            self.watched_colored.insert(address.script_pubkey());
+        }
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
@@ -416,11 +420,12 @@ impl Wallet {
 
     /// Record the UTXOs payments from outside the wallet put on its colored addresses: ask the
     /// indexer about every colored script the wallet watches (see
-    /// [`get_colored_address`](Wallet::get_colored_address)) that is unpaid or paid by an
-    /// unconfirmed transaction, after adding `addresses` to them. Each of `addresses` must be a
-    /// colored address of this wallet (revealed or within the lookahead), otherwise
-    /// [`Error::InvalidAddress`] and nothing is synced; a host names the ones it still waits for
-    /// after a restart. Nothing watched: no request at all.
+    /// [`get_colored_address`](Wallet::get_colored_address)) and no TX has paid yet, after adding
+    /// `addresses` to them. Each of `addresses` must be a colored address of this wallet that it
+    /// revealed (handed out), not one within the lookahead, which the next own reveal would take;
+    /// and under `reuse_addresses` none can be named. Otherwise [`Error::InvalidAddress`] and
+    /// nothing is synced. A host names the ones it still waits for after a restart. Nothing
+    /// watched and unpaid: no request at all.
     ///
     /// ERA fork. Not the public [`sync`](crate::wallet::RgbWalletOpsOnline::sync), which would
     /// see the payment too: its orphan reconcile marks spent every UTXO the indexer says is
@@ -436,14 +441,27 @@ impl Wallet {
     ) -> Result<(), Error> {
         info!(self.logger(), "Syncing colored payments...");
         self.check_online(online)?;
+        if !addresses.is_empty() && self.wallet_data().reuse_addresses {
+            return Err(Error::InvalidAddress {
+                details: s!("colored addresses are not watched with reuse_addresses"),
+            });
+        }
+        let last_revealed = self
+            .bdk_wallet()
+            .spk_index()
+            .last_revealed_index(KeychainKind::External);
         let mut named = Vec::with_capacity(addresses.len());
         for address in &addresses {
             let spk = self.get_script_pubkey(address)?;
             match self.bdk_wallet().spk_index().index_of_spk(spk.clone()) {
-                Some((KeychainKind::External, _)) => named.push(spk),
+                Some((KeychainKind::External, index))
+                    if last_revealed.is_some_and(|last| *index <= last) =>
+                {
+                    named.push(spk)
+                }
                 _ => {
                     return Err(Error::InvalidAddress {
-                        details: s!("not a colored address of this wallet"),
+                        details: s!("not a colored address this wallet handed out"),
                     });
                 }
             }

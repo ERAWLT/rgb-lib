@@ -610,46 +610,29 @@ pub trait WalletCore {
         spks
     }
 
-    /// ERA fork: the colored scripts this wallet watches for a payment from outside it, while
-    /// one still has to come or confirm. None by default; the singlesig wallet watches the
-    /// addresses `get_colored_address` handed out and those the host asked
-    /// `sync_colored_payments` about, in this process.
+    /// ERA fork: the colored scripts this wallet watches for a payment from outside it, until
+    /// one comes. None by default; the singlesig wallet watches the addresses
+    /// `get_colored_address` handed out and those the host asked `sync_colored_payments` about,
+    /// in this process.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn watched_colored_spks(&self) -> Vec<ScriptBuf> {
         Vec::new()
     }
 
-    /// ERA fork: of `watched`, the scripts no TX has used yet and those an unconfirmed TX pays:
-    /// what a sync still has to ask about.
+    /// ERA fork: of `watched`, the scripts no TX has paid yet, which is all a sync asks about.
+    /// A paid one is never asked about again, confirmed or not: the indexer answers a script with
+    /// the TXs spending from it too, and once its UTXO is the wallet's an own spend of it (one
+    /// whose record was lost among them) would reach BDK that way.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn colored_spks_still_watched(&self, watched: &HashSet<ScriptBuf>) -> Vec<ScriptBuf> {
-        if watched.is_empty() {
-            return Vec::new();
-        }
-        let unconfirmed: HashSet<ScriptBuf> = self
-            .bdk_wallet()
-            .transactions()
-            .filter(|tx| matches!(tx.chain_position, ChainPosition::Unconfirmed { .. }))
-            .flat_map(|tx| {
-                tx.tx_node
-                    .tx
-                    .output
-                    .iter()
-                    .map(|o| o.script_pubkey.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
         let spk_index = self.bdk_wallet().spk_index();
         watched
             .iter()
-            .filter(|spk| {
-                let used = match spk_index.index_of_spk((*spk).clone()) {
-                    Some((KeychainKind::External, index)) => {
-                        spk_index.is_used(KeychainKind::External, *index)
-                    }
-                    _ => true,
-                };
-                !used || unconfirmed.contains(*spk)
+            .filter(|spk| match spk_index.index_of_spk((*spk).clone()) {
+                Some((KeychainKind::External, index)) => {
+                    !spk_index.is_used(KeychainKind::External, *index)
+                }
+                _ => false,
             })
             .cloned()
             .collect()

@@ -2324,6 +2324,44 @@ fn a_lost_spend_that_leaves_the_mempool_lets_go_online_through() {
     assert!(party.wallet.completed_spends().is_empty());
 }
 
+// ERA fork (T1.1b, the third review's probe): an envelope paid from outside, still unconfirmed,
+// carries an asset and is spent by a donation whose answer is lost. The indexer answers a script
+// with the TXs spending from it too, so had the wallet kept watching the paid address until it
+// confirmed, the next sync would have taught BDK the lost spend, and once it left the mempool
+// every go_online would refuse. A paid address is watched no more: go_online goes through.
+#[test]
+#[parallel]
+fn a_lost_spend_of_an_envelope_paid_from_outside_lets_go_online_through() {
+    let chain = ScriptedChain::start();
+    let mut wallet = get_test_wallet(true, None);
+    let online = wallet.go_online(online_options(&chain)).unwrap();
+    chain.fund(&wallet.get_address().unwrap(), FUNDING);
+    chain.mine(1);
+    let address = wallet.get_colored_address().unwrap();
+    let funding = chain.fund(&address, UTXO_SATS as u64).to_string();
+    wallet.sync_colored_payments(online, vec![]).unwrap();
+    let asset_id = issue(&wallet, vec![AMOUNT]);
+    let mut party = Issuer {
+        wallet,
+        online,
+        asset_id,
+    };
+    let (_idx, txid) = donation_answer_lost(&chain, &mut party);
+    assert!(!chain.is_confirmed(&funding));
+
+    party
+        .wallet
+        .list_unspents(Some(party.online), false, false)
+        .unwrap();
+    let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
+    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_none());
+
+    chain.evict(&txid);
+    chain.mine(1);
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+}
+
 // ERA fork (T1.1b, the review's probe): why the host must not use the public sync for that. Its
 // orphan reconcile marks the donation's inputs spent with no transition, so the next go_online
 // finds no divergence and completes nothing: the donation stays Initiated and its transition
