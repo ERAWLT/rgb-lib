@@ -598,16 +598,46 @@ pub trait WalletCore {
             .filter(|tx| matches!(tx.chain_position, ChainPosition::Unconfirmed { .. }))
         {
             // first input is enough for the indexer's to return the TX info
+            let mut followed = false;
             for input in tx.tx_node.tx.input.iter() {
                 if let Some(((kc, _), txout)) = spk_index.txout(input.previous_output)
                     && kc == KeychainKind::External
                 {
                     spks.insert(txout.script_pubkey.clone());
+                    followed = true;
                     break;
                 }
             }
+            // ERA fork: a TX that pays the colored keychain and spends none of it (a payment from
+            // outside the wallet to an address `get_colored_address` handed out) is followed
+            // through its first colored output, until it confirms
+            if !followed
+                && let Some(output) = tx.tx_node.tx.output.iter().find(|o| {
+                    matches!(
+                        spk_index.index_of_spk(o.script_pubkey.clone()),
+                        Some((KeychainKind::External, _))
+                    )
+                })
+            {
+                spks.insert(output.script_pubkey.clone());
+            }
         }
         spks
+    }
+
+    /// ERA fork: the most recently revealed colored scripts that no TX has used yet, at most
+    /// `COLORED_SYNC_RECENT_UNUSED`: the addresses `get_colored_address` handed out and not yet
+    /// paid, for every fast sync to see a payment from outside the wallet, as the vanilla tail
+    /// (`fast_sync_vanilla_spks`) sees one to a vanilla address.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn recent_unused_colored_spks(&self) -> Vec<ScriptBuf> {
+        self.bdk_wallet()
+            .spk_index()
+            .unused_keychain_spks(KeychainKind::External)
+            .rev()
+            .take(COLORED_SYNC_RECENT_UNUSED)
+            .map(|(_, spk)| spk)
+            .collect()
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -648,6 +678,8 @@ pub trait WalletCore {
                     SyncKeychain::Colored => {
                         spks.extend(self.fast_sync_colored_spks(txn)?);
                         spks.extend(self.unconfirmed_colored_spks());
+                        // ERA fork: payments from outside to the addresses handed out
+                        spks.extend(self.recent_unused_colored_spks());
                     }
                     SyncKeychain::Vanilla { lookback } => {
                         spks.extend(self.fast_sync_vanilla_spks(lookback));

@@ -2303,8 +2303,39 @@ fn the_colored_payment_sync_leaves_a_lost_spend_to_go_online() {
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (idx, txid) = donation_answer_lost(&chain, &mut party);
 
-    party.wallet.sync_colored_payments(party.online).unwrap();
+    party
+        .wallet
+        .sync_colored_payments(party.online, true)
+        .unwrap();
     // the sync did meet the spend
+    let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
+    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_some());
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+    assert!(is_signed(&stash_witness(&party, &txid)));
+}
+
+// ERA fork (T1.1b): the colored fast sync asks about the most recent unused colored scripts, the
+// donation's change address among them, so the first syncing call after S1 meets its TX (here a
+// list_unspents with a sync, as in every *_begin); it only records, and go_online still completes
+// the donation
+#[test]
+#[parallel]
+fn the_fast_sync_leaves_a_lost_spend_to_go_online() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+
+    party
+        .wallet
+        .list_unspents(Some(party.online), false, false)
+        .unwrap();
     let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
     assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_some());
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
