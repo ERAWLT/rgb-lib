@@ -2292,3 +2292,54 @@ fn a_bundle_the_index_does_not_know_is_consumed_again() {
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
     spend_the_change(&chain, &mut party, AMOUNT_SMALL);
 }
+
+// ERA fork (T1.1b): sync_colored_payments meets a donation whose answer was lost (its change
+// address is revealed and unused) and only records what it finds, so the next go_online still
+// sees the divergence and completes the donation, as in W1
+#[test]
+#[parallel]
+fn the_colored_payment_sync_leaves_a_lost_spend_to_go_online() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+
+    party.wallet.sync_colored_payments(party.online).unwrap();
+    // the sync did meet the spend
+    let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
+    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_some());
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+    assert!(is_signed(&stash_witness(&party, &txid)));
+}
+
+// ERA fork (T1.1b, the review's probe): why the host must not use the public sync for that. Its
+// orphan reconcile marks the donation's inputs spent with no transition, so the next go_online
+// finds no divergence and completes nothing: the donation stays Initiated and its transition
+// never reaches the stash
+#[test]
+#[parallel]
+fn the_public_sync_after_s1_preempts_the_completion() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+    party
+        .wallet
+        .sync(
+            party.online,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FullSync,
+            },
+        )
+        .unwrap();
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert!(party.wallet.completed_spends().is_empty());
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    assert!(stash_witness(&party, &txid).is_none());
+}

@@ -383,12 +383,11 @@ impl Wallet {
     /// revealed and persisted, as [`get_address`](Wallet::get_address) does on the vanilla
     /// keychain, so no two calls hand out the same address (with `reuse_addresses` off).
     ///
-    /// A transaction paying this address is seen only by a `FullSync` or a `FullScan` of the
-    /// colored keychain: the fast sync every other call makes asks the indexer about the scripts
-    /// of pending witness receives and of the colored inputs of unconfirmed transactions, and
-    /// such a transaction has neither. After broadcasting it, call
-    /// [`sync`](crate::wallet::RgbWalletOpsOnline::sync) with `SyncKeychain::Colored` and
-    /// `SyncStrategy::FullSync`; `go_online` scans the keychain in full anyway.
+    /// The fast sync every other call makes does not see a transaction paying this address: it
+    /// asks the indexer about the scripts of pending witness receives and of the colored inputs
+    /// of unconfirmed transactions, and such a transaction has neither. After broadcasting it,
+    /// call [`sync_colored_payments`](Wallet::sync_colored_payments); `go_online`'s full scan
+    /// sees it too.
     pub fn get_colored_address(&mut self) -> Result<String, Error> {
         info!(self.logger(), "Getting colored address...");
         let address = self.get_new_address()?;
@@ -398,6 +397,28 @@ impl Wallet {
         self.trigger_auto_backup();
         info!(self.logger(), "Get colored address completed");
         Ok(address.to_string())
+    }
+
+    /// Ask the indexer about every colored address revealed and still unused, and record the
+    /// UTXOs a payment from outside the wallet put there (see
+    /// [`get_colored_address`](Wallet::get_colored_address)).
+    ///
+    /// ERA fork. Not the public [`sync`](crate::wallet::RgbWalletOpsOnline::sync) with a
+    /// `FullSync`, which would see the payment too: its orphan reconcile marks spent every UTXO
+    /// the indexer says is spent, including the inputs of this wallet's own spend whose record
+    /// was lost (a broadcast whose answer did not come back), and then `go_online` finds no
+    /// divergence and never completes that spend (`OnlineOptions::complete_unrecorded_spends`):
+    /// its transition never reaches the stash. This call only records; such a spend stays for
+    /// `go_online` to complete, exactly as its own full scan leaves it.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn sync_colored_payments(&mut self, online: Online) -> Result<(), Error> {
+        info!(self.logger(), "Syncing colored payments...");
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        self.sync_unused_colored_spks(&txn)?;
+        txn.commit()?;
+        info!(self.logger(), "Sync colored payments completed");
+        Ok(())
     }
 
     /// Rotate the pinned address for the given keychain.

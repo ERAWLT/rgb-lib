@@ -675,6 +675,38 @@ pub trait WalletCore {
         Ok(())
     }
 
+    /// ERA fork: ask the indexer about the colored keychain's revealed and unused scripts, and
+    /// record the colored UTXOs it reports there (`Wallet::sync_colored_payments`). Records only:
+    /// never marks a row spent, as the public `sync`'s orphan reconcile does.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn sync_unused_colored_spks(&mut self, txn: &DbTxn) -> Result<(), Error> {
+        let spks: Vec<ScriptBuf> = self
+            .bdk_wallet()
+            .spk_index()
+            .unused_keychain_spks(KeychainKind::External)
+            .map(|(_, spk)| spk)
+            .collect();
+        debug!(
+            self.logger(),
+            "Syncing {} unused colored scripts...",
+            spks.len()
+        );
+        let request = SyncRequest::builder()
+            .chain_tip(self.bdk_wallet().latest_checkpoint())
+            .spks(spks);
+        let update: Update = self.indexer().sync(request)?.into();
+        let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
+        bdk_wallet
+            .apply_update(update)
+            .map_err(|e| Error::FailedBdkSync {
+                details: e.to_string(),
+            })?;
+        bdk_wallet.persist(bdk_db)?;
+        self.update_db_colored_txos_from_bdk(txn, false)?;
+        debug!(self.logger(), "Synced");
+        Ok(())
+    }
+
     /// Mark any rgb-lib `Txo` row currently held as `exists && !spent && !pending_witness`
     /// whose outpoint is not in BDK's `list_unspent` after sync.
     ///
