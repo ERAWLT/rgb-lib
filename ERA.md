@@ -107,6 +107,7 @@ Rules for the branch:
 | `ebecd8c` | Hand out a colored address for a payment from outside | To propose to UTEXO (any host funding envelopes from its own wallet) |
 | `0ca2fc9` | Sync colored payments without the orphan reconcile | To propose to UTEXO (with `ebecd8c`) |
 | `2310cc6` | Let the colored fast sync see a payment from outside the wallet | To propose to UTEXO (with `ebecd8c`) |
+| `1fb40da` | Watch only the colored addresses handed out, not every unused one | To propose to UTEXO (with `ebecd8c`; replaces the tail of `2310cc6`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
@@ -118,7 +119,7 @@ Later commits that touch only this file are part of the series too. `3f0a555` to
 `5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
 [§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f);
 `1ed4436` to `e230950` answer UTEXO's review of #104 and go with `6ce375e`
-([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9` and `2310cc6` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6).
+([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9`, `2310cc6` and its review fix `1fb40da` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -1400,7 +1401,7 @@ number at merge under the bridge's merge rule (`3e48ae71`).
 - The bridge never calls rgb-lib's public `sync`: its orphan reconcile would mark the inputs
   spent without the transition or the status, and the completion would never see them. The guard
   is the bridge's (`the_bridge_never_calls_rgb_libs_public_sync` in `era_rgb`, since API 20: until
-  then the rule had none); the colored payments of [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6)
+  then the rule had none); the colored payments of [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da)
   go through `sync_colored_payments`, which only records.
 - For the app (T1.3, design rev. 6.1, accepted): R5, the offline tail of opening a wallet, never
   cancels a pending Drain whose PSBT was handed out to the device (the app's keeper holds it as
@@ -1883,14 +1884,16 @@ there). Then:
   opens a wallet.
 - `WalletManifest::write` renames a temporary file into place but syncs neither (upstream).
 
-## 8. A colored address for a payment from outside (`ebecd8c`, `0ca2fc9`, `2310cc6`)
+## 8. A colored address for a payment from outside (`ebecd8c`, `0ca2fc9`, `2310cc6`, `1fb40da`)
 
 The app funds a wallet's RGB-ready UTXOs ("envelopes") from the user's ordinary Bitcoin
 wallet in one transaction, signed on the device like any other send, instead of first paying
 the vanilla keychain and then signing `create_utxos` (two device approvals). That transaction
 pays colored addresses, and upstream has no public way to get one: `get_new_address` is a
 method of the crate-private `WalletOffline`, and `Wallet::get_address` reveals on the vanilla
-keychain only. Nor did upstream's own syncs see such a payment (below).
+keychain only. Nor did upstream's own syncs see such a payment: every sync it makes on the
+colored keychain is a fast one, which asks about pending witness scripts and the colored inputs
+of unconfirmed transactions, and only `go_online`'s consistency check scans it in full.
 
 ### What changes
 
@@ -1898,83 +1901,86 @@ keychain only. Nor did upstream's own syncs see such a payment (below).
   then the backup bookkeeping `get_address` does (`update_backup_info`, `trigger_auto_backup`).
   The index is revealed and persisted, so no address is handed out twice, the reveal survives a
   reload, and under `reuse_addresses` it returns the pinned index, as every other reveal does.
-- **The colored fast sync** (`sync_bdk_and_db_txos`, `FastSync` + `Colored`, `2310cc6`) asks,
-  besides upstream's pending witness scripts and colored inputs of unconfirmed transactions:
-  - the `COLORED_SYNC_RECENT_UNUSED` (20) most recently revealed colored scripts that no
-    transaction has used (`recent_unused_colored_spks`): the addresses handed out and not yet
-    paid. The vanilla fast sync does the same for a payment to `get_address`, with a tail of the
-    vanilla keychain;
-  - for an unconfirmed transaction that pays the colored keychain and spends none of it, its
-    first colored output (`unconfirmed_colored_spks`), so that it is followed until it confirms
-    (upstream follows only those with a colored input; a payment from outside stayed `future`
-    in `get_btc_balance` until the next `go_online`).
+- **The wallet watches the addresses it handed out** (`Wallet::watched_colored`, singlesig, in
+  memory, `1fb40da`): `get_colored_address` adds its script, and so does
+  `sync_colored_payments` for each address the host names. A watched script is asked about while
+  no transaction has used it, or while an unconfirmed transaction pays it
+  (`colored_spks_still_watched`); then it drops out of every request.
+- **The colored fast sync** adds the watched scripts to upstream's set (`watched_colored_spks`,
+  a `WalletCore` method, empty for every wallet but the singlesig one). So every call that syncs
+  (the `*_begin` calls, `list_unspents` and `get_btc_balance` with a sync, `refresh` while it
+  waits for confirmations) records a payment to a handed-out address and follows it to
+  `settled`. `unconfirmed_colored_spks` is upstream's.
+- `Wallet::sync_colored_payments(online, addresses)` (singlesig): adds `addresses` to the watched
+  set (each must be on the colored keychain, revealed or within BDK's lookahead, otherwise
+  `InvalidAddress` and nothing is synced), then asks about every watched script in its own
+  transaction, recording only (`sync_colored_spks`). Nothing watched: no request. For a host
+  whose `refresh` nothing waits for (upstream's `refresh` syncs only inside its wait for
+  confirmations), and for the payment it still waits for after a restart.
+- No new `SyncStrategy`, no registered script, nothing persisted.
 
-  Every call that syncs makes this sync: the `*_begin` calls, `list_unspents` and
-  `get_btc_balance` with a sync, and `refresh` while it waits for confirmations. Cost: unused
-  scripts only, at most 20, none once the payments are seen and confirmed.
-- `Wallet::sync_colored_payments(online, every_unused)` (singlesig, `0ca2fc9`, flag in `2310cc6`),
-  in its own transaction, recording only: `false` is the colored fast sync above, for a host that
-  waits for a payment and for whose `refresh` nothing waits (upstream's `refresh` syncs only inside
-  its wait for confirmations); `true` asks about every revealed and unused colored script
-  (`unused_keychain_spks(External)`), however old.
-- No new `SyncStrategy` and no registered script.
+### Why the addresses handed out, and nothing wider
 
-### Why not the public `sync`, nor a pending witness script
+`2310cc6` asked about the 20 most recent unused colored scripts instead, and the review of it
+found the hole: those include the change address of this wallet's own spend whose record was
+lost (S1 of [§6](#6-completing-an-own-unrecorded-spend-cc-99)), revealed by its `send_begin` and
+unused. The next syncing call taught BDK that spend's transaction. If the transaction then left
+the mempool, BDK kept it (the requests carry no expected txids, so nothing tells it of an
+eviction), and every `go_online` found a divergence the indexer could not explain and refused
+with `UnrecordedSpendUnseen`, where before it went through and the host re-sent the donation.
+`sync_colored_payments(.., true)` of `2310cc6` asked about every unused script and had the same
+hole. A handed-out address is never one of rgb-lib's own reveals, so no watched script can lead
+BDK to an own spend.
 
-**Not the public `sync`** (`ebecd8c` said to use it with a `FullSync`; `0ca2fc9` replaced that).
-`sync_impl` follows the colored sync with `reconcile_orphaned_colored_txos`, which marks spent
-every database UTXO that BDK no longer lists as unspent. After S1 of
-[§6](#6-completing-an-own-unrecorded-spend-cc-99) the inputs of this wallet's own spend are
-exactly that: the sync meets its transaction (through the change address, revealed and unused),
-the reconcile marks the inputs spent with no transition and no status, and the next `go_online`
-finds no divergence and completes nothing, so the transition never reaches the stash. The fast
-sync and `sync_colored_payments` only record, which is what `go_online`'s own full scan does
-before its check, so the completion still runs. Inside the session the wallet then holds a spend
-that BDK knows and the database does not, until that `go_online`: the spend's inputs stay out of
-every allocation (their transfer is `Initiated`), and nothing is lost.
+**Not the public `sync`** either (`ebecd8c` said to use it with a `FullSync`; `0ca2fc9`
+replaced that): `sync_impl` follows the colored sync with `reconcile_orphaned_colored_txos`,
+which marks spent every database UTXO that BDK no longer lists as unspent, the inputs of an own
+spend BDK has learnt among them, and then `go_online` finds no divergence and completes nothing,
+so the transition never reaches the stash. The watched sync only records.
 
-Registering the address as a pending witness script, the other way to make the fast sync look,
-is wrong too: `update_db_colored_txos_from_bdk` marks a UTXO landing on such a script
+**Nor a pending witness script:** `update_db_colored_txos_from_bdk` marks a UTXO landing on one
 `pending_witness`, which takes it out of `get_available_allocations` until a witness transfer
 settles on it, and none ever will.
 
 ### What the host decides
 
-The envelope is usable as soon as the indexer knows the transaction, confirmed or not, as an
-envelope `create_utxos_end` made is (`record_broadcast` puts that one into BDK unconfirmed). A
-payment replaced or dropped before it confirms takes with it any blind invoice issued on the
-envelope; that is upstream's property for its own envelopes too, and the host decides when to
-count a payment's envelopes as ready. A payment replaced by another to the same addresses
-leaves the first one's rows in the database, which the next `go_online` refuses as a divergence
-with no spender: not solved here (the app's CC-115).
-
-The fast sync's 20 and `go_online`'s stop gap (`INDEXER_STOP_GAP`, also 20) bound what is seen
-without `every_unused`: a payment to an address with more than 20 unused ones revealed after it
-(abandoned attempts, dry runs) is found by `sync_colored_payments(.., true)`, and by a full scan
-only within the gap. The host hands addresses out only after its own backup, and reuses an
-address handed out and never paid rather than revealing a new one.
+- The envelope is usable as soon as the indexer knows the transaction, confirmed or not, as an
+  envelope `create_utxos_end` made is (`record_broadcast` puts that one into BDK unconfirmed). A
+  payment replaced or dropped before it confirms takes with it any blind invoice issued on the
+  envelope; that is upstream's property for its own envelopes too, and the host decides when to
+  count a payment's envelopes as ready. A payment replaced by another to the same addresses
+  leaves the first one's rows in the database, which the next `go_online` refuses as a
+  divergence with no spender: not solved here (the app's CC-115).
+- The watched set lives in the process. A payment made while the wallet was closed is seen by
+  `go_online`'s full scan, within its stop gap (`INDEXER_STOP_GAP`, 20 unused scripts); one the
+  host still waits for after a restart, it names to `sync_colored_payments`. The host hands
+  addresses out only after its own backup, and reuses an address handed out and never paid
+  rather than revealing a new one.
 
 ### Tests
 
 `src/wallet/test/get_colored_address.rs`, on the scripted chain (in `era.yml`): successive and
-persisted indexes on the colored keychain, a backup owed; the fast sync seeing a payment from
-outside, after which a blind invoice can be issued on it; following one from the mempool to
-`settled`; asking about exactly 20 scripts when more are unused, leaving an older payment to
-`every_unused`; `go_online` seeing one made while the wallet was offline. In
-`src/wallet/test/unrecorded_spends.rs`, after S1: `the_fast_sync_leaves_a_lost_spend_to_go_online`
-and `the_colored_payment_sync_leaves_a_lost_spend_to_go_online` (each meets the donation's
-transaction, `go_online` still completes it) and `the_public_sync_after_s1_preempts_the_completion`
-(why not the public sync).
+persisted indexes on the colored keychain, a backup owed; the fast sync seeing a payment to a
+handed-out address, after which a blind invoice can be issued on it; following one from the
+mempool to `settled`; asking about the handed-out address and not about a script rgb-lib
+revealed itself, and about neither once paid and confirmed; a payment awaited across a restart
+seen once the host names it, and followed from then on; another wallet's address, a vanilla one
+and a non-address refused with no request; `go_online` seeing one made while the wallet was
+offline. In `src/wallet/test/unrecorded_spends.rs`, after S1:
+`a_lost_spend_that_leaves_the_mempool_lets_go_online_through` (with a payment synced meanwhile,
+BDK never learns the lost spend, and `go_online` goes through once it has left every mempool)
+and `the_public_sync_after_s1_preempts_the_completion` (why not the public sync).
 
 ### Carrying it
 
-`get_colored_address` sits next to `get_address` in `singlesig.rs`; `sync_colored_payments` and
-the two fast-sync additions use `check_online`, the indexer's `sync`, BDK's `unused_keychain_spks`
-and `index_of_spk`, `sync_wallet` and `update_db_colored_txos_from_bdk`. All are on the `-bfa`
-tags as well; the tests use the scripted chain (`f82b1c1`). If upstream drops the orphan
-reconcile from `sync`, the `the_public_sync_after_s1_preempts_the_completion` expectation fails.
-If upstream changes the fast sync's own set, the request count in
-`the_fast_sync_asks_about_the_most_recent_unused_addresses_only` says so.
+`get_colored_address` sits next to `get_address` in `singlesig.rs`, the watched set on the
+singlesig `Wallet`; `sync_colored_payments` uses `check_online`, `get_script_pubkey`, BDK's
+`index_of_spk` and `is_used`, the indexer's `sync` and `update_db_colored_txos_from_bdk`. All are
+on the `-bfa` tags as well; the tests use the scripted chain (`f82b1c1`). If upstream drops the
+orphan reconcile from `sync`, the `the_public_sync_after_s1_preempts_the_completion` expectation
+fails; if its fast sync starts asking about unused colored scripts on its own, the request count
+in `the_fast_sync_asks_about_the_addresses_handed_out_only` says so, and the eviction case of
+`a_lost_spend_that_leaves_the_mempool_lets_go_online_through` is the one to check.
 
 ## Carrying the series onto a new UTEXO tag
 
