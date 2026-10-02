@@ -159,6 +159,11 @@ impl SinglesigKeys {
 pub struct Wallet {
     pub(crate) internals: WalletInternals,
     pub(crate) keys: SinglesigKeys,
+    /// ERA fork: the colored scripts this wallet watches for a payment from outside it, in this
+    /// process (see [`get_colored_address`](Wallet::get_colored_address)). Not persisted:
+    /// `go_online`'s full scan sees a payment made meanwhile, and the host names the addresses
+    /// it still waits for (`sync_colored_payments`).
+    pub(crate) watched_colored: HashSet<ScriptBuf>,
 }
 
 impl WalletCore for Wallet {
@@ -168,6 +173,11 @@ impl WalletCore for Wallet {
 
     fn internals_mut(&mut self) -> &mut WalletInternals {
         &mut self.internals
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn watched_colored_spks(&self) -> Vec<ScriptBuf> {
+        self.colored_spks_still_watched(&self.watched_colored)
     }
 }
 
@@ -293,6 +303,7 @@ impl Wallet {
                 auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
+            watched_colored: HashSet::new(),
         })
     }
 
@@ -383,14 +394,18 @@ impl Wallet {
     /// revealed and persisted, as [`get_address`](Wallet::get_address) does on the vanilla
     /// keychain, so no two calls hand out the same address (with `reuse_addresses` off).
     ///
-    /// A transaction paying this address is seen by the fast sync every call that syncs makes
-    /// (it asks about the most recently revealed and still unused colored scripts, and follows
-    /// the transaction until it confirms), by
-    /// [`sync_colored_payments`](Wallet::sync_colored_payments), which a host can call while it
-    /// waits for one, and by `go_online`'s full scan.
+    /// The wallet watches the address in this process: the fast sync every call that syncs
+    /// makes, and [`sync_colored_payments`](Wallet::sync_colored_payments), ask the indexer about
+    /// it until a transaction pays it and that transaction confirms. Only the addresses handed
+    /// out here, never the change addresses rgb-lib reveals for its own transactions: asking
+    /// about one of those would teach BDK an own spend whose record was lost, and if that
+    /// transaction then left the mempool, BDK would keep it and every `go_online` would refuse
+    /// (`UnrecordedSpendUnseen`). After a restart, `go_online`'s full scan sees a payment made
+    /// meanwhile; for one still awaited, the host names the addresses.
     pub fn get_colored_address(&mut self) -> Result<String, Error> {
         info!(self.logger(), "Getting colored address...");
         let address = self.get_new_address()?;
+        self.watched_colored.insert(address.script_pubkey());
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
@@ -399,39 +414,51 @@ impl Wallet {
         Ok(address.to_string())
     }
 
-    /// Record the UTXOs payments from outside the wallet put on its colored addresses (see
-    /// [`get_colored_address`](Wallet::get_colored_address)): the colored fast sync every call
-    /// that syncs makes, or, with `every_unused`, a sync of every colored script revealed and
-    /// still unused, however long ago.
+    /// Record the UTXOs payments from outside the wallet put on its colored addresses: ask the
+    /// indexer about every colored script the wallet watches (see
+    /// [`get_colored_address`](Wallet::get_colored_address)) that is unpaid or paid by an
+    /// unconfirmed transaction, after adding `addresses` to them. Each of `addresses` must be a
+    /// colored address of this wallet (revealed or within the lookahead), otherwise
+    /// [`Error::InvalidAddress`] and nothing is synced; a host names the ones it still waits for
+    /// after a restart. Nothing watched: no request at all.
     ///
     /// ERA fork. Not the public [`sync`](crate::wallet::RgbWalletOpsOnline::sync), which would
     /// see the payment too: its orphan reconcile marks spent every UTXO the indexer says is
     /// spent, including the inputs of this wallet's own spend whose record was lost (a
     /// broadcast whose answer did not come back), and then `go_online` finds no divergence and
     /// never completes that spend (`OnlineOptions::complete_unrecorded_spends`): its transition
-    /// never reaches the stash. This call only records; such a spend stays for `go_online` to
-    /// complete, exactly as its own full scan leaves it.
+    /// never reaches the stash. This call only records.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn sync_colored_payments(
         &mut self,
         online: Online,
-        every_unused: bool,
+        addresses: Vec<String>,
     ) -> Result<(), Error> {
         info!(self.logger(), "Syncing colored payments...");
         self.check_online(online)?;
-        let txn = self.database().begin_transaction()?;
-        if every_unused {
-            self.sync_unused_colored_spks(&txn)?;
-        } else {
-            self.sync_wallet(
-                &txn,
-                SyncOptions {
-                    keychain: SyncKeychain::Colored,
-                    strategy: SyncStrategy::FastSync,
-                },
-                false,
-            )?;
+        let mut named = Vec::with_capacity(addresses.len());
+        for address in &addresses {
+            let spk = self.get_script_pubkey(address)?;
+            match self.bdk_wallet().spk_index().index_of_spk(spk.clone()) {
+                Some((KeychainKind::External, _)) => named.push(spk),
+                _ => {
+                    return Err(Error::InvalidAddress {
+                        details: s!("not a colored address of this wallet"),
+                    });
+                }
+            }
         }
+        self.watched_colored.extend(named);
+        let spks = self.watched_colored_spks();
+        if spks.is_empty() {
+            info!(
+                self.logger(),
+                "Sync colored payments completed: nothing watched"
+            );
+            return Ok(());
+        }
+        let txn = self.database().begin_transaction()?;
+        self.sync_colored_spks(&txn, spks)?;
         txn.commit()?;
         info!(self.logger(), "Sync colored payments completed");
         Ok(())

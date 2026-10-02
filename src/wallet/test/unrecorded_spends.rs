@@ -2293,60 +2293,35 @@ fn a_bundle_the_index_does_not_know_is_consumed_again() {
     spend_the_change(&chain, &mut party, AMOUNT_SMALL);
 }
 
-// ERA fork (T1.1b): sync_colored_payments meets a donation whose answer was lost (its change
-// address is revealed and unused) and only records what it finds, so the next go_online still
-// sees the divergence and completes the donation, as in W1
+// ERA fork (T1.1b, the second review's probe): after S1 the fast sync and the colored payment
+// sync, with an address handed out and paid meanwhile, never ask about the lost donation's change
+// address, so BDK does not learn its TX. If the TX then leaves every mempool, go_online goes
+// through, as it did before the fork watched colored addresses: had BDK learnt the TX, it would
+// keep it (nothing tells it of an eviction), and every go_online would refuse with
+// UnrecordedSpendUnseen.
 #[test]
 #[parallel]
-fn the_colored_payment_sync_leaves_a_lost_spend_to_go_online() {
+fn a_lost_spend_that_leaves_the_mempool_lets_go_online_through() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
-    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+    let (_idx, txid) = donation_answer_lost(&chain, &mut party);
 
-    party
-        .wallet
-        .sync_colored_payments(party.online, true)
-        .unwrap();
-    // the sync did meet the spend
-    let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
-    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_some());
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-
-    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert_eq!(party.wallet.completed_spends().len(), 1);
-    assert_eq!(
-        status_of(&party.wallet, idx),
-        TransferStatus::WaitingConfirmations
-    );
-    assert!(is_signed(&stash_witness(&party, &txid)));
-}
-
-// ERA fork (T1.1b): the colored fast sync asks about the most recent unused colored scripts, the
-// donation's change address among them, so the first syncing call after S1 meets its TX (here a
-// list_unspents with a sync, as in every *_begin); it only records, and go_online still completes
-// the donation
-#[test]
-#[parallel]
-fn the_fast_sync_leaves_a_lost_spend_to_go_online() {
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let (idx, txid) = donation_answer_lost(&chain, &mut party);
-
+    let address = party.wallet.get_colored_address().unwrap();
+    chain.fund(&address, UTXO_SATS as u64);
     party
         .wallet
         .list_unspents(Some(party.online), false, false)
         .unwrap();
+    party
+        .wallet
+        .sync_colored_payments(party.online, vec![address])
+        .unwrap();
     let bdk_txid = crate::bitcoin::Txid::from_str(&txid).unwrap();
-    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_some());
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    assert!(party.wallet.bdk_wallet().get_tx(bdk_txid).is_none());
 
+    chain.evict(&txid);
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert_eq!(party.wallet.completed_spends().len(), 1);
-    assert_eq!(
-        status_of(&party.wallet, idx),
-        TransferStatus::WaitingConfirmations
-    );
-    assert!(is_signed(&stash_witness(&party, &txid)));
+    assert!(party.wallet.completed_spends().is_empty());
 }
 
 // ERA fork (T1.1b, the review's probe): why the host must not use the public sync for that. Its

@@ -24,10 +24,6 @@ pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
-// ERA fork: how many of the most recently revealed and still unused colored scripts a fast sync
-// asks about (the addresses `get_colored_address` hands out to payments from outside the wallet)
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) const COLORED_SYNC_RECENT_UNUSED: usize = 20;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_TIMEOUT: u64 = 10;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
