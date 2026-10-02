@@ -1,5 +1,5 @@
-//! ERA fork: `Wallet::get_colored_address`, and which sync sees a TX that pays it from outside
-//! the wallet (on the scripted chain: no regtest services).
+//! ERA fork: `Wallet::get_colored_address` and `Wallet::sync_colored_payments`, which sees a TX
+//! paying such an address from outside the wallet (on the scripted chain: no regtest services).
 
 use super::*;
 
@@ -74,7 +74,7 @@ fn blind_receive(wallet: &mut Wallet, chain: &ScriptedChain) -> Result<ReceiveDa
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[test]
 #[parallel]
-fn a_full_sync_sees_a_payment_from_outside() {
+fn the_colored_payment_sync_sees_a_payment_from_outside() {
     let chain = ScriptedChain::start();
     let mut wallet = get_test_wallet(false, None);
     let online = wallet.go_online(online_options(&chain)).unwrap();
@@ -90,22 +90,14 @@ fn a_full_sync_sees_a_payment_from_outside() {
     assert!(chain.is_confirmed(&txid));
 
     // The fast sync of every other call does not ask about the address. If this starts to hold,
-    // rgb-lib's fast sync has learnt to and the host's full sync after a payment can go.
+    // rgb-lib's fast sync has learnt to and the host's sync after a payment can go.
     assert!(!lists_envelope(&mut wallet, online, &txid, true));
     assert_matches!(
         blind_receive(&mut wallet, &chain),
         Err(Error::InsufficientAllocationSlots)
     );
 
-    wallet
-        .sync(
-            online,
-            SyncOptions {
-                keychain: SyncKeychain::Colored,
-                strategy: SyncStrategy::FullSync,
-            },
-        )
-        .unwrap();
+    wallet.sync_colored_payments(online).unwrap();
     assert!(lists_envelope(&mut wallet, online, &txid, false));
     // and an invoice can now be issued on it
     let receive = blind_receive(&mut wallet, &chain).unwrap();
@@ -118,7 +110,7 @@ fn a_full_sync_sees_a_payment_from_outside() {
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[test]
 #[parallel]
-fn a_full_sync_sees_an_unconfirmed_payment() {
+fn the_colored_payment_sync_sees_an_unconfirmed_payment() {
     let chain = ScriptedChain::start();
     let mut wallet = get_test_wallet(false, None);
     let online = wallet.go_online(online_options(&chain)).unwrap();
@@ -126,15 +118,7 @@ fn a_full_sync_sees_an_unconfirmed_payment() {
     let txid = chain.fund(&address, UTXO_SATS as u64).to_string();
     assert!(chain.knows(&txid) && !chain.is_confirmed(&txid));
 
-    wallet
-        .sync(
-            online,
-            SyncOptions {
-                keychain: SyncKeychain::Colored,
-                strategy: SyncStrategy::FullSync,
-            },
-        )
-        .unwrap();
+    wallet.sync_colored_payments(online).unwrap();
     assert!(lists_envelope(&mut wallet, online, &txid, false));
     chain.assert_all_matched();
 }

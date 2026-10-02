@@ -967,6 +967,40 @@ pub trait WalletCore {
         Ok(())
     }
 
+    /// ERA fork: ask the indexer about the colored keychain's revealed and unused scripts, and
+    /// record the colored UTXOs it reports there (`Wallet::sync_colored_payments`). Records only:
+    /// never marks a row spent, as the public `sync`'s orphan reconcile does.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn sync_unused_colored_spks(&mut self, txn: &DbTxn) -> Result<(), Error> {
+        let spks: Vec<ScriptBuf> = self
+            .bdk_wallet()
+            .spk_index()
+            .unused_keychain_spks(KeychainKind::External)
+            .map(|(_, spk)| spk)
+            .collect();
+        debug!(
+            self.logger(),
+            "Syncing {} unused colored scripts...",
+            spks.len()
+        );
+        let request = SyncRequest::builder()
+            .chain_tip(self.bdk_wallet().latest_checkpoint())
+            .spks(spks);
+        let update: Update = self.indexer().sync(request)?.into();
+        // beta.8 persists BDK's changes with the caller's commit (persist_and_commit)
+        self.bdk_wallet_mut()
+            .apply_update(update)
+            .map_err(|e| Error::FailedBdkSync {
+                details: e.to_string(),
+            })?;
+        // as a colored sync does (finish_sync): a payment to a pending witness script is the
+        // witness receive's, flagged as such
+        let pending_witness_scripts = self.reconcile_pending_witness(txn)?;
+        self.update_db_colored_txos_from_bdk(txn, false, &pending_witness_scripts)?;
+        debug!(self.logger(), "Synced");
+        Ok(())
+    }
+
     /// Register in the DB the colored TXOs known to BDK but not to the DB yet.
     ///
     /// `pending_witness_scripts` are the pending witness scripts returned by
