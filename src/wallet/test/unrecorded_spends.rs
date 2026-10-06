@@ -2846,6 +2846,31 @@ fn plan_table_of_a_replaced_payment() {
         })
         .unwrap();
     assert_eq!(plan.gone_envelopes.len(), 1);
+    // its TX named by a transfer of this wallet still in play (the issuance's batch transfer,
+    // given that TXID: a send's change is named so); one that failed does not count
+    let name_it = |txn: &DbTxn, status: TransferStatus| {
+        let issuance = txn
+            .iter_asset_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.asset_id.as_deref() == Some(base.party.asset_id.as_str()))
+            .unwrap()
+            .batch_transfer_idx;
+        update_batch_transfer(txn, issuance, |b| {
+            b.txid = ActiveValue::Set(Some(first.clone()));
+            b.status = ActiveValue::Set(status);
+        });
+    };
+    for status in [
+        TransferStatus::WaitingConfirmations,
+        TransferStatus::Settled,
+    ] {
+        refused(base.plan(|txn, _| name_it(txn, status), unchanged));
+    }
+    let plan = base
+        .plan_after(|txn, _| name_it(txn, TransferStatus::Failed))
+        .unwrap();
+    assert_eq!(plan.gone_envelopes.len(), 1);
     // beside it, a row of a TX BDK holds as canonical (the replacement) that BDK does not list
     // and nothing spends; or one of a TX BDK never saw
     for txid in [replacement.as_str(), FAKE_TXID] {
@@ -2865,4 +2890,100 @@ fn plan_table_of_a_replaced_payment() {
             unchanged,
         ));
     }
+}
+
+// From the review of the CC-115 change (its probes, made regression tests)
+
+// the BTC change of an own send that moved a whole allocation goes to a new colored address and
+// holds nothing, while the transfer waits on the send's TX. When another install spending the
+// same coins replaces that TX, the change is no envelope of a payment from outside: go_online
+// refuses as before, rather than leave the transfer waiting for a TX that will not come
+#[test]
+#[parallel]
+fn a_send_whose_tx_is_replaced_is_still_refused() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT, true);
+    let idx = begin.batch_transfer_idx.unwrap();
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+    let rows = |party: &Issuer| -> Vec<DbTxo> {
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        txn.iter_txos()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.txid == txid)
+            .collect()
+    };
+    let change = rows(&party);
+    assert!(!change.is_empty() && change.iter().all(|t| t.exists && !t.spent));
+    assert!(
+        party
+            .wallet
+            .list_unspents(None, false, true)
+            .unwrap()
+            .iter()
+            .filter(|u| u.utxo.outpoint.txid == txid)
+            .all(|u| u.rgb_allocations.is_empty())
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let address = party.wallet.get_colored_address().unwrap();
+    chain.replace(&txid, &[(address.as_str(), 5_000)]);
+
+    let error = reopen(&chain, &mut party, completing_options(&chain))
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.inconsistency_reason(),
+        Some(InconsistencyReason::NoCanonicalSpender)
+    );
+    assert_eq!(rows(&party), change);
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+}
+
+// a vanilla record does not refuse: the envelopes create_utxos made, its TX replaced by another
+// install spending the same coins (BDK learns that spend from the vanilla full scan), are marked
+// like those of a payment from outside; nothing waits on that TX once create_utxos ended
+#[test]
+#[parallel]
+fn the_envelopes_of_a_replaced_create_utxos_are_marked_too() {
+    let chain = ScriptedChain::start();
+    let mut wallet = get_test_wallet(true, Some(1));
+    let online = wallet.go_online(completing_options(&chain)).unwrap();
+    chain.fund(&wallet.get_address().unwrap(), FUNDING);
+    chain.mine(1);
+    wallet
+        .create_utxos(online, false, Some(2), Some(UTXO_SATS), FEE_RATE, false)
+        .unwrap();
+    let txid = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .find(|u| u.utxo.colorable)
+        .unwrap()
+        .utxo
+        .outpoint
+        .txid;
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let elsewhere = get_test_wallet(false, None).get_address().unwrap();
+    chain.replace(&txid, &[(elsewhere.as_str(), FUNDING - 10_000)]);
+
+    wallet.go_offline();
+    wallet.go_online(completing_options(&chain)).unwrap();
+    let txn = wallet.database().begin_transaction().unwrap();
+    let rows: Vec<DbTxo> = txn
+        .iter_txos()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.txid == txid)
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|t| !t.exists && !t.spent));
 }
