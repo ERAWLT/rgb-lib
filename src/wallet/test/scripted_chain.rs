@@ -13,7 +13,8 @@
 //! - a withheld transaction is one the indexer does not know (never listed, looked up as unknown,
 //!   never mined) until the test releases it: a broadcast that never reached the network, or a
 //!   donation its recipient broadcasts later;
-//! - an evicted transaction is gone from every mempool;
+//! - an evicted transaction is gone from every mempool, and so is a replaced one, whose
+//!   replacement spends the same coins; either can be broadcast again later;
 //! - every request is logged, and one no route answers is recorded as unmatched, which
 //!   [`ScriptedChain::assert_all_matched`] (and dropping the chain) turns into a test failure, so
 //!   a dependency upgrade that changes what the wallet asks shows up instead of silently covering
@@ -79,6 +80,8 @@ struct State {
     // outputs the chain never saw created: the inputs of funding transactions
     foreign: HashMap<OutPoint, TxOut>,
     withheld: HashSet<Txid>,
+    // transactions that left every mempool (evicted or replaced), kept to be readmitted
+    evicted: HashMap<Txid, Transaction>,
     withhold_broadcasts: usize,
     faults: Vec<Fault>,
     log: Vec<String>,
@@ -101,6 +104,7 @@ impl State {
             confirmed_at: HashMap::new(),
             foreign: HashMap::new(),
             withheld: HashSet::new(),
+            evicted: HashMap::new(),
             withhold_broadcasts: 0,
             faults: vec![],
             log: vec![],
@@ -483,6 +487,20 @@ impl State {
     }
 }
 
+/// The outputs paying each `(address, sats)`.
+fn tx_outputs(outputs: &[(&str, u64)]) -> Vec<TxOut> {
+    outputs
+        .iter()
+        .map(|(address, amount)| TxOut {
+            value: Amount::from_sat(*amount),
+            script_pubkey: BdkAddress::from_str(address)
+                .unwrap()
+                .assume_checked()
+                .script_pubkey(),
+        })
+        .collect()
+}
+
 fn script_hash(script: &ScriptBuf) -> String {
     format!("{:x}", sha256::Hash::hash(script.as_bytes()))
 }
@@ -674,10 +692,14 @@ impl ScriptedChain {
 
     /// Pay `amount` sats to `address` from outside the wallet (in the mempool until mined).
     pub(crate) fn fund(&self, address: &str, amount: u64) -> Txid {
-        let script = BdkAddress::from_str(address)
-            .unwrap()
-            .assume_checked()
-            .script_pubkey();
+        self.pay(&[(address, amount)])
+    }
+
+    /// Pay each `(address, sats)` of `outputs` from outside the wallet in one transaction (in the
+    /// mempool until mined), as a host funding several envelopes at once does.
+    pub(crate) fn pay(&self, outputs: &[(&str, u64)]) -> Txid {
+        let outputs = tx_outputs(outputs);
+        let amount: u64 = outputs.iter().map(|o| o.value.to_sat()).sum();
         let mut state = self.state();
         state.funding_nonce += 1;
         let foreign = OutPoint::new(
@@ -702,15 +724,57 @@ impl ScriptedChain {
                 sequence: Sequence::MAX,
                 witness: Witness::from_slice(&[[0u8; 64]]),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(amount),
-                script_pubkey: script,
-            }],
+            output: outputs,
         };
         let txid = tx.compute_txid();
         state.txs.insert(txid, tx);
         state.mempool.push(txid);
         txid
+    }
+
+    /// Replace `txid`, which the indexer has in its mempool, by a transaction spending the same
+    /// coins and paying `outputs` instead: a fee bump, or another wallet on the same seed spending
+    /// those coins (full RBF). The replaced transaction leaves every mempool, as an evicted one
+    /// does, and can be [readmitted](Self::readmit).
+    pub(crate) fn replace(&self, txid: &str, outputs: &[(&str, u64)]) -> Txid {
+        let replaced = Txid::from_str(txid).unwrap();
+        let mut state = self.state();
+        assert!(
+            !state.confirmed_at.contains_key(&replaced),
+            "a mined TX cannot be replaced"
+        );
+        assert!(state.mempool.contains(&replaced), "not in the mempool");
+        let original = state.txs.remove(&replaced).unwrap();
+        let replacement = Transaction {
+            output: tx_outputs(outputs),
+            ..original.clone()
+        };
+        let txid = replacement.compute_txid();
+        assert_ne!(txid, replaced, "a replacement pays something else");
+        state.mempool.retain(|t| *t != replaced);
+        state.evicted.insert(replaced, original);
+        state.txs.insert(txid, replacement);
+        state.mempool.push(txid);
+        txid
+    }
+
+    /// Broadcast again a transaction that left every mempool (evicted or replaced), as whoever
+    /// kept it can: back in the mempool, once no transaction the indexer knows spends its coins.
+    pub(crate) fn readmit(&self, txid: &str) {
+        let txid = Txid::from_str(txid).unwrap();
+        let mut state = self.state();
+        let tx = state
+            .evicted
+            .remove(&txid)
+            .expect("a TX that left the mempool");
+        for input in &tx.input {
+            assert!(
+                state.spender(&input.previous_output).is_none(),
+                "a TX the indexer knows spends its coins: evict it first"
+            );
+        }
+        state.txs.insert(txid, tx);
+        state.mempool.push(txid);
     }
 
     /// Mine `count` blocks, the first with every transaction the indexer knows in its mempool.
@@ -770,7 +834,9 @@ impl ScriptedChain {
             "a mined TX cannot be evicted"
         );
         state.mempool.retain(|t| *t != txid);
-        state.txs.remove(&txid);
+        if let Some(tx) = state.txs.remove(&txid) {
+            state.evicted.insert(txid, tx);
+        }
     }
 
     /// Answer the next `times` requests `method path` with `status`; with `relay`, after the

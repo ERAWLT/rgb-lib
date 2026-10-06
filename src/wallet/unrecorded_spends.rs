@@ -25,6 +25,15 @@
 //!
 //! [`plan`] only reads (BDK's view, the database, the transfer files and the indexer's answers),
 //! so the table of verdicts is tested without a chain; [`apply`] writes.
+//!
+//! CC-115, the one divergence that is not a spend: an envelope paid from outside the wallet whose
+//! payment was replaced (an RBF, or another wallet on the same seed spending the same coins) or
+//! evicted before it confirmed. Its row is `exists && !spent`, BDK no longer lists it, and nothing
+//! spends it. When BDK has seen the payment and no longer holds it as canonical, and the wallet's
+//! records leave the coin empty, the check marks the row as not existing (`exists` false, as a TXO
+//! of a TX that has not reached the network is) instead of refusing: out of every selection and
+//! of the check, and back as it was once a sync sees the payment canonical again. Any other coin
+//! without a spender is refused as before. See the fork's `ERA.md`, section 9.
 
 use super::*;
 use crate::wallet::online::SIGNED_PSBT_FILE;
@@ -86,6 +95,10 @@ pub(crate) struct SpendView {
     pub(crate) txs: BTreeMap<String, BdkTransaction>,
     /// The wallet's colored outputs of each of them, and whether BDK sees each spent
     pub(crate) colored_outputs: BTreeMap<String, Vec<(BdkOutPoint, bool)>>,
+    /// ERA fork (CC-115): of the transactions that created divergent coins, those BDK has seen
+    /// (its graph holds them) and no longer holds as canonical: replaced by a conflicting
+    /// transaction it learnt, or evicted. One BDK never saw is not among them.
+    pub(crate) non_canonical_creators: BTreeSet<String>,
 }
 
 impl SpendView {
@@ -95,7 +108,9 @@ impl SpendView {
     ) -> Self {
         let mut spenders = BTreeMap::new();
         let mut txs = BTreeMap::new();
+        let mut canonical = HashSet::new();
         for wallet_tx in bdk_wallet.transactions() {
+            canonical.insert(wallet_tx.tx_node.txid);
             let tx = wallet_tx.tx_node.tx.as_ref();
             for input in &tx.input {
                 if divergence.contains(&input.previous_output) {
@@ -115,10 +130,19 @@ impl SpendView {
                 outputs.push((output.outpoint, output.is_spent));
             }
         }
+        let non_canonical_creators = divergence
+            .iter()
+            .map(|o| o.txid)
+            .filter(|txid| {
+                !canonical.contains(txid) && bdk_wallet.tx_graph().get_tx(*txid).is_some()
+            })
+            .map(|txid| txid.to_string())
+            .collect();
         Self {
             spenders,
             txs,
             colored_outputs,
+            non_canonical_creators,
         }
     }
 }
@@ -149,6 +173,9 @@ pub(crate) struct PlannedSpend {
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub(crate) spends: Vec<PlannedSpend>,
+    /// ERA fork (CC-115): divergent coins that are envelopes of a payment BDK no longer holds,
+    /// to be marked as not existing
+    pub(crate) gone_envelopes: Vec<DbTxo>,
 }
 
 fn refusal(txid: &str, reason: UnrecordedSpendReason, batch_transfer_idx: Option<i32>) -> Error {
@@ -197,11 +224,61 @@ fn read_transfer_file(
     })
 }
 
+/// CC-115: the divergent coins without a spender, if every one is an envelope of a payment BDK
+/// no longer holds: its creating TX is one of `view.non_canonical_creators`, and the wallet's
+/// records leave the coin empty ([`holds_nothing`]). `None` when any one is not: it is refused as
+/// before.
+fn gone_envelopes(
+    view: &SpendView,
+    coins: &[BdkOutPoint],
+    txn: &DbTxn,
+) -> Result<Option<Vec<DbTxo>>, Error> {
+    if coins.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    if coins
+        .iter()
+        .any(|c| !view.non_canonical_creators.contains(&c.txid.to_string()))
+    {
+        return Ok(None);
+    }
+    let mut txos = vec![];
+    for coin in coins {
+        txos.push(
+            txn.get_txo(&Outpoint::from(*coin))?
+                .expect("a divergent coin is a row of the database"),
+        );
+    }
+    let reserved: HashSet<BdkOutPoint> = txn
+        .iter_reserved_txos()?
+        .into_iter()
+        .map(BdkOutPoint::from)
+        .collect();
+    let unspents = txn.get_rgb_allocations(txos, None, None, None, None)?;
+    if !unspents.iter().all(|u| holds_nothing(u, &reserved)) {
+        return Ok(None);
+    }
+    Ok(Some(unspents.into_iter().map(|u| u.utxo).collect()))
+}
+
+/// CC-115: whether the wallet's records leave a coin empty, by its own accounting of a UTXO's
+/// slots (`get_available_allocations`): no allocation but those of failed transfers (so no
+/// issuance, no receive, no input or change of a transfer in flight or done), no blind receive
+/// waiting on it (`pending_blinded`), no witness receive landing on it, and no reservation (a
+/// drain or another vanilla TX begun on it).
+fn holds_nothing(unspent: &LocalUnspent, reserved: &HashSet<BdkOutPoint>) -> bool {
+    unspent.rgb_allocations.iter().all(|a| a.status.failed())
+        && unspent.pending_blinded == 0
+        && !unspent.utxo.pending_witness
+        && !reserved.contains(&BdkOutPoint::from(unspent.utxo.clone()))
+}
+
 /// Decide what to complete, or why not. Nothing is written.
 ///
 /// The verdicts, in this order of precedence (the first that applies wins):
 /// 1. a divergent coin that no own spend explains: [`Error::Inconsistency`] with a reason
-///    (P1, P2, P4);
+///    (P1, P2, P4), save an envelope of a payment BDK no longer holds (CC-115), which the plan
+///    marks as not existing;
 /// 2. the indexer's lookup failing: its error (P3);
 /// 3. the indexer not knowing an own spend: [`Error::UnrecordedSpendUnseen`] (P3);
 /// 4. an own spend whose record or files do not allow completing it: [`Error::UnrecordedSpend`]
@@ -217,25 +294,26 @@ pub(crate) fn plan(
 ) -> Result<Plan, Error> {
     // phase 1, local: every divergent coin is spent by a canonical TX (P1) that one of this
     // wallet's records names (P2), and nothing that TX created was spent by a TX the wallet has
-    // no record of (P4)
+    // no record of (P4); or it is not spent at all, but an envelope of a payment BDK no longer
+    // holds (CC-115)
     let mut own_spends = BTreeSet::new();
-    let mut without_spender = false;
+    let mut without_spender = vec![];
     for outpoint in divergence {
         match view.spenders.get(outpoint) {
             Some(txid) => {
                 own_spends.insert(txid.clone());
             }
-            None => without_spender = true,
+            None => without_spender.push(*outpoint),
         }
     }
     let spenders: Vec<String> = own_spends.iter().cloned().collect();
-    if without_spender {
+    let Some(gone_envelopes) = gone_envelopes(view, &without_spender, txn)? else {
         return Err(Error::unrecorded_inconsistency(
             details,
             &spenders,
             InconsistencyReason::NoCanonicalSpender,
         ));
-    }
+    };
     let mut records = BTreeMap::new();
     for txid in &own_spends {
         let found = Records {
@@ -336,7 +414,10 @@ pub(crate) fn plan(
             record,
         });
     }
-    Ok(Plan { spends })
+    Ok(Plan {
+        spends,
+        gone_envelopes,
+    })
 }
 
 fn inputs(tx: &BdkTransaction) -> BTreeSet<BdkOutPoint> {
@@ -456,7 +537,8 @@ fn plan_send(
 }
 
 /// Write a plan: the stash first, durable before anything else, then the database in the
-/// check's transaction (committed by `go_online`), then the check that no divergence is left.
+/// check's transaction (committed by `go_online`), the envelopes gone (CC-115) last, then the
+/// check that no divergence is left.
 pub(crate) fn apply<W: WalletOnline + ?Sized>(
     wallet: &mut W,
     txn: &DbTxn,
@@ -469,7 +551,12 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
     // StockNotStored (CC-101, stock_store), which is the retryable Error::IO. A consume that fails
     // half way stores nothing: the runtime's drop, which would store it, is turned off. A bundle
     // the stash already holds (S2, or a completion that did not commit) is not consumed again.
-    runtime.require_explicit_persistence();
+    // With no spend to complete (only envelopes gone, CC-115) the runtime is left as upstream's
+    // check leaves it.
+    let completing = !plan.spends.is_empty();
+    if completing {
+        runtime.require_explicit_persistence();
+    }
     for spend in &plan.spends {
         let PlannedRecord::Send {
             batch_transfer,
@@ -504,7 +591,9 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
     }
     // with everything stored by the commits above, this finds nothing to write on this base; it
     // stays as the durability point of a base whose stock does not store at each commit
-    runtime.persist()?;
+    if completing {
+        runtime.persist()?;
+    }
 
     // phase 5, the database: what the operation's commit would have written
     let mut completed = vec![];
@@ -552,6 +641,23 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
                 });
             }
         }
+    }
+    // CC-115: an envelope of a payment BDK no longer holds is marked as a TXO of a TX that has not
+    // reached the network is (`exists` false): out of every selection, of the check and of what
+    // the host counts. `spent` stays false, so the sync that sees the payment canonical again
+    // sets `exists` back (`set_txo` raises it and never touches `spent`): the same row, as it was.
+    // Not reported as a completion: it is derived from the chain, and a copy without it does the
+    // same at its next go_online.
+    for txo in plan.gone_envelopes {
+        let outpoint = txo.outpoint();
+        let mut gone: DbTxoActMod = txo.into();
+        gone.exists = ActiveValue::Set(false);
+        txn.update_txo(gone)?;
+        warn!(
+            wallet.logger(),
+            "CC-115: TXO {outpoint} holds nothing and BDK no longer holds its TX as canonical \
+             (replaced or evicted): marked as not existing until the TX is back"
+        );
     }
 
     // phase 6 (P7): the writes left no divergence
