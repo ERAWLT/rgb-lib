@@ -272,6 +272,7 @@ impl DbTxn {
     /// ERA fork: a savepoint in this transaction, used as a transaction of its own: what is written
     /// through it joins this transaction on [`Self::commit`] and is undone if it is dropped. This
     /// transaction is not to be used while the savepoint is open.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn savepoint(&self) -> Result<DbTxn, Error> {
         Ok(DbTxn {
             txn: Some(block_on(self.inner().begin())?),

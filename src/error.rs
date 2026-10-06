@@ -894,7 +894,8 @@ impl Error {
     }
 
     // ERA fork (CC-99): the inconsistency the completion refuses with, the upstream details
-    // followed by the spending TXs and the reason
+    // followed by the spending TXs and the reason; online only, as is the completion
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn unrecorded_inconsistency(
         details: String,
         spenders: &[String],
