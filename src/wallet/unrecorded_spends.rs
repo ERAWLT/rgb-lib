@@ -27,13 +27,15 @@
 //! so the table of verdicts is tested without a chain; [`apply`] writes.
 //!
 //! CC-115, the one divergence that is not a spend: an envelope paid from outside the wallet whose
-//! payment was replaced (an RBF, or another wallet on the same seed spending the same coins) or
-//! evicted before it confirmed. Its row is `exists && !spent`, BDK no longer lists it, and nothing
-//! spends it. When BDK has seen the payment and no longer holds it as canonical, and the wallet's
-//! records leave the coin empty, the check marks the row as not existing (`exists` false, as a TXO
-//! of a TX that has not reached the network is) instead of refusing: out of every selection and
-//! of the check, and back as it was once a sync sees the payment canonical again. Any other coin
-//! without a spender is refused as before. See the fork's `ERA.md`, section 9.
+//! payment was replaced before it confirmed (an RBF, or another wallet on the same seed spending
+//! the same coins). Its row is `exists && !spent`, BDK no longer lists it, and nothing spends it.
+//! When BDK has seen the payment and no longer holds it as canonical (it learnt a conflicting TX,
+//! or the payment descends from one: BDK records no eviction, since rgb-lib's requests carry no
+//! expected TXIDs), and the wallet's records leave the coin empty, the check marks the row as not
+//! existing (`exists` false, as a TXO of a TX that has not reached the network is) instead of
+//! refusing: out of every selection and of the check, and back as it was once a sync sees the
+//! payment canonical again. Any other coin without a spender is refused as before. See the fork's
+//! `ERA.md`, section 9.
 
 use super::*;
 use crate::wallet::online::SIGNED_PSBT_FILE;
@@ -96,8 +98,9 @@ pub(crate) struct SpendView {
     /// The wallet's colored outputs of each of them, and whether BDK sees each spent
     pub(crate) colored_outputs: BTreeMap<String, Vec<(BdkOutPoint, bool)>>,
     /// ERA fork (CC-115): of the transactions that created divergent coins, those BDK has seen
-    /// (its graph holds them) and no longer holds as canonical: replaced by a conflicting
-    /// transaction it learnt, or evicted. One BDK never saw is not among them.
+    /// (its graph holds them) and no longer holds as canonical: in conflict with a transaction it
+    /// learnt, or descending from one (BDK records no eviction for this wallet: its requests carry
+    /// no expected TXIDs). One BDK never saw is not among them.
     pub(crate) non_canonical_creators: BTreeSet<String>,
 }
 
@@ -643,9 +646,10 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
         }
     }
     // CC-115: an envelope of a payment BDK no longer holds is marked as a TXO of a TX that has not
-    // reached the network is (`exists` false): out of every selection, of the check and of what
-    // the host counts. `spent` stays false, so the sync that sees the payment canonical again
-    // sets `exists` back (`set_txo` raises it and never touches `spent`): the same row, as it was.
+    // reached the network is (`exists` false): out of every selection and of the check;
+    // `list_unspents` still lists it, flagged, for the host to filter. `spent` stays false, so the
+    // sync that sees the payment canonical again sets `exists` back (`set_txo` raises it and never
+    // touches `spent`): the same row, as it was.
     // Not reported as a completion: it is derived from the chain, and a copy without it does the
     // same at its next go_online.
     for txo in plan.gone_envelopes {
@@ -656,7 +660,7 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
         warn!(
             wallet.logger(),
             "CC-115: TXO {outpoint} holds nothing and BDK no longer holds its TX as canonical \
-             (replaced or evicted): marked as not existing until the TX is back"
+             (replaced): marked as not existing until the TX is back"
         );
     }
 
