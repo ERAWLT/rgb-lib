@@ -110,6 +110,9 @@ Rules for the branch:
 | `1fb40da` | Watch only the colored addresses handed out, not every unused one | To propose to UTEXO (with `ebecd8c`; replaces the tail of `2310cc6`) |
 | `24d3314` | Stop watching a colored address once a payment reaches it | To propose to UTEXO (with `ebecd8c`) |
 | `09cbbda` | Mark a replaced payment's empty envelopes as gone at go_online | To propose to UTEXO (with `c1feef6` and `ebecd8c`) |
+| `93a3fc8` | Say how a payment leaves BDK's view, and that unspents still list it | To propose to UTEXO (with `09cbbda`) |
+| `c0e51da` | Refuse a replaced TX that a transfer still in play names | To propose to UTEXO (with `09cbbda`) |
+| `112054c` | Pin the marking's way back and its copies, as the review probed | To propose to UTEXO (with `09cbbda`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
@@ -121,7 +124,7 @@ Later commits that touch only this file are part of the series too. `3f0a555` to
 `5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
 [§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f);
 `1ed4436` to `e230950` answer UTEXO's review of #104 and go with `6ce375e`
-([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9`, `2310cc6` and its review fixes `1fb40da` and `24d3314` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da-24d3314); `09cbbda` is [§9](#9-a-replaced-payment-of-envelopes-cc-115).
+([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9`, `2310cc6` and its review fixes `1fb40da` and `24d3314` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da-24d3314); `09cbbda` and, after its review, `93a3fc8` to `112054c` are [§9](#9-a-replaced-payment-of-envelopes-cc-115).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -1267,7 +1270,8 @@ only.
 `InconsistencyReason`: `spender-not-recorded` (another install of the wallet, a copy older than
 the operation, a drain begun with `dry_run = true`), `no-canonical-spender` (the TX that created
 the coin was replaced or reorganized away: not CC-99; since CC-115 only a coin that holds something,
-or one of a TX BDK never saw, see [§9](#9-a-replaced-payment-of-envelopes-cc-115)), `later-spend-unrecorded` (an output of an
+one of a TX a transfer still in play names, or one of a TX BDK never saw, see
+[§9](#9-a-replaced-payment-of-envelopes-cc-115)), `later-spend-unrecorded` (an output of an
 own spend was spent by a TX this wallet has no record of).
 
 `UnrecordedSpendReason`: `transfer-failed`, `unexpected-status`, `record-ambiguous`,
@@ -1316,7 +1320,7 @@ indexer knows T.
 | several of these at once | one `refresh` that broadcast two sends, a send and a drain | all completed, one commit; one refused and none is committed (a stash refusal keeps the spends consumed before it in the stash, below) |
 | any of these after a VSS restore | S3 via VSS | completed; `.vss_restored` removed after the commit |
 | a spender no record of this wallet names | another install (CC-27), a copy older than the operation, a `dry_run = true` drain, a transfer deleted then broadcast | `Inconsistency` `spender-not-recorded` (`RestoredBackupInconsistent` after a VSS restore) |
-| a coin without a canonical spender | its creating TX replaced or reorganized away | `Inconsistency` `no-canonical-spender` (not CC-99; design question 6), unless the coin holds nothing and BDK saw that TX: then marked as not existing, [§9](#9-a-replaced-payment-of-envelopes-cc-115) |
+| a coin without a canonical spender | its creating TX replaced or reorganized away | `Inconsistency` `no-canonical-spender` (not CC-99; design question 6), unless the coin holds nothing, BDK saw that TX and no transfer still in play names it: then marked as not existing, [§9](#9-a-replaced-payment-of-envelopes-cc-115) |
 | an output of T spent by an unrecorded TX | a chain of lost transfers from an old copy | `Inconsistency` `later-spend-unrecorded` |
 | the lookup fails | indexer or forwarder down | the indexer's error |
 | own record, BDK has T, the indexer does not know it | indexer lag; T applied locally and evicted | `UnrecordedSpendUnseen` |
@@ -2005,7 +2009,8 @@ in `the_fast_sync_asks_about_the_addresses_handed_out_only` says so, and the evi
 
 ## 9. A replaced payment of envelopes (CC-115)
 
-`09cbbda`, a release gate of the app's envelope payments (T3.3) on top of
+`09cbbda`, then `93a3fc8` to `112054c` after its review (no blocker, no major; [below](#from-the-review)),
+a release gate of the app's envelope payments (T3.3) on top of
 [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da-24d3314).
 
 ### Why
@@ -2024,15 +2029,17 @@ session, at CC-99's price (§8).
 ### What changes
 
 In the completion's plan (`unrecorded_spends.rs`, so only with `complete_unrecorded_spends`), a
-divergent coin without a canonical spender is set aside instead of refused when both of these hold:
+divergent coin without a canonical spender is set aside instead of refused when all three hold:
 
 | | Claim | Proven by |
 |---|---|---|
-| (b) | its payment left BDK's view | BDK's graph holds the creating TX (`tx_graph().get_tx`) and its canonical view (`transactions()`) does not: replaced by a conflicting TX BDK learnt, or evicted |
+| (b) | its payment left BDK's view | BDK's graph holds the creating TX (`tx_graph().get_tx`) and its canonical view (`transactions()`) does not: BDK learnt a TX in conflict with it (a replacement, another wallet's spend of the same coins), or it descends from one. BDK records no eviction for this wallet (rgb-lib's requests carry no expected TXIDs and nothing calls `apply_evicted_txs`), so a payment merely dropped from every mempool stays canonical ([below](#what-it-does-not-see)) |
+| (c) | it is no transfer's | no batch transfer of this wallet but a `Failed` one names the creating TX (`get_batch_transfers_by_txid`). A payment from outside never is. A send's BTC change is: rgb-lib pays it to a new colored address (`prepare_psbt`), after a send of a whole allocation it carries no coloring, and the transfer waits on that TX; marked, it would leave the transfer `WaitingConfirmations` for good, since `wait_confirmations` answers `Ok(None)` for a TX the indexer does not know. Vanilla records (`wallet_transaction`) do not count: the envelopes of a `create_utxos` whose TX was replaced are marked like a payment's, and nothing waits on that TX once `create_utxos` ended |
 | (a) | it holds nothing | the wallet's own accounting of a UTXO's slots (`get_rgb_allocations`, as `get_available_allocations` reads it): no allocation but those of `Failed` transfers (no issuance, no receive, no input or change of a transfer in flight or done), `pending_blinded == 0`, not `pending_witness`, and no `reserved_txo` (a drain or another vanilla TX begun on it) |
 
-Each such coin is marked `exists = false` in the check's transaction, after the completion's own
-writes and before P7. A coin without a spender that is not such an envelope refuses the whole
+(b) and (c) are read first, and the database rows only when every coin passed them. Each such coin
+is marked `exists = false` in the check's transaction, after the completion's own writes and before
+P7. A coin without a spender that is not such an envelope refuses the whole
 `go_online` as before, and nothing is marked. A plan with nothing to complete leaves the RGB
 runtime as upstream's check does (no `require_explicit_persistence`, no `persist()`).
 
@@ -2041,19 +2048,31 @@ The marking is logged (`CC-115: TXO ... marked as not existing`), not reported b
 the chain, and a copy of the wallet without it marks the same at its next `go_online`. Nothing new
 is asked of the indexer: (b) is BDK's view after the check's own full scans.
 
+The VSS restore marker goes as after a clean check, before the commit (`check_consistency`): a
+marking alone is no completion. Should that commit fail, a later refusal of the restored copy reads
+`Inconsistency`, not `RestoredBackupInconsistent`; the next `go_online` marks the same rows again.
+Treating a marking as a completion there would carry it through the check's return to `go_online`,
+for a case that needs a VSS restore, a marking and a failed commit at once: not done.
+
 ### Why `exists = false`, and not spent or deleted
 
 `exists = false` is upstream's state for a TXO whose TX has not reached the network (a send's
-change before its broadcast, a witness receive's UTXO), and every reader already skips it:
-`get_available_allocations` (blind invoices, issuance), the send's input selection,
-the consistency check, `reconcile_orphaned_colored_txos`. The app counts an envelope only when
-`exists` (`RgbEnvelopeSummary`, `RgbFreeEnvelopes`, the bridge's `coloredFundingSeen`).
+change before its broadcast, a witness receive's UTXO). The selection skips it
+(`get_available_allocations`: blind invoices, issuance; the send's input selection), and so do the
+consistency check and `reconcile_orphaned_colored_txos`. `list_unspents` does not: it lists every
+unspent row, this one with `exists: false`, so a host counting envelopes from it filters on
+`exists`, as the bridge's `coloredFundingSeen` does.
 
 It is also undone by upstream's own code. If the payment comes back (the replacement dropped, the
 first one broadcast again and mined), the next full scan lists its outputs,
 `update_db_colored_txos_from_bdk` finds no existing row for them (it compares rows with `exists`),
 and `set_txo` upserts on the outpoint, raising `exists` and never touching `spent`: the same row,
 an envelope again.
+
+One upstream path removes such a row: `delete_transfers` deletes the `!exists` rows that a deleted
+transfer's colorings name (`delete_batch_transfer`, its cleanup of a send's unbroadcast change). For
+a marked envelope that is the coloring of a `Failed` transfer; if the payment comes back, the full
+scan inserts the row again, under a new index. Harmless, and pinned.
 
 - **Spent** would lose it for good: `set_txo` never clears `spent`, so a payment that comes back
   would leave its envelope spent in the database and unspent in BDK, which the check does not see
@@ -2066,9 +2085,10 @@ an envelope again.
 ### What does not change
 
 - Every other `no-canonical-spender`: a coin that holds anything (an issuance or a receive, a
-  pending blind invoice, a witness receive, a reservation, an input or the change of a transfer),
-  and a coin of a TX BDK holds as canonical or never saw, refuses as before, with the same
-  details and reason, and nothing marked.
+  pending blind invoice, a witness receive, a reservation, an input or the asset change of a
+  transfer), a coin of a TX that a transfer still in play names (a send's change, BTC only or not),
+  and a coin of a TX BDK holds as canonical or never saw, refuses as before, with the same details
+  and reason, and nothing marked.
 - The CC-99 completion: the same precedence for coins with a spender, the same refusals, the same
   writes. A `go_online` meeting a lost own spend and a replaced payment does both in one commit,
   or neither.
@@ -2080,10 +2100,10 @@ an envelope again.
 ### What it does not see
 
 - **A replacement that pays none of the wallet's colored scripts** (another wallet on the seed
-  sending the same coins elsewhere) never reaches BDK. The full scan finds nothing on the
-  addresses, and BDK, asked without expected TXIDs, cannot learn that the first payment left the
-  mempool: it keeps that payment canonical, its rows are no divergence, and the envelope stays
-  listed, unconfirmed, for good. Nothing blocks, but an invoice issued on it would be a seal on an
+  sending the same coins elsewhere), and a payment merely dropped from every mempool, never reach
+  BDK. The full scan finds nothing on the addresses, and BDK, asked without expected TXIDs, cannot
+  learn that the payment left the mempool: it keeps that payment canonical, its rows are no
+  divergence, and the envelope stays listed, unconfirmed, for good. Nothing blocks, but an invoice issued on it would be a seal on an
   outpoint that will never exist. Pinned by
   `a_payment_replaced_out_of_the_wallets_sight_stays_listed`. Only the host can close it: an
   envelope paid from outside takes a blind invoice only once its payment confirms, which is the
@@ -2114,12 +2134,19 @@ them, in seconds, a tie going by TXID.
 | an envelope holding a blind invoice, an issued asset, a drain begun on it | `no-canonical-spender`, its rows unchanged and the bump's outputs not recorded (nothing committed); with the invoice, refused again at the next `go_online`; once the drain is aborted, through |
 | an envelope whose blind invoice failed | through; the transfer stays `Failed`; the next invoice goes on the bump |
 | beside a donation whose broadcast answer was lost (CC-99) | a failed status lookup refuses the whole `go_online` and marks nothing; the next one completes the donation and marks the envelope; the donation settles |
-| `plan_table_of_a_replaced_payment`: the planner over that state | as it is: no spend, the envelope set aside, nothing asked. Refused, nothing asked: its TX canonical after all; a pending witness on it; a reservation; an allocation (set aside again when that transfer is `Failed`); beside it a row of a canonical TX (the bump) or of a TX BDK never saw |
+| `plan_table_of_a_replaced_payment`: the planner over that state | as it is: no spend, the envelope set aside, nothing asked. Refused, nothing asked: its TX canonical after all; a pending witness on it; a reservation; an allocation (set aside again when that transfer is `Failed`); its TX named by a batch transfer `WaitingConfirmations` or `Settled` (set aside again when `Failed`); beside it a row of a canonical TX (the bump) or of a TX BDK never saw |
+| an own send of a whole allocation (its change BTC only, uncolored), `WaitingConfirmations`, its TX replaced by another spend of the same coins | `no-canonical-spender`, the change row unchanged, the transfer still `WaitingConfirmations` (the review's probe) |
+| a `create_utxos` whose TX another spend of the same coins replaced | its two envelopes marked |
+| the first payment comes back unconfirmed (seen after the bump) | the same rows exist again, the bump's marked |
+| a copy of the wallet from before the marking, then one from after it, put back | the first marks the same rows at its `go_online`; the second gets them back once the first payment is back and mined |
+| a marked row that a deleted `Failed` transfer's coloring names | `delete_transfers` removes it; once the payment is back, a new row (another index), an envelope |
 
 The planner's earlier case of a coin whose TX BDK never saw (`FAKE_TXID`) still refuses.
 
-**Mutations**, 13 by hand (a script that restores the file from a copy, never through git), each
-condition broken alone: 12 fail a test. (b): the canonical half dropped
+**Mutations**, 15 by hand (a script that restores the file from a copy, never through git), each
+condition broken alone: 14 fail a test. (c), after the review: dropped
+(`a_send_whose_tx_is_replaced_is_still_refused` and the planner), `Failed` transfers counted (the
+planner). (b): the canonical half dropped
 (`plan_table_of_a_replaced_payment`), the graph half dropped (that and the CC-99 planner's
 `FAKE_TXID` case), the creator check skipped. (a): `Failed` allocations counted, allocations
 ignored, the pending blind receive, the pending witness, the reservation ignored, `holds_nothing`
@@ -2128,15 +2155,33 @@ instead (three), not written (six: P7's `Internal`). One survives, equivalent on
 runtime set to explicit persistence and `persist()`ed with nothing to complete, where nothing is
 dirty.
 
+### From the review
+
+The review of `09cbbda` found no blocker and no major; its probes are regression tests now.
+
+- **F1, minor: the rule was wider than CC-115** (`c0e51da`). A send's BTC change, uncolored after a
+  send of a whole allocation, of a TX another install replaced, was marked: `go_online` passed and
+  the transfer stayed `WaitingConfirmations` for good, with no error to the host. Condition (c)
+  above: a coin of a TX that a batch transfer still in play names refuses as before.
+- **F2, nit: "or evicted" was wrong** (`93a3fc8`). BDK records no eviction for this wallet; the
+  rustdoc, the log line and (b) say what does make a payment non-canonical.
+- **F3, nit: the row is not hidden from everything** (`93a3fc8`, and this file).
+  `list_unspents` still lists it, flagged; `delete_transfers` can remove it, and it comes back as a
+  new row (`112054c`). The app's own count of envelopes is the app's to filter.
+- **F4, nit: the VSS restore marker** goes before the commit when the check only marked rows:
+  documented under [What changes](#what-changes-4), not changed.
+- Pinned from the probes as well (`112054c`): a payment that comes back unconfirmed, and copies of
+  the wallet from before and after the marking.
+
 ### Carrying it
 
 Fork-only files (`unrecorded_spends.rs`, its tests, the scripted chain), plus two rustdoc paragraphs
 next to fork-only lines (`InconsistencyReason::NoCanonicalSpender`,
 `OnlineOptions::complete_unrecorded_spends`): it goes wherever §6 goes. It reads
 `get_rgb_allocations`, `iter_reserved_txos`, `update_txo` and BDK's `tx_graph()` and
-`transactions()`, all on the `-bfa` tags. Checked with `git merge-tree --merge-base=62a8c3a <tag>
-09cbbda` against both `-bfa` tags (2026-10-06, not compiled): the same conflicting files and
-hunks as at `1de6980`, none new. The return of a payment relies on `set_txo` raising
+`transactions()` and `get_batch_transfers_by_txid`, all on the `-bfa` tags. Checked with
+`git merge-tree --merge-base=62a8c3a <tag> 09cbbda`, and again at `112054c`, against both `-bfa`
+tags (2026-10-06, not compiled): the same conflicting files and hunks as at `1de6980`, none new. The return of a payment relies on `set_txo` raising
 `exists` on a conflict and on `update_db_colored_txos_from_bdk` comparing rows with `exists`; if a
 new base changes either, `a_replaced_payment_that_comes_back_brings_its_envelopes_back` fails.
 
@@ -2212,8 +2257,8 @@ git push origin era/<name>                              # the branch only, never
   §7: one more conflict in `From<InternalError> for Error` on `v0.3.0-beta.43-bfa`, two upstream
   tests whose expectation changed, the format tripwire to run first, and the private rgb-ops to
   check.
-- `09cbbda` (CC-115): see [Carrying it](#carrying-it-3) in §9; no conflict beyond the series'
-  own on either `-bfa` tag.
+- `09cbbda` and `93a3fc8` to `112054c` (CC-115): see [Carrying it](#carrying-it-3) in §9; no
+  conflict beyond the series' own on either `-bfa` tag.
 - If the proxy forwarder guard fires, route the new call through
   `WalletOnline::proxy_client`, `reject_list_client` or `check_proxy_endpoint`, and change the
   expected set in `era.yml` only for a line that is not a call site; do not widen the
