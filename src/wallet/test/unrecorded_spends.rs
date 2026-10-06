@@ -2987,3 +2987,126 @@ fn the_envelopes_of_a_replaced_create_utxos_are_marked_too() {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|t| !t.exists && !t.spent));
 }
+
+// the first payment comes back unconfirmed (the bump evicted, the first broadcast again and seen
+// later): its rows exist again, the same rows, and the bump's are marked
+#[test]
+#[parallel]
+fn a_replaced_payment_that_comes_back_unconfirmed_brings_its_envelopes_back() {
+    let mut payment = EnvelopePayment::new(2);
+    let first = payment.txid.clone();
+    let rows = payment.rows(&first);
+    let replacement = payment.bump();
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(payment.envelopes(&replacement), 2);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    payment.chain.evict(&replacement);
+    payment.chain.readmit(&first);
+    payment.reopen().unwrap();
+    assert_eq!(payment.rows(&first), rows);
+    assert_eq!(payment.envelopes(&first), 2);
+    assert_eq!(payment.envelopes(&replacement), 0);
+    assert!(
+        payment
+            .rows(&replacement)
+            .iter()
+            .all(|t| !t.exists && !t.spent)
+    );
+}
+
+// the marking follows the chain, not the copy: a copy of the wallet taken before it marks the
+// same rows at its next go_online, and a copy taken after it gets them back once the first
+// payment is back and mined
+#[test]
+#[parallel]
+fn copies_from_before_and_after_the_marking_follow_the_chain() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let before = tempfile::tempdir().unwrap();
+    copy_dir(&payment.wallet.get_wallet_dir(), before.path());
+    let replacement = payment.bump();
+    payment.reopen().unwrap();
+    assert!(payment.rows(&first).iter().all(|t| !t.exists));
+    let after = tempfile::tempdir().unwrap();
+    copy_dir(&payment.wallet.get_wallet_dir(), after.path());
+
+    let put_back = |payment: &mut EnvelopePayment, copy: &tempfile::TempDir| {
+        let wallet_data = payment.wallet.get_wallet_data();
+        let keys = payment.wallet.get_keys();
+        let wallet_dir = payment.wallet.get_wallet_dir();
+        drop(std::mem::replace(
+            &mut payment.wallet,
+            get_test_wallet(false, Some(1)),
+        ));
+        fs::remove_dir_all(&wallet_dir).unwrap();
+        copy_dir(copy.path(), &wallet_dir);
+        payment.wallet = Wallet::new(wallet_data, keys).unwrap();
+        payment.online = payment
+            .wallet
+            .go_online(completing_options(&payment.chain))
+            .unwrap();
+    };
+    put_back(&mut payment, &before);
+    assert!(payment.rows(&first).iter().all(|t| !t.exists));
+    assert_eq!(payment.envelopes(&replacement), 1);
+
+    payment.chain.evict(&replacement);
+    payment.chain.readmit(&first);
+    payment.chain.mine(1);
+    put_back(&mut payment, &after);
+    assert!(payment.rows(&first).iter().all(|t| t.exists && !t.spent));
+    assert_eq!(payment.envelopes(&first), 1);
+    assert!(payment.rows(&replacement).iter().all(|t| !t.exists));
+}
+
+// upstream's delete_transfers removes the `!exists` rows the colorings of a deleted transfer name
+// (its cleanup of a send's unbroadcast change): a marked row that a Failed transfer's coloring
+// names goes with it, and comes back as a new row once the payment is back
+#[test]
+#[parallel]
+fn a_marked_row_a_deleted_transfer_names_comes_back_as_a_new_row() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    assert_eq!(payment.invoice().unwrap(), first);
+    let idx = payment
+        .wallet
+        .list_transfers(AssetFilter::AnyOrNone, None)
+        .unwrap()[0]
+        .batch_transfer_idx;
+    assert!(
+        payment
+            .wallet
+            .fail_transfers(payment.online, Some(idx), false, false)
+            .unwrap()
+    );
+    let replacement = payment.bump();
+    payment.reopen().unwrap();
+    let gone = payment.rows(&first);
+    assert!(gone.len() == 1 && !gone[0].exists);
+    {
+        let txn = payment.wallet.database().begin_transaction().unwrap();
+        let asset_transfer = &asset_transfers_of(&txn, idx)[0];
+        txn.set_coloring(DbColoringActMod {
+            txo_idx: ActiveValue::Set(gone[0].idx),
+            asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
+            r#type: ActiveValue::Set(ColoringType::Receive),
+            assignment: ActiveValue::Set(Assignment::Fungible(AMOUNT)),
+            ..Default::default()
+        })
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(payment.wallet.delete_transfers(Some(idx), false).unwrap());
+    assert!(payment.rows(&first).is_empty());
+
+    payment.chain.evict(&replacement);
+    payment.chain.readmit(&first);
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    let back = payment.rows(&first);
+    assert!(back.len() == 1 && back[0].exists && !back[0].spent);
+    assert_ne!(back[0].idx, gone[0].idx);
+    assert_eq!(payment.envelopes(&first), 1);
+}
