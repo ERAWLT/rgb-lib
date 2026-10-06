@@ -1713,7 +1713,10 @@ fn apply_refuses_to_leave_a_divergence() {
         &mut base.party.wallet,
         &txn,
         &mut runtime,
-        Plan { spends: vec![] },
+        Plan {
+            spends: vec![],
+            gone_envelopes: vec![],
+        },
     );
     assert_matches!(result, Err(Error::Internal { details }) if details.contains("left a divergence"));
 }
@@ -2386,4 +2389,480 @@ fn the_public_sync_after_s1_preempts_the_completion() {
     assert!(party.wallet.completed_spends().is_empty());
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
     assert!(stash_witness(&party, &txid).is_none());
+}
+
+// CC-115: an envelope paid from outside the wallet whose payment is replaced (a fee bump, or
+// another wallet on the same seed spending the same coins) before it confirms. Once BDK learns
+// the replacement, from go_online's full scan of the colored keychain, it no longer holds the
+// first payment, and the rows the colored payment sync recorded are divergent coins that nothing
+// spends. One that holds nothing is marked as not existing and comes back with its payment; one
+// that holds anything is refused as before.
+
+/// A payment of envelopes from outside: the wallet as the bridge opens it (the completion on, one
+/// allocation per UTXO), `count` colored addresses handed out and paid in one TX, which the
+/// colored payment sync recorded while unconfirmed.
+struct EnvelopePayment {
+    chain: ScriptedChain,
+    wallet: Wallet,
+    online: Online,
+    addresses: Vec<String>,
+    txid: String,
+}
+
+impl EnvelopePayment {
+    fn new(count: usize) -> Self {
+        let chain = ScriptedChain::start();
+        let mut wallet = get_test_wallet(false, Some(1));
+        let online = wallet.go_online(completing_options(&chain)).unwrap();
+        let addresses: Vec<String> = (0..count)
+            .map(|_| wallet.get_colored_address().unwrap())
+            .collect();
+        let txid = chain.pay(&paying(&addresses, UTXO_SATS as u64)).to_string();
+        wallet.sync_colored_payments(online, vec![]).unwrap();
+        let mut payment = Self {
+            chain,
+            wallet,
+            online,
+            addresses,
+            txid: txid.clone(),
+        };
+        assert_eq!(payment.envelopes(&txid), count);
+        payment
+    }
+
+    /// Replace the payment by one paying `outputs`. BDK orders unconfirmed conflicts by when it
+    /// last saw each, in seconds, a tie going by TXID: the replacement is seen a second later at
+    /// least, as it is in the field.
+    fn replace(&self, outputs: &[(&str, u64)]) -> String {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        self.chain.replace(&self.txid, outputs).to_string()
+    }
+
+    /// The same addresses paid again, for less: a fee bump.
+    fn bump(&self) -> String {
+        self.replace(&paying(&self.addresses, UTXO_SATS as u64 - 500))
+    }
+
+    /// Offline, then online again with the completion on, as the bridge reopens a wallet.
+    fn reopen(&mut self) -> Result<(), Error> {
+        self.wallet.go_offline();
+        self.online = self.wallet.go_online(completing_options(&self.chain))?;
+        Ok(())
+    }
+
+    /// The RGB-ready UTXOs of `txid` the wallet lists, as the bridge counts them (colorable and
+    /// existing).
+    fn envelopes(&mut self, txid: &str) -> usize {
+        self.wallet
+            .list_unspents(None, false, true)
+            .unwrap()
+            .into_iter()
+            .filter(|u| u.utxo.colorable && u.utxo.exists && u.utxo.outpoint.txid == txid)
+            .count()
+    }
+
+    /// The database rows of the outputs of `txid`.
+    fn rows(&self, txid: &str) -> Vec<DbTxo> {
+        let txn = self.wallet.database().begin_transaction().unwrap();
+        txn.iter_txos()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.txid == txid)
+            .collect()
+    }
+
+    /// A blind invoice on an envelope of the wallet: the TXID of the UTXO it took.
+    fn invoice(&mut self) -> Result<String, Error> {
+        let receive = self.wallet.blind_receive(
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![self.chain.proxy_endpoint()],
+            MIN_CONFIRMATIONS,
+        )?;
+        let utxo = self
+            .wallet
+            .list_transfers(AssetFilter::AnyOrNone, None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.batch_transfer_idx == receive.batch_transfer_idx)
+            .unwrap()
+            .receive_utxo
+            .unwrap();
+        Ok(utxo.txid)
+    }
+
+    fn refused_as_no_canonical_spender(&mut self) {
+        let error = self.reopen().err().unwrap();
+        assert_matches!(error, Error::Inconsistency { .. });
+        assert_eq!(
+            error.inconsistency_reason(),
+            Some(InconsistencyReason::NoCanonicalSpender)
+        );
+    }
+}
+
+fn paying(addresses: &[String], amount: u64) -> Vec<(&str, u64)> {
+    addresses.iter().map(|a| (a.as_str(), amount)).collect()
+}
+
+// the replaced payment's empty envelopes are marked as not existing and count as envelopes no
+// more; the replacement's outputs on the same addresses, which go_online's full scan records, are
+// the envelopes now. Upstream's check, without the option, still refuses.
+#[test]
+#[parallel]
+fn a_replaced_payment_of_empty_envelopes_lets_go_online_through() {
+    let mut payment = EnvelopePayment::new(2);
+    let first = payment.txid.clone();
+    let replacement = payment.bump();
+
+    payment.wallet.go_offline();
+    let result = payment.wallet.go_online(online_options(&payment.chain));
+    assert_matches!(result, Err(Error::Inconsistency { .. }));
+    assert_eq!(result.err().unwrap().inconsistency_reason(), None);
+    assert!(payment.rows(&first).iter().all(|t| t.exists));
+
+    payment.reopen().unwrap();
+    assert!(payment.wallet.completed_spends().is_empty());
+    let bdk = payment.wallet.bdk_wallet();
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    assert!(bdk.get_tx(first_id).is_none() && bdk.tx_graph().get_tx(first_id).is_some());
+    let rows = payment.rows(&first);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|t| !t.exists && !t.spent && !t.pending_witness)
+    );
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(payment.envelopes(&replacement), 2);
+    // one invoice per envelope: the replacement's two, and none on the first payment's
+    assert_eq!(payment.invoice().unwrap(), replacement);
+    assert_eq!(payment.invoice().unwrap(), replacement);
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+
+    // nothing left to mark: the next go_online changes nothing
+    payment.reopen().unwrap();
+    assert_eq!(payment.rows(&first), rows);
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&replacement), 2);
+    payment.chain.assert_all_matched();
+}
+
+// a replacement paying other colored addresses of the wallet, within the full scan's stop gap
+// (another install on the same seed paying the addresses it handed out): seen, and the first
+// payment's envelopes are marked the same way
+#[test]
+#[parallel]
+fn a_payment_replaced_by_one_to_other_addresses_lets_go_online_through() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let others: Vec<String> = (0..2)
+        .map(|_| payment.wallet.get_colored_address().unwrap())
+        .collect();
+    let replacement = payment.replace(&paying(&others, UTXO_SATS as u64 - 500));
+
+    payment.reopen().unwrap();
+    assert!(payment.rows(&first).iter().all(|t| !t.exists));
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(payment.envelopes(&replacement), 2);
+}
+
+// the limit of the rule: a replacement that pays none of the wallet's scripts never reaches BDK,
+// which keeps holding the first payment as canonical (the requests carry no expected TXIDs, so
+// nothing tells it of an eviction). No divergence, no refusal, and the envelope stays listed
+// although its TX is gone: the host's rule for when a payment's envelopes are ready covers it
+// (ERA.md, section 9)
+#[test]
+#[parallel]
+fn a_payment_replaced_out_of_the_wallets_sight_stays_listed() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let elsewhere = get_test_wallet(false, None).get_address().unwrap();
+    payment.replace(&[(elsewhere.as_str(), UTXO_SATS as u64 - 500)]);
+    assert!(!payment.chain.knows(&first));
+
+    payment.reopen().unwrap();
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+    assert_eq!(payment.envelopes(&first), 1);
+}
+
+// the payment comes back (the replacement dropped, the first payment broadcast again and mined):
+// its rows exist again, the same rows, and the replacement's are marked in turn
+#[test]
+#[parallel]
+fn a_replaced_payment_that_comes_back_brings_its_envelopes_back() {
+    let mut payment = EnvelopePayment::new(2);
+    let first = payment.txid.clone();
+    let rows = payment.rows(&first);
+    let replacement = payment.bump();
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(payment.envelopes(&replacement), 2);
+
+    payment.chain.evict(&replacement);
+    payment.chain.readmit(&first);
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert!(payment.wallet.completed_spends().is_empty());
+    assert_eq!(payment.rows(&first), rows);
+    assert_eq!(payment.envelopes(&first), 2);
+    assert_eq!(payment.envelopes(&replacement), 0);
+    assert!(payment.rows(&replacement).iter().all(|t| !t.exists));
+    assert_eq!(payment.invoice().unwrap(), first);
+    assert_eq!(payment.invoice().unwrap(), first);
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+    payment.chain.assert_all_matched();
+}
+
+// an envelope that holds something is refused as before, nothing committed: a blind invoice
+// waiting on it, an asset issued on it, a drain begun on it (once the drain is aborted the
+// envelope holds nothing, and go_online goes through)
+#[test]
+#[parallel]
+fn a_replaced_payment_whose_envelope_holds_something_is_refused() {
+    // a blind invoice
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    assert_eq!(payment.invoice().unwrap(), first);
+    let replacement = payment.bump();
+    payment.refused_as_no_canonical_spender();
+    assert!(payment.rows(&first).iter().all(|t| t.exists && !t.spent));
+    assert!(payment.rows(&replacement).is_empty());
+    payment.refused_as_no_canonical_spender();
+
+    // an asset issued on it
+    let mut payment = EnvelopePayment::new(1);
+    issue(&payment.wallet, vec![AMOUNT]);
+    let first = payment.txid.clone();
+    payment.bump();
+    payment.refused_as_no_canonical_spender();
+    assert!(payment.rows(&first).iter().all(|t| t.exists));
+
+    // a drain begun on it, then aborted
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let address = get_test_wallet(false, None).get_address().unwrap();
+    let psbt = payment
+        .wallet
+        .drain_to_begin(payment.online, address, FEE_RATE, false)
+        .unwrap();
+    payment.bump();
+    payment.refused_as_no_canonical_spender();
+    assert!(payment.rows(&first).iter().all(|t| t.exists));
+    payment
+        .wallet
+        .abort_pending_vanilla_tx(psbt_txid(&psbt))
+        .unwrap();
+    payment.reopen().unwrap();
+    assert!(payment.rows(&first).iter().all(|t| !t.exists));
+}
+
+// a blind invoice on the envelope that failed before the payment was replaced holds nothing, by
+// the wallet's own accounting of a UTXO's slots: go_online goes through, the transfer stays failed
+#[test]
+#[parallel]
+fn a_replaced_payment_whose_invoice_failed_lets_go_online_through() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    assert_eq!(payment.invoice().unwrap(), first);
+    let idx = payment
+        .wallet
+        .list_transfers(AssetFilter::AnyOrNone, None)
+        .unwrap()[0]
+        .batch_transfer_idx;
+    assert!(
+        payment
+            .wallet
+            .fail_transfers(payment.online, Some(idx), false, false)
+            .unwrap()
+    );
+    let replacement = payment.bump();
+
+    payment.reopen().unwrap();
+    assert!(payment.rows(&first).iter().all(|t| !t.exists));
+    assert_eq!(status_of(&payment.wallet, idx), TransferStatus::Failed);
+    assert_eq!(payment.invoice().unwrap(), replacement);
+}
+
+// with an own spend whose record was lost in the same go_online: one plan, all or nothing. A
+// lookup that fails refuses the whole of it and marks nothing; the next go_online completes the
+// spend and marks the envelope
+#[test]
+#[parallel]
+fn a_replaced_payment_and_a_lost_spend_go_together() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid) = donation_answer_lost(&chain, &mut party);
+    let address = party.wallet.get_colored_address().unwrap();
+    let first = chain.fund(&address, UTXO_SATS as u64).to_string();
+    party
+        .wallet
+        .sync_colored_payments(party.online, vec![])
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    chain.replace(&first, &[(address.as_str(), UTXO_SATS as u64 - 500)]);
+    let exists = |party: &Issuer| {
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        txn.iter_txos()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.txid == first)
+            .unwrap()
+            .exists
+    };
+
+    chain.fault("GET", &format!("/tx/{txid}/status"), 502, false, 1);
+    let result = reopen(&chain, &mut party, completing_options(&chain));
+    assert_matches!(result, Err(Error::Indexer { .. }));
+    assert!(exists(&party));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert!(!exists(&party));
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+}
+
+impl Base {
+    /// An issuer's envelope paid from outside and recorded unconfirmed, the payment then replaced
+    /// by one to the same address: returns the base and the two TXIDs.
+    fn replaced_payment() -> (Self, String, String) {
+        let chain = ScriptedChain::start();
+        let party = issuer(&chain, vec![AMOUNT]);
+        let mut wallet = party.wallet;
+        let address = wallet.get_colored_address().unwrap();
+        let first = chain.fund(&address, UTXO_SATS as u64).to_string();
+        wallet.sync_colored_payments(party.online, vec![]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let replacement = chain
+            .replace(&first, &[(address.as_str(), UTXO_SATS as u64 - 500)])
+            .to_string();
+        let party = Issuer { wallet, ..party };
+        (Self::scan(chain, party, vec![]), first, replacement)
+    }
+}
+
+// CC-115 in the planner table: the envelope is set aside only while its TX is one BDK saw and no
+// longer holds as canonical and the wallet's records leave it empty; anything else, and any other
+// coin nothing spends beside it, is refused as before, with nothing asked
+#[test]
+#[parallel]
+fn plan_table_of_a_replaced_payment() {
+    let (base, first, replacement) = Base::replaced_payment();
+    let row = |txn: &DbTxn| {
+        txn.iter_txos()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.txid == first)
+            .unwrap()
+    };
+    let refused = |(result, asked): (Result<Plan, Error>, Vec<String>)| {
+        let error = result.err().unwrap();
+        assert_eq!(
+            error.inconsistency_reason(),
+            Some(InconsistencyReason::NoCanonicalSpender)
+        );
+        assert!(asked.is_empty());
+    };
+    let unchanged = |_: &mut SpendView, _: &mut Lookup| {};
+
+    // as it is: nothing to complete, the envelope gone, nothing asked
+    let (result, asked) = base.plan(|_, _| {}, unchanged);
+    let plan = result.unwrap();
+    assert!(plan.spends.is_empty());
+    assert_eq!(
+        plan.gone_envelopes
+            .iter()
+            .map(|t| t.outpoint())
+            .collect::<Vec<_>>(),
+        vec![Outpoint {
+            txid: first.clone(),
+            vout: 0
+        }]
+    );
+    assert!(asked.is_empty());
+
+    // its TX canonical after all
+    refused(base.plan(
+        |_, _| {},
+        |view, _| {
+            assert!(view.non_canonical_creators.contains(&first));
+            view.non_canonical_creators.clear();
+        },
+    ));
+    // a witness receive landing on it
+    refused(base.plan(
+        |txn, _| {
+            let mut txo: DbTxoActMod = row(txn).into();
+            txo.pending_witness = ActiveValue::Set(true);
+            txn.update_txo(txo).unwrap();
+        },
+        unchanged,
+    ));
+    // reserved (a drain or another vanilla TX begun on it)
+    refused(base.plan(
+        |txn, _| {
+            txn.set_reserved_txos(vec![DbReservedTxoActMod {
+                txid: ActiveValue::Set(first.clone()),
+                vout: ActiveValue::Set(0),
+                reserved_for: ActiveValue::Set(None),
+                ..Default::default()
+            }])
+            .unwrap();
+        },
+        unchanged,
+    ));
+    // an allocation on it (the issuance's, moved there); one of a failed transfer holds nothing
+    let allocate = |txn: &DbTxn| {
+        let issuance = txn
+            .iter_asset_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.asset_id.as_deref() == Some(base.party.asset_id.as_str()))
+            .unwrap();
+        txn.set_coloring(DbColoringActMod {
+            txo_idx: ActiveValue::Set(row(txn).idx),
+            asset_transfer_idx: ActiveValue::Set(issuance.idx),
+            r#type: ActiveValue::Set(ColoringType::Issue),
+            assignment: ActiveValue::Set(Assignment::Fungible(AMOUNT)),
+            ..Default::default()
+        })
+        .unwrap();
+        issuance.batch_transfer_idx
+    };
+    refused(base.plan(
+        |txn, _| {
+            allocate(txn);
+        },
+        unchanged,
+    ));
+    let plan = base
+        .plan_after(|txn, _| {
+            let issuance = allocate(txn);
+            set_status(txn, issuance, TransferStatus::Failed);
+        })
+        .unwrap();
+    assert_eq!(plan.gone_envelopes.len(), 1);
+    // beside it, a row of a TX BDK holds as canonical (the replacement) that BDK does not list
+    // and nothing spends; or one of a TX BDK never saw
+    for txid in [replacement.as_str(), FAKE_TXID] {
+        refused(base.plan(
+            |txn, _| {
+                txn.set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set(txid.to_string()),
+                    vout: ActiveValue::Set(9),
+                    btc_amount: ActiveValue::Set(s!("1000")),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(true),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                })
+                .unwrap();
+            },
+            unchanged,
+        ));
+    }
 }
