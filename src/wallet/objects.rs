@@ -139,10 +139,10 @@ pub struct OnlineOptions {
     /// `WaitingConfirmations`, the drain's reservations released), provided every coin in
     /// question is spent by such a transaction and the indexer knows it; it broadcasts nothing
     /// and contacts no RGB proxy. A coin nothing spends is accepted in one case only (CC-115): it
-    /// holds nothing, and BDK has seen the transaction that created it and no longer holds it as
+    /// holds nothing, BDK has seen the transaction that created it and no longer holds it as
     /// canonical (a payment replaced before it confirmed, by a conflicting transaction BDK
-    /// learnt); its row is then marked as not existing until that transaction is back. What it
-    /// completed is read with
+    /// learnt), and no transfer of this wallet still in play names that transaction; its row is
+    /// then marked as not existing until that transaction is back. What it completed is read with
     /// [`Wallet::completed_spends`](crate::wallet::Wallet::completed_spends). Anything it cannot
     /// prove is refused as before, with nothing committed to the database (a `stash-refused`
     /// [`Error::UnrecordedSpend`] can leave spends consumed before it in the stash, see the fork's

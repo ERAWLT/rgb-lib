@@ -970,9 +970,10 @@ pub enum InconsistencyReason {
     SpenderNotRecorded,
     /// A coin has no spender in the wallet's view of the chain: the transaction that created it
     /// was replaced or reorganized away, and the coin holds something (an allocation, a blind or
-    /// witness receive, a reservation), or the wallet's view of the chain never had that
-    /// transaction. An empty coin of a transaction that view had and no longer holds is not
-    /// refused but marked as not existing (CC-115, the fork's `ERA.md`, section 9)
+    /// witness receive, a reservation), or a transfer of this wallet still in play names that
+    /// transaction, or the wallet's view of the chain never had it. An empty coin of a transaction
+    /// that view had and no longer holds, which no such transfer names, is not refused but marked
+    /// as not existing (CC-115, the fork's `ERA.md`, section 9)
     NoCanonicalSpender,
     /// A colored output of a spend this wallet recorded was spent by a transaction it has no
     /// record of

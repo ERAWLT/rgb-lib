@@ -31,11 +31,11 @@
 //! the same coins). Its row is `exists && !spent`, BDK no longer lists it, and nothing spends it.
 //! When BDK has seen the payment and no longer holds it as canonical (it learnt a conflicting TX,
 //! or the payment descends from one: BDK records no eviction, since rgb-lib's requests carry no
-//! expected TXIDs), and the wallet's records leave the coin empty, the check marks the row as not
-//! existing (`exists` false, as a TXO of a TX that has not reached the network is) instead of
-//! refusing: out of every selection and of the check, and back as it was once a sync sees the
-//! payment canonical again. Any other coin without a spender is refused as before. See the fork's
-//! `ERA.md`, section 9.
+//! expected TXIDs), no transfer of this wallet still in play names that TX, and the wallet's
+//! records leave the coin empty, the check marks the row as not existing (`exists` false, as a TXO
+//! of a TX that has not reached the network is) instead of refusing: out of every selection and of
+//! the check, and back as it was once a sync sees the payment canonical again. Any other coin
+//! without a spender is refused as before. See the fork's `ERA.md`, section 9.
 
 use super::*;
 use crate::wallet::online::SIGNED_PSBT_FILE;
@@ -228,9 +228,11 @@ fn read_transfer_file(
 }
 
 /// CC-115: the divergent coins without a spender, if every one is an envelope of a payment BDK
-/// no longer holds: its creating TX is one of `view.non_canonical_creators`, and the wallet's
-/// records leave the coin empty ([`holds_nothing`]). `None` when any one is not: it is refused as
-/// before.
+/// no longer holds: its creating TX is one of `view.non_canonical_creators`, no batch transfer of
+/// this wallet but a `Failed` one names that TX (a payment from outside never is; a send's change
+/// is, and holds nothing when the send moved a whole allocation, while its transfer waits on the
+/// TX), and the wallet's records leave the coin empty ([`holds_nothing`]). `None` when any one is
+/// not: it is refused as before.
 fn gone_envelopes(
     view: &SpendView,
     coins: &[BdkOutPoint],
@@ -244,6 +246,16 @@ fn gone_envelopes(
         .any(|c| !view.non_canonical_creators.contains(&c.txid.to_string()))
     {
         return Ok(None);
+    }
+    let creators: BTreeSet<String> = coins.iter().map(|c| c.txid.to_string()).collect();
+    for txid in &creators {
+        if txn
+            .get_batch_transfers_by_txid(txid)?
+            .iter()
+            .any(|b| !b.status.failed())
+        {
+            return Ok(None);
+        }
     }
     let mut txos = vec![];
     for coin in coins {
