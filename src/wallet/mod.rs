@@ -56,7 +56,7 @@ pub use offline::RgbWalletOpsOffline;
 pub use online::RgbWalletOpsOnline;
 pub use singlesig::{KeychainLayoutOverrides, SinglesigKeys, Wallet};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub use unrecorded_spends::CompletedSpend;
+pub use unrecorded_spends::{CompletedSpend, DroppedPayment};
 
 pub(crate) use backup::WalletBackup;
 pub(crate) use core::{

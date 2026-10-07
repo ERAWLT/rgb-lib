@@ -59,6 +59,28 @@ pub struct CompletedSpend {
     pub confirmations: u64,
 }
 
+/// ERA fork (L4b): what [`Wallet::forget_dropped_payment`](crate::wallet::Wallet::forget_dropped_payment)
+/// did with a payment of envelopes the host proved will never confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedPayment {
+    /// BDK never saw the TX: nothing of it to forget
+    NotSeen,
+    /// BDK holds the TX as confirmed: it was not dropped; nothing changed
+    Confirmed,
+    /// A TX BDK holds as canonical spends an output of it: forgetting the payment would take that
+    /// TX out of BDK's view as well; nothing changed
+    Spent,
+    /// A transfer of this wallet still in play names the TX, the wallet recorded a spend of one of
+    /// its colored outputs, or one of them holds something ([`holds_nothing`]); nothing changed
+    Held,
+    /// BDK no longer holds the TX as canonical, and `envelopes` of its colored outputs, which
+    /// existed, are marked as not existing
+    Forgotten {
+        /// The rows marked
+        envelopes: u32,
+    },
+}
+
 /// How the indexer answers for a transaction: `Some(confirmations)` when it knows it (0 in its
 /// mempool), `None` when it does not.
 pub(crate) trait TxStatusLookup {
@@ -270,6 +292,45 @@ fn gone_envelopes(
         .map(BdkOutPoint::from)
         .collect();
     let unspents = txn.get_rgb_allocations(txos, None, None, None, None)?;
+    if !unspents.iter().all(|u| holds_nothing(u, &reserved)) {
+        return Ok(None);
+    }
+    Ok(Some(unspents.into_iter().map(|u| u.utxo).collect()))
+}
+
+/// ERA fork (L4b): the colored outputs of the payment `txid` to mark as not existing once the host
+/// proved it dropped, or `None` when anything of the wallet stands on them — CC-115's (c) and (a):
+/// a batch transfer still in play names the TX, the wallet recorded a spend of one of them, or one
+/// holds something ([`holds_nothing`]). Outputs already not existing are left as they are.
+pub(crate) fn dropped_payment_envelopes(
+    txn: &DbTxn,
+    txid: &str,
+) -> Result<Option<Vec<DbTxo>>, Error> {
+    if txn
+        .get_batch_transfers_by_txid(txid)?
+        .iter()
+        .any(|b| !b.status.failed())
+    {
+        return Ok(None);
+    }
+    let rows: Vec<DbTxo> = txn
+        .iter_txos()?
+        .into_iter()
+        .filter(|t| t.txid == txid)
+        .collect();
+    if rows.iter().any(|t| t.spent) {
+        return Ok(None);
+    }
+    let existing: Vec<DbTxo> = rows.into_iter().filter(|t| t.exists).collect();
+    if existing.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    let reserved: HashSet<BdkOutPoint> = txn
+        .iter_reserved_txos()?
+        .into_iter()
+        .map(BdkOutPoint::from)
+        .collect();
+    let unspents = txn.get_rgb_allocations(existing, None, None, None, None)?;
     if !unspents.iter().all(|u| holds_nothing(u, &reserved)) {
         return Ok(None);
     }

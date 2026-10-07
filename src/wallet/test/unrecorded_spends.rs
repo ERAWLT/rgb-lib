@@ -2588,6 +2588,233 @@ fn a_payment_replaced_out_of_the_wallets_sight_stays_listed() {
     assert_eq!(payment.envelopes(&first), 1);
 }
 
+// L4b: the payment above, and one merely dropped from every mempool, which BDK keeps canonical for
+// good: the host that proved it dropped forgets it. BDK is told it left the mempool, its empty
+// envelopes are marked as not existing, go_online goes through; once the payment is back and mined,
+// the same rows are envelopes again
+#[test]
+#[parallel]
+fn a_dropped_payment_the_host_forgets_leaves_until_it_comes_back() {
+    let mut payment = EnvelopePayment::new(2);
+    let first = payment.txid.clone();
+    let rows = payment.rows(&first);
+    payment.chain.evict(&first);
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 2, "BDK keeps a dropped payment");
+
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.to_uppercase())
+            .unwrap(),
+        DroppedPayment::Forgotten { envelopes: 2 }
+    );
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    let bdk = payment.wallet.bdk_wallet();
+    assert!(bdk.get_tx(first_id).is_none() && bdk.tx_graph().get_tx(first_id).is_some());
+    assert!(
+        payment
+            .rows(&first)
+            .iter()
+            .all(|t| !t.exists && !t.spent && !t.pending_witness)
+    );
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+
+    // across a go_online, and asked again with nothing left to mark
+    payment.reopen().unwrap();
+    assert!(payment.wallet.completed_spends().is_empty());
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Forgotten { envelopes: 0 }
+    );
+
+    payment.chain.readmit(&first);
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert_eq!(payment.rows(&first), rows);
+    assert_eq!(payment.envelopes(&first), 2);
+    assert_eq!(payment.invoice().unwrap(), first);
+    payment.chain.assert_all_matched();
+}
+
+// a forgotten payment the indexer lists again, unconfirmed and seen after it was forgotten: BDK
+// holds it as canonical again and its envelopes exist again
+#[test]
+#[parallel]
+fn a_forgotten_payment_seen_again_in_the_mempool_is_back() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    payment.chain.evict(&first);
+    payment.reopen().unwrap();
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Forgotten { envelopes: 1 }
+    );
+    // BDK orders sightings by the second
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    payment.chain.readmit(&first);
+    payment.reopen().unwrap();
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+    assert_eq!(payment.envelopes(&first), 1);
+}
+
+// what keeps a payment from being forgotten, each time with nothing changed: a TX BDK never saw, a
+// txid that is not one, a confirmed payment, a blind invoice or an asset on its envelope, and a
+// canonical TX spending one of its outputs (it would leave BDK's view with the payment)
+#[test]
+#[parallel]
+fn a_payment_the_wallet_stands_on_is_not_forgotten() {
+    let mut payment = EnvelopePayment::new(1);
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(FAKE_TXID.to_string())
+            .unwrap(),
+        DroppedPayment::NotSeen
+    );
+    assert_matches!(
+        payment.wallet.forget_dropped_payment(s!("not a txid")),
+        Err(Error::InvalidTxid)
+    );
+
+    // a blind invoice waiting on its envelope
+    let first = payment.txid.clone();
+    assert_eq!(payment.invoice().unwrap(), first);
+    let rows = payment.rows(&first);
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Held
+    );
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+    assert_eq!(payment.rows(&first), rows);
+    payment.reopen().unwrap();
+
+    // confirmed
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Confirmed
+    );
+    assert_eq!(payment.envelopes(&first), 1);
+
+    // an asset issued on its envelope
+    let mut payment = EnvelopePayment::new(1);
+    issue(&payment.wallet, vec![AMOUNT]);
+    let first = payment.txid.clone();
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Held
+    );
+    assert!(payment.rows(&first).iter().all(|t| t.exists));
+
+    // a canonical TX spending its envelope
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    let vout = payment.rows(&first)[0].vout;
+    let child = crate::bitcoin::Transaction {
+        version: crate::bitcoin::transaction::Version::TWO,
+        lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+        input: vec![crate::bitcoin::TxIn {
+            previous_output: crate::bitcoin::OutPoint::new(first_id, vout),
+            ..Default::default()
+        }],
+        output: vec![crate::bitcoin::TxOut {
+            value: crate::bitcoin::Amount::from_sat(500),
+            script_pubkey: crate::bitcoin::ScriptBuf::new(),
+        }],
+    };
+    let seen_at = now().unix_timestamp() as u64;
+    payment
+        .wallet
+        .bdk_wallet_db_mut()
+        .0
+        .apply_unconfirmed_txs([(child, seen_at)]);
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Spent
+    );
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+    assert!(payment.rows(&first).iter().all(|t| t.exists));
+
+    // a colored output of it the wallet recorded as spent, by a TX BDK does not hold
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let row = payment.rows(&first).remove(0);
+    let txn = payment.wallet.database().begin_transaction().unwrap();
+    let mut spent: DbTxoActMod = row.into();
+    spent.spent = ActiveValue::Set(true);
+    txn.update_txo(spent).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Held
+    );
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+}
+
+// a TX that a transfer still in play names is not forgotten, even when its colored output holds
+// nothing: an own send of a whole allocation, waiting for its confirmations, whose change carries
+// no coloring (its transfer waits on that TX)
+#[test]
+#[parallel]
+fn a_send_waiting_on_its_tx_is_not_forgotten() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT, true);
+    let idx = begin.batch_transfer_idx.unwrap();
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    assert!(
+        party
+            .wallet
+            .list_unspents(None, false, true)
+            .unwrap()
+            .iter()
+            .filter(|u| u.utxo.outpoint.txid == txid)
+            .all(|u| u.rgb_allocations.is_empty())
+    );
+    assert_eq!(
+        party.wallet.forget_dropped_payment(txid.clone()).unwrap(),
+        DroppedPayment::Held
+    );
+    let id = crate::bitcoin::Txid::from_str(&txid).unwrap();
+    assert!(party.wallet.bdk_wallet().get_tx(id).is_some());
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+}
+
 // the payment comes back (the replacement dropped, the first payment broadcast again and mined):
 // its rows exist again, the same rows, and the replacement's are marked in turn
 #[test]
