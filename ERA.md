@@ -2255,8 +2255,10 @@ info.
 
 Fork-only code beside §9's (`singlesig.rs` next to `sync_colored_payments`, `unrecorded_spends.rs`)
 and its tests: it goes wherever §9 goes. It reads BDK's `tx_graph().get_tx_node`, `get_tx`,
-`transactions()` and calls `apply_evicted_txs` (bdk_wallet 3.1.0), all present on the `-bfa` tags'
-BDK.
+`transactions()` and calls `apply_evicted_txs`: bdk_wallet `=3.1.0`, which every `-bfa` tag from
+beta.34 to beta.43 pins as well. Checked with `git merge-tree --merge-base=62a8c3a
+v0.3.0-beta.43-bfa 665f241` (2026-10-08, not compiled): the same conflicting files as at
+`112054c`, none new.
 
 ## Carrying the series onto a new UTEXO tag
 
