@@ -65,7 +65,8 @@ pub struct CompletedSpend {
 pub enum DroppedPayment {
     /// BDK never saw the TX: nothing of it to forget
     NotSeen,
-    /// BDK holds the TX as confirmed: it was not dropped; nothing changed
+    /// BDK holds the TX as mined — an anchor, a reorged block's too — or keeps it canonical
+    /// whatever its eviction says: it was not dropped; nothing changed
     Confirmed,
     /// A TX BDK holds as canonical spends an output of it: forgetting the payment would take that
     /// TX out of BDK's view as well; nothing changed
@@ -73,8 +74,12 @@ pub enum DroppedPayment {
     /// A transfer of this wallet still in play names the TX, the wallet recorded a spend of one of
     /// its colored outputs, or one of them holds something ([`holds_nothing`]); nothing changed
     Held,
-    /// BDK no longer holds the TX as canonical, and `envelopes` of its colored outputs, which
-    /// existed, are marked as not existing
+    /// Setting it aside, with the transactions competing for its coins, would let another
+    /// transaction BDK holds as not canonical come back; nothing changed
+    Conflicted,
+    /// BDK holds the TX — and every TX competing for its coins — as not canonical until one of
+    /// them is mined, and `envelopes` of its colored outputs, which existed, are marked as not
+    /// existing
     Forgotten {
         /// The rows marked
         envelopes: u32,

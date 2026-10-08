@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// ERA fork (L4b): the eviction time [`Wallet::forget_dropped_payment`] gives a payment the host
+/// believes dropped. bdk_chain holds an unconfirmed TX as not canonical while its last eviction
+/// is not older than its last sighting: no sighting reaches this, so only an anchor (the TX
+/// mined) makes it canonical again. `i64::MAX`, not `u64::MAX`: a store that keeps the time as a
+/// signed integer must not wrap it.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const DROPPED_UNTIL_MINED: u64 = i64::MAX as u64;
+
 /// Overrides of the keychain layout of a singlesig wallet: the coin type of each side's account
 /// and the keychain of the colored side. Every field left `None` keeps rgb-lib's default for the
 /// wallet network. The vanilla keychain is [`SinglesigKeys::vanilla_keychain`].
@@ -482,48 +490,49 @@ impl Wallet {
         Ok(())
     }
 
-    /// ERA fork (L4b): forget a payment of envelopes from outside the wallet that the host proved
-    /// will never confirm: dropped from every mempool, or replaced by a TX that pays none of the
-    /// wallet's colored scripts. BDK learns neither (rgb-lib's requests carry no expected TXIDs,
-    /// `ERA.md` §9): it keeps such a payment canonical and its envelopes listed, unconfirmed, for
-    /// good.
+    /// ERA fork (L4b): forget a payment of envelopes from outside the wallet that the host
+    /// believes will never confirm: dropped from every mempool, or replaced by a TX that pays none
+    /// of the wallet's colored scripts. BDK learns neither (rgb-lib's requests carry no expected
+    /// TXIDs, `ERA.md` §9): it keeps such a payment canonical and its envelopes listed,
+    /// unconfirmed, for good.
     ///
-    /// BDK is told the TX left the mempool (`apply_evicted_txs`), and its colored outputs that
+    /// BDK is told the TX — and every TX in its graph competing for the same coins — left the
+    /// mempool for good ([`DROPPED_UNTIL_MINED`]): none of them is canonical again until one is
+    /// mined, however often an indexer lists it unconfirmed. The payment's colored outputs that
     /// exist are marked as not existing, as `go_online` marks a replaced payment's (CC-115): out
     /// of every selection and of the consistency check, still listed by `list_unspents` with
-    /// `exists` false. If the payment comes back — a sync finds it in the indexer's mempool
-    /// again, or it is mined — BDK holds it as canonical again and the same rows exist again.
-    /// A payment BDK already holds as not canonical (a conflict it learnt) only has its rows
-    /// marked.
+    /// `exists` false. Mined after all, the payment is canonical again by its anchor, and the
+    /// same rows exist again — confirmed, so nothing that lands on them can be lost. The host's
+    /// belief may be wrong at no cost: a payment still in some mempool is set aside until it
+    /// confirms, never brought back unconfirmed under a host that stopped watching it.
     ///
     /// Only when nothing of the wallet stands on the payment; otherwise nothing is changed and
-    /// [`DroppedPayment`] says why: BDK holds it as confirmed, a TX BDK holds as canonical spends
-    /// one of its outputs (that TX would leave BDK's view with it), a transfer still in play names
-    /// it, or one of its colored outputs was spent by the wallet or holds something. Nothing is
-    /// asked of the indexer: that the payment is dropped is the host's to prove.
+    /// [`DroppedPayment`] says why: BDK holds it as mined (any anchor, a reorged block's too), a
+    /// TX BDK holds as canonical spends one of its outputs (that TX would leave BDK's view with
+    /// it), setting it aside would let another TX BDK holds as not canonical come back (worked
+    /// out on a copy of BDK's graph first), a transfer still in play names it, or one of its
+    /// colored outputs was spent by the wallet or holds something. Nothing is asked of the
+    /// indexer.
     ///
     /// The rows are written in one database transaction, committed after BDK's eviction is
     /// persisted. Should the commit fail, BDK holds the payment as not canonical while its rows
     /// exist: the next `go_online` with `complete_unrecorded_spends` marks them as CC-115 does,
-    /// under the same rule.
+    /// under the same rule. A call that changes nothing (asked again) writes nothing.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn forget_dropped_payment(&mut self, txid: String) -> Result<DroppedPayment, Error> {
         info!(self.logger(), "Forgetting dropped payment {txid}...");
         let id = Txid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
         let txid = id.to_string();
         let bdk = self.bdk_wallet();
-        let Some(node) = bdk.tx_graph().get_tx_node(id) else {
+        let graph = bdk.tx_graph();
+        let Some(node) = graph.get_tx_node(id) else {
             info!(self.logger(), "Forget dropped payment: BDK never saw it");
             return Ok(DroppedPayment::NotSeen);
         };
-        let last_seen = node.last_seen;
-        let confirmed = bdk
-            .get_tx(id)
-            .map(|wallet_tx| wallet_tx.chain_position.is_confirmed());
-        if confirmed == Some(true) {
+        if !node.anchors.is_empty() {
             info!(
                 self.logger(),
-                "Forget dropped payment: BDK holds it as confirmed"
+                "Forget dropped payment: BDK holds it as mined"
             );
             return Ok(DroppedPayment::Confirmed);
         }
@@ -541,6 +550,47 @@ impl Wallet {
             );
             return Ok(DroppedPayment::Spent);
         }
+        // The payment and every TX competing for its coins, set aside together: alone, the loser
+        // of a conflict it won would be canonical again.
+        let mut evicted: BTreeSet<Txid> = graph
+            .direct_conflicts(&node.tx)
+            .map(|(_, conflicting)| conflicting)
+            .collect();
+        evicted.insert(id);
+        // Worked out on a copy first: nothing may become canonical that is not now.
+        let chain = bdk.local_chain();
+        let tip = chain.tip().block_id();
+        let canonical = |g: &bdk_wallet::chain::TxGraph<
+            bdk_wallet::chain::ConfirmationBlockTime,
+        >|
+         -> HashSet<Txid> {
+            g.list_canonical_txs(chain, tip, CanonicalizationParams::default())
+                .map(|c| c.tx_node.txid)
+                .collect()
+        };
+        let before = canonical(graph);
+        let mut probe = graph.clone();
+        for t in &evicted {
+            let _ = probe.insert_evicted_at(*t, DROPPED_UNTIL_MINED);
+        }
+        let after = canonical(&probe);
+        if after.difference(&before).next().is_some() {
+            info!(
+                self.logger(),
+                "Forget dropped payment: another TX would come back"
+            );
+            return Ok(DroppedPayment::Conflicted);
+        }
+        if after.contains(&id) {
+            info!(
+                self.logger(),
+                "Forget dropped payment: BDK keeps it canonical"
+            );
+            return Ok(DroppedPayment::Confirmed);
+        }
+        let evicting = evicted
+            .iter()
+            .any(|t| graph.get_last_evicted(*t) != Some(DROPPED_UNTIL_MINED));
         let txn = self.database().begin_transaction()?;
         let Some(envelopes) = unrecorded_spends::dropped_payment_envelopes(&txn, &txid)? else {
             info!(
@@ -550,17 +600,30 @@ impl Wallet {
             return Ok(DroppedPayment::Held);
         };
         let marked = envelopes.len() as u32;
+        if marked == 0 && !evicting {
+            info!(
+                self.logger(),
+                "Forget dropped payment: forgotten before, nothing to change"
+            );
+            return Ok(DroppedPayment::Forgotten { envelopes: 0 });
+        }
         for txo in envelopes {
             let mut gone: DbTxoActMod = txo.into();
             gone.exists = ActiveValue::Set(false);
             txn.update_txo(gone)?;
         }
-        if confirmed.is_some() {
-            // bdk_chain holds a TX as not canonical once its last eviction is not older than its
-            // last sighting
-            let evicted_at = (now().unix_timestamp() as u64).max(last_seen.unwrap_or(0));
+        if evicting {
+            let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+            tx_update.evicted_ats = evicted.iter().map(|t| (*t, DROPPED_UNTIL_MINED)).collect();
             let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
-            bdk_wallet.apply_evicted_txs([(id, evicted_at)]);
+            bdk_wallet
+                .apply_update(Update {
+                    tx_update,
+                    ..Default::default()
+                })
+                .map_err(|e| Error::FailedBdkSync {
+                    details: e.to_string(),
+                })?;
             bdk_wallet.persist(bdk_db)?;
         }
         self.update_backup_info(&txn, false)?;
@@ -568,8 +631,9 @@ impl Wallet {
         self.trigger_auto_backup();
         warn!(
             self.logger(),
-            "L4b: payment {txid} forgotten as dropped, {marked} TXO(s) marked as not existing \
-             until the TX is back"
+            "L4b: payment {txid} forgotten as dropped with {} competing TX(s), {marked} TXO(s) \
+             marked as not existing until one is mined",
+            evicted.len() - 1
         );
         Ok(DroppedPayment::Forgotten { envelopes: marked })
     }

@@ -2642,11 +2642,11 @@ fn a_dropped_payment_the_host_forgets_leaves_until_it_comes_back() {
     payment.chain.assert_all_matched();
 }
 
-// a forgotten payment the indexer lists again, unconfirmed and seen after it was forgotten: BDK
-// holds it as canonical again and its envelopes exist again
+// a forgotten payment the indexer lists again, unconfirmed and seen after it was forgotten: it stays
+// forgotten — no sighting outweighs the eviction — and comes back once mined, confirmed
 #[test]
 #[parallel]
-fn a_forgotten_payment_seen_again_in_the_mempool_is_back() {
+fn a_forgotten_payment_seen_again_in_the_mempool_stays_forgotten_until_mined() {
     let mut payment = EnvelopePayment::new(1);
     let first = payment.txid.clone();
     payment.chain.evict(&first);
@@ -2663,8 +2663,75 @@ fn a_forgotten_payment_seen_again_in_the_mempool_is_back() {
     payment.chain.readmit(&first);
     payment.reopen().unwrap();
     let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
-    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_some());
+    assert!(payment.wallet.bdk_wallet().get_tx(first_id).is_none());
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
     assert_eq!(payment.envelopes(&first), 1);
+    assert_eq!(payment.invoice().unwrap(), first);
+}
+
+// the host's belief may be wrong: a payment the indexer still lists, forgotten, is set aside until
+// it confirms — never listed again unconfirmed, so nothing lands on an output that may never exist
+#[test]
+#[parallel]
+fn a_payment_forgotten_while_the_indexer_lists_it_is_set_aside_until_mined() {
+    let mut payment = EnvelopePayment::new(2);
+    let first = payment.txid.clone();
+    assert_eq!(
+        payment
+            .wallet
+            .forget_dropped_payment(first.clone())
+            .unwrap(),
+        DroppedPayment::Forgotten { envelopes: 2 }
+    );
+    for _ in 0..2 {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        payment.reopen().unwrap();
+        assert_eq!(payment.envelopes(&first), 0);
+        assert!(payment.rows(&first).iter().all(|t| !t.exists && !t.spent));
+    }
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 2);
+    payment.chain.assert_all_matched();
+}
+
+// the winner of a conflict BDK knows (a fee bump to the same addresses, CC-115 marking the payment
+// it replaced) forgotten: the loser is set aside with it, never brought back by its absence
+#[test]
+#[parallel]
+fn a_forgotten_replacement_takes_the_payment_it_replaced_with_it() {
+    let mut payment = EnvelopePayment::new(1);
+    let first = payment.txid.clone();
+    let bump = payment.bump();
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 0);
+    assert_eq!(payment.envelopes(&bump), 1);
+    payment.chain.evict(&bump);
+    assert_eq!(
+        payment.wallet.forget_dropped_payment(bump.clone()).unwrap(),
+        DroppedPayment::Forgotten { envelopes: 1 }
+    );
+    let first_id = crate::bitcoin::Txid::from_str(&first).unwrap();
+    let bump_id = crate::bitcoin::Txid::from_str(&bump).unwrap();
+    let bdk = payment.wallet.bdk_wallet();
+    assert!(bdk.get_tx(first_id).is_none() && bdk.get_tx(bump_id).is_none());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 0, "no phantom of the loser");
+    assert_eq!(payment.envelopes(&bump), 0);
+    assert_matches!(payment.invoice(), Err(Error::InsufficientAllocationSlots));
+
+    // the loser broadcast again and mined: back, confirmed
+    payment.chain.readmit(&first);
+    payment.chain.mine(1);
+    payment.reopen().unwrap();
+    assert_eq!(payment.envelopes(&first), 1);
+    assert_eq!(payment.envelopes(&bump), 0);
 }
 
 // what keeps a payment from being forgotten, each time with nothing changed: a TX BDK never saw, a
