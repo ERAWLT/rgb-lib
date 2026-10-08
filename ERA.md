@@ -114,6 +114,7 @@ Rules for the branch:
 | `c0e51da` | Refuse a replaced TX that a transfer still in play names | To propose to UTEXO (with `09cbbda`) |
 | `112054c` | Pin the marking's way back and its copies, as the review probed | To propose to UTEXO (with `09cbbda`) |
 | `665f241` | Let the host forget a payment of envelopes it proved dropped | To propose to UTEXO (with `09cbbda`) |
+| `3b00147` | Set a forgotten payment aside until it is mined, with its rivals | To propose to UTEXO (with `665f241`) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
@@ -125,7 +126,7 @@ Later commits that touch only this file are part of the series too. `3f0a555` to
 `5f5edb8` to `f82cc6b`, and after its verification `74a2d66` to `f5d6522` are
 [§7](#7-the-rgb-stock-on-disk-cc-101); `d326033` extends [§3](#3-dependency-diet-f808c7f);
 `1ed4436` to `e230950` answer UTEXO's review of #104 and go with `6ce375e`
-([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9`, `2310cc6` and its review fixes `1fb40da` and `24d3314` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da-24d3314); `09cbbda` and, after its review, `93a3fc8` to `112054c` are [§9](#9-a-replaced-payment-of-envelopes-cc-115); `665f241` is [§10](#10-a-dropped-payment-the-host-forgets-l4b).
+([§1](#1-configurable-keychain-layout-6ce375e)). `ebecd8c`, its review fix `0ca2fc9`, `2310cc6` and its review fixes `1fb40da` and `24d3314` are [§8](#8-a-colored-address-for-a-payment-from-outside-ebecd8c-0ca2fc9-2310cc6-1fb40da-24d3314); `09cbbda` and, after its review, `93a3fc8` to `112054c` are [§9](#9-a-replaced-payment-of-envelopes-cc-115); `665f241` and, after its review, `3b00147` are [§10](#10-a-dropped-payment-the-host-forgets-l4b).
 
 ## 1. Configurable keychain layout (`6ce375e`)
 
@@ -2188,7 +2189,8 @@ new base changes either, `a_replaced_payment_that_comes_back_brings_its_envelope
 
 ## 10. A dropped payment the host forgets (L4b)
 
-`665f241`, on top of [§9](#9-a-replaced-payment-of-envelopes-cc-115).
+`665f241`, then `3b00147` after its review ([below](#from-the-review-1)), on top of
+[§9](#9-a-replaced-payment-of-envelopes-cc-115).
 
 ### Why
 
@@ -2197,7 +2199,7 @@ replaced by a TX that pays none of the wallet's colored scripts, never reaches B
 canonical and its envelopes listed, unconfirmed, for good. A host that lets no token leave while
 such a payment is unconfirmed (the app's T3.3 rule) is then blocked for good: its own "stop
 waiting" cannot let the payment go while rgb-lib still lists its envelopes, and rgb-lib will list
-them forever. The host can prove the payment dropped (its backend's watchdog, a conflict proven
+them forever. The host can believe the payment dropped (its backend's watchdog, a conflict proven
 with the indexer); rgb-lib had no way to be told.
 
 ### What the host calls
@@ -2209,31 +2211,45 @@ accepted).
 | Verdict | When | What changes |
 |---|---|---|
 | `NotSeen` | BDK's graph does not hold the TX | nothing |
-| `Confirmed` | BDK holds it as confirmed | nothing |
+| `Confirmed` | BDK holds it as mined — any anchor, a reorged block's too — or would keep it canonical whatever its eviction says | nothing |
 | `Spent` | a TX BDK holds as canonical spends one of its outputs: forgetting the payment would take that TX out of BDK's view with it | nothing |
+| `Conflicted` | setting it aside with its rivals (below) would make another TX canonical that is not now — worked out on a clone of BDK's `TxGraph` | nothing |
 | `Held` | §9's (c) — a batch transfer not `Failed` names the TX — or (a) — one of its colored outputs holds something ([`holds_nothing`]) — or the wallet recorded a spend of one of them (`spent`) | nothing |
-| `Forgotten { envelopes }` | otherwise | BDK told the TX left the mempool (`apply_evicted_txs`, at max(now, its own last sighting): bdk_chain holds a TX as not canonical once its last eviction is not older than its last sighting), unless BDK already holds it as not canonical; its colored outputs that exist marked `exists = false`, as §9 marks them; `update_backup_info` and the auto backup, as for any change the host asked for |
+| `Forgotten { envelopes }` | otherwise | the payment and every TX in BDK's graph competing for its coins (`direct_conflicts`) evicted at `DROPPED_UNTIL_MINED` through `apply_update` (which records an eviction whatever the TX's state, where `apply_evicted_txs` takes canonical ones only); its colored outputs that exist marked `exists = false`, as §9 marks them; `update_backup_info` and the auto backup. A call that changes nothing writes nothing |
 
 The checks run before anything is written. The rows are written in one database transaction,
 committed after BDK's eviction is persisted: should the commit fail, BDK holds the payment as not
 canonical while its rows exist, and the next `go_online` with `complete_unrecorded_spends` marks
-them under §9's rule, which then holds by its (b). A second call after a `Forgotten` finds nothing
-left to mark: `Forgotten { envelopes: 0 }`.
+them under §9's rule, which then holds by its (b).
 
-### Its way back
+### Set aside until mined
 
-Unchanged from §9: a sync that sees the TX again (in the indexer's mempool, seen after the
-eviction, or mined) makes BDK hold it as canonical, `update_db_colored_txos_from_bdk` finds no
-existing row for its outputs and `set_txo` raises `exists` on the same rows. The host's proof can
-therefore be wrong without loss: a payment forgotten too early comes back as it was.
+bdk_chain holds an unconfirmed TX as not canonical while its last eviction is not older than its
+last sighting. `DROPPED_UNTIL_MINED` is `i64::MAX` (not `u64::MAX`, so a store keeping it signed
+does not wrap it): no sighting reaches it, so an indexer listing the payment again unconfirmed
+changes nothing, and only an anchor — the payment mined — makes it canonical again. Then
+`update_db_colored_txos_from_bdk` finds no existing row for its outputs and `set_txo` raises
+`exists` on the same rows: confirmed, so nothing that lands on them can be lost.
+
+That is what makes the host's belief safe to be wrong. A payment forgotten while still in some
+mempool is set aside until it confirms, never listed again unconfirmed under a host that stopped
+watching it — the first version, which evicted at "now", let the next sync bring such a payment
+back unconfirmed, and a blind invoice or a token's change could land on an output that may never
+exist (CC-24).
+
+The rivals go with it because they would otherwise come back by its absence: the loser of a
+conflict the payment won is not canonical only because the payment is. A rival mined later is
+canonical by its anchor, as the payment would be.
 
 ### What it does not do
 
-- It proves nothing: whether the payment is dropped is the host's to prove. A host that calls it
-  on a payment still in some mempool gets it back at the next sync that sees it.
-- It never forgets a TX the wallet stands on (the `Spent` and `Held` rows above): those are the
-  cases where §9 refuses `go_online` with `no-canonical-spender`, which a forgotten payment would
-  otherwise lead to.
+- It proves nothing: whether the payment is dropped is the host's to believe. Being wrong costs
+  the envelopes' use until the payment confirms, nothing more.
+- It never forgets a TX the wallet stands on (`Spent`, `Held`): those are the cases where §9
+  refuses `go_online` with `no-canonical-spender`, which a forgotten payment would otherwise lead
+  to.
+- A deeper chain of conflicts, where setting the payment and its direct rivals aside would bring
+  a third TX back, is refused (`Conflicted`), not resolved.
 
 ### Tests
 
@@ -2242,23 +2258,38 @@ In `src/wallet/test/unrecorded_spends.rs`, on the scripted chain (`EnvelopePayme
 | Case | Asserts |
 |---|---|
 | a payment evicted from the chain's mempool | BDK keeps it (two envelopes listed after `go_online`); forgotten (TXID in upper case): `Forgotten { envelopes: 2 }`, BDK's graph holds it and its canonical view does not, both rows `exists = false`, not spent; no envelope, an invoice `InsufficientAllocationSlots`; `go_online` through, nothing completed; asked again, `Forgotten { envelopes: 0 }`; readmitted and mined: the same rows, two envelopes, an invoice on the first |
-| forgotten, then readmitted unconfirmed a second later | canonical again, its envelope listed |
+| forgotten, then readmitted unconfirmed a second later | still not canonical, no envelope, an invoice `InsufficientAllocationSlots`; mined: back, an invoice on it |
+| forgotten while the chain still lists it | two `go_online`s a second apart: no envelope, rows `exists = false`; mined: back |
+| a fee bump to the same address (CC-115 marked the first payment), then the bump dropped and forgotten | `Forgotten { envelopes: 1 }`; neither canonical; after `go_online` no envelope of either; the first readmitted and mined: its envelope back, the bump's not |
 | what refuses | `NotSeen` (a TXID BDK never saw), `InvalidTxid`; `Held` with a blind invoice on its envelope (BDK keeps it canonical, rows unchanged, `go_online` through), with an asset issued on it, with a row recorded spent; `Confirmed` once mined; `Spent` with a canonical child spending its envelope |
 | an own send of a whole allocation, `WaitingConfirmations`, its change uncolored | `Held` (only (c) refuses it), BDK keeps it canonical, the transfer still `WaitingConfirmations` |
 
-**Mutations**, 7 by hand (a copy restored, never git), each condition broken alone: all fail a
-test — the confirmed check, the spent check, (c), the recorded spend, (a), the marking, the
-eviction. Not pinned: the `max` with the last sighting (equal to now in every test), and the backup
-info.
+**Mutations**, by hand (a copy restored, never git), each condition broken alone: the confirmed
+check, the spent check, (c), the recorded spend, (a), the marking, the eviction (`665f241`); the
+eviction at "now" instead of `DROPPED_UNTIL_MINED`, the rivals left out (`3b00147`) — all fail a
+test. Not pinned: `Conflicted` (no case on the scripted chain builds a chain of three conflicts),
+the clone's "kept canonical" after the anchor check (equivalent for every anchored TX), and the
+write skipped when nothing changes.
+
+### From the review
+
+The review of `665f241` found the host's proof weaker than it looked (the app's "dropped" is its
+backend's 24-hour timer) and what that cost: a payment forgotten while still in some mempool came
+back unconfirmed at the next sync, with the host no longer watching (major, probed in the fork and
+in the app); forgetting the winner of a conflict brought the loser back (minor, probed); a payment
+anchored in a reorged-out block was reported forgotten while BDK kept it canonical (minor,
+reasoning). `3b00147` answers all three as above. Its other points are the app's (its handling of
+a `Confirmed` answer).
 
 ### Carrying it
 
 Fork-only code beside §9's (`singlesig.rs` next to `sync_colored_payments`, `unrecorded_spends.rs`)
-and its tests: it goes wherever §9 goes. It reads BDK's `tx_graph().get_tx_node`, `get_tx`,
-`transactions()` and calls `apply_evicted_txs`: bdk_wallet `=3.1.0`, which every `-bfa` tag from
-beta.34 to beta.43 pins as well. Checked with `git merge-tree --merge-base=62a8c3a
-v0.3.0-beta.43-bfa 665f241` (2026-10-08, not compiled): the same conflicting files as at
-`112054c`, none new.
+and its tests: it goes wherever §9 goes. It reads BDK's `tx_graph()` (`get_tx_node`,
+`direct_conflicts`, `get_last_evicted`, `list_canonical_txs` on a clone), `get_tx`,
+`transactions()`, `local_chain()`, and calls `apply_update` with `TxUpdate::evicted_ats`:
+bdk_wallet `=3.1.0`, which every `-bfa` tag from beta.34 to beta.43 pins as well. Checked with
+`git merge-tree --merge-base=62a8c3a v0.3.0-beta.43-bfa <rev>` at `665f241` and `3b00147`
+(2026-10-08, not compiled): the same conflicting files as at `112054c`, none new.
 
 ## Carrying the series onto a new UTEXO tag
 
