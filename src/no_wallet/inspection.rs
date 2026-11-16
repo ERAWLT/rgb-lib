@@ -6,18 +6,46 @@
 
 use super::*;
 
+use crate::Opout as RgbOpout;
+
+/// An operation output, which RGB identifies as `<operation ID>/<assignment type>/<index>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct Opout {
+    /// ID of the operation the output belongs to
+    pub opid: String,
+    /// Type of the assignment the output belongs to
+    pub assignment_type: TypeOfAssignment,
+    /// Index of the output among the ones of its assignment type
+    pub index: u16,
+}
+
+impl TryFrom<RgbOpout> for Opout {
+    /// The assignment type of the operation output, when it's not one of the supported schemas'
+    type Error = AssignmentType;
+
+    fn try_from(opout: RgbOpout) -> Result<Self, Self::Error> {
+        Ok(Self {
+            opid: opout.op.to_string(),
+            assignment_type: TypeOfAssignment::from_assignment_type(opout.ty).ok_or(opout.ty)?,
+            index: opout.no,
+        })
+    }
+}
+
 /// Information about an RGB input being spent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct RgbInputInfo {
-    /// The operation output the input spends, as `<operation ID>/<assignment type>/<index>`,
-    /// which the bundle of the spending transition commits to in its input map
-    pub opout: String,
+    /// The operation output the input spends, which the bundle of the spending transition commits
+    /// to in its input map
+    pub opout: Opout,
     /// The index of the transaction input spending the allocation (`None` when the allocation
     /// can't be resolved, as inspecting a fascia without a wallet)
     pub vin: Option<u32>,
-    /// The assignment in input (`None` when the spent allocation can't be resolved, as inspecting
-    /// a fascia without a wallet)
+    /// The assignment in input, the state it carries included (`None` when the spent allocation
+    /// isn't resolved, as inspecting a fascia without a wallet: the opout gives the type of the
+    /// assignment, not the state the input spends)
     pub assignment: Option<Assignment>,
 }
 
@@ -367,7 +395,7 @@ fn consignment_inspection<const TRANSFER: bool>(
         }
     }
     // get the spent outpoint and assignment of a transition input
-    let resolve_input = |opout: Opout| -> Option<(OutPoint, Assignment)> {
+    let resolve_input = |opout: RgbOpout| -> Option<(OutPoint, Assignment)> {
         if opout.op == genesis_id {
             let typed_assigns = consignment.genesis.assignments.get(&opout.ty)?;
             let seal = typed_assigns.revealed_seal_at(opout.no).ok()??;
@@ -741,7 +769,7 @@ pub(crate) fn bundle_info(
     witness_tx: &BdkTransaction,
     check_commitments: bool,
     resolve_inputs: bool,
-    mut resolve_input: impl FnMut(Opout) -> Option<(OutPoint, Assignment)>,
+    mut resolve_input: impl FnMut(RgbOpout) -> Option<(OutPoint, Assignment)>,
     mut is_ours: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
     mut is_terminal: impl FnMut(&OpId) -> Option<bool>,
 ) -> Result<RgbOperationInfo, Error> {
@@ -827,7 +855,11 @@ pub(crate) fn bundle_info(
                 None => (None, None),
             };
             inputs_info.push(RgbInputInfo {
-                opout: opout.to_string(),
+                opout: opout.try_into().map_err(|ty| Error::RgbInspection {
+                    details: format!(
+                        "bundle for contract {contract_id}: unknown assignment type: {ty}"
+                    ),
+                })?,
                 vin,
                 assignment,
             });
@@ -855,7 +887,7 @@ pub(crate) fn bundle_info(
 /// (given by OpId, e.g. the split a burn spends) to an outpoint the witness transaction spends.
 fn bundle_output(
     bundle_transitions: &HashMap<OpId, &Transition>,
-    opout: Opout,
+    opout: RgbOpout,
 ) -> Option<(OutPoint, Assignment)> {
     let transition = bundle_transitions.get(&opout.op)?;
     let assigns = transition.assignments.get(&opout.ty)?;
@@ -1114,6 +1146,37 @@ mod tests {
         // invalid witness TXID
         let result = inspect_consignment(file_path, BundleFilter::Witness("invalid".to_string()));
         assert_matches!(result, Err(Error::InvalidTxid));
+    }
+
+    #[test]
+    fn opout_assignment_types() {
+        let opid = OpId::from([1; 32]);
+        let opout = |ty| Opout::try_from(RgbOpout::new(opid, ty, 3));
+
+        assert_eq!(
+            opout(OS_ASSET).unwrap(),
+            Opout {
+                opid: opid.to_string(),
+                assignment_type: TypeOfAssignment::Asset,
+                index: 3,
+            }
+        );
+        assert_eq!(
+            opout(OS_INFLATION).unwrap().assignment_type,
+            TypeOfAssignment::InflationRight
+        );
+        assert_eq!(
+            opout(OS_LINK).unwrap().assignment_type,
+            TypeOfAssignment::LinkRight
+        );
+        assert_eq!(
+            opout(OS_MINT).unwrap().assignment_type,
+            TypeOfAssignment::MintRight
+        );
+
+        // an assignment type no supported schema defines
+        let unknown = AssignmentType::with(u16::MAX);
+        assert_eq!(opout(unknown), Err(unknown));
     }
 
     #[test]

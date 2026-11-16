@@ -917,8 +917,15 @@ dictionary PsbtInspection {
 };
 
 [Remote]
+dictionary Opout {
+  string opid;
+  TypeOfAssignment assignment_type;
+  u16 index;
+};
+
+[Remote]
 dictionary RgbInputInfo {
-  string opout;
+  Opout opout;
   u32? vin;
   Assignment? assignment;
 };
@@ -941,6 +948,14 @@ dictionary RgbOperationInfo {
   u32 committed_transition_count;
   u32 committed_input_count;
   sequence<RgbTransitionInfo> transitions;
+};
+
+[Remote]
+enum TypeOfAssignment {
+  "Asset",
+  "InflationRight",
+  "LinkRight",
+  "MintRight",
 };
 
 [Remote]

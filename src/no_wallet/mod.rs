@@ -13,9 +13,10 @@ pub(crate) mod validation;
 use super::*;
 
 pub use inspection::{
-    BundleFilter, ConsignmentInspection, RgbBridgeLocationInfo, RgbEvmContractInfo, RgbGenesisInfo,
-    RgbInputInfo, RgbInspection, RgbMediaInfo, RgbOperationInfo, RgbOutputInfo, RgbRejectListInfo,
-    RgbTransitionInfo, TransitionGlobal, TransitionMetadata, inspect_consignment, inspect_fascia,
+    BundleFilter, ConsignmentInspection, Opout, RgbBridgeLocationInfo, RgbEvmContractInfo,
+    RgbGenesisInfo, RgbInputInfo, RgbInspection, RgbMediaInfo, RgbOperationInfo, RgbOutputInfo,
+    RgbRejectListInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,
+    inspect_consignment, inspect_fascia,
 };
 #[cfg(feature = "wallet")]
 pub(crate) use inspection::{bundle_info, fascia_from_file, fascia_inspection};

@@ -228,7 +228,9 @@ pub use rgbstd::{
 };
 
 pub use crate::{
-    database::enums::{AssetSchema, Assignment, Encryption, TransportType, TypeOfTransition},
+    database::enums::{
+        AssetSchema, Assignment, Encryption, TransportType, TypeOfAssignment, TypeOfTransition,
+    },
     error::Error,
     no_wallet::BitcoinNetwork,
 };
