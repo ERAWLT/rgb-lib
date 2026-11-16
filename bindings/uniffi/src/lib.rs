@@ -479,22 +479,25 @@ impl From<Unspent> for RgbLibUnspent {
     }
 }
 pub struct RgbInputInfo {
-    pub vin: u32,
-    pub assignment: Assignment,
+    pub opout: String,
+    pub vin: Option<u32>,
+    pub assignment: Option<Assignment>,
 }
 impl From<RgbLibRgbInputInfo> for RgbInputInfo {
     fn from(orig: RgbLibRgbInputInfo) -> Self {
         Self {
+            opout: orig.opout,
             vin: orig.vin,
-            assignment: orig.assignment.into(),
+            assignment: orig.assignment.map(|a| a.into()),
         }
     }
 }
 impl From<RgbInputInfo> for RgbLibRgbInputInfo {
     fn from(orig: RgbInputInfo) -> Self {
         Self {
+            opout: orig.opout,
             vin: orig.vin,
-            assignment: orig.assignment.into(),
+            assignment: orig.assignment.map(|a| a.into()),
         }
     }
 }
@@ -1282,6 +1285,16 @@ fn inspect_consignment(
         .map(|i| i.into())
 }
 
+fn inspect_fascia(
+    psbt: String,
+    fascia_path: String,
+    entropy: u64,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<RgbInspection, RgbLibError> {
+    rgb_lib::no_wallet::inspect_fascia(psbt, fascia_path, entropy, bitcoin_network)
+        .map(|i| i.into())
+}
+
 fn validate_consignment(
     consignment_path: String,
     indexer_config: IndexerConfig,
@@ -2056,7 +2069,7 @@ impl Wallet {
         self._get_wallet().inspect_psbt(psbt)
     }
 
-    fn inspect_rgb_transfer(
+    fn inspect_fascia(
         &self,
         psbt: String,
         fascia_path: String,
@@ -2064,7 +2077,7 @@ impl Wallet {
     ) -> Result<RgbInspection, RgbLibError> {
         Ok(self
             ._get_wallet()
-            .inspect_rgb_transfer(psbt, fascia_path, entropy)?
+            .inspect_fascia(psbt, fascia_path, entropy)?
             .into())
     }
 
@@ -2477,7 +2490,7 @@ impl MultisigWallet {
         self._get_wallet().inspect_psbt(psbt)
     }
 
-    fn inspect_rgb_transfer(
+    fn inspect_fascia(
         &self,
         psbt: String,
         fascia_path: String,
@@ -2485,7 +2498,7 @@ impl MultisigWallet {
     ) -> Result<RgbInspection, RgbLibError> {
         Ok(self
             ._get_wallet()
-            .inspect_rgb_transfer(psbt, fascia_path, entropy)?
+            .inspect_fascia(psbt, fascia_path, entropy)?
             .into())
     }
 }
