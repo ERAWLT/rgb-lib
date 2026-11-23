@@ -4324,11 +4324,26 @@ pub trait WalletOnline: WalletOffline {
     ) -> Result<Option<DbBatchTransfer>, Error> {
         // ERA fork: a NACK fails the batch, unless its TX is on chain already (a kill between the
         // broadcast below and the commit of its refresh, and a proxy that answers the next poll
-        // with a NACK): the transfer happened, and completes as beta.8 completes one whose TX a
-        // recipient broadcast. A lookup that fails fails this refresh.
+        // with a NACK): the transfer happened. Mined, it completes as beta.8 completes one whose
+        // TX a recipient broadcast; still in the mempool, the batch keeps waiting (review N1): a
+        // TX that may yet leave every mempool must neither be failed nor completed into a
+        // WaitingConfirmations that a TX the indexer forgot never leaves. A lookup that fails
+        // fails this refresh.
         if transfers.iter().any(|t| t.ack == Some(false)) {
-            if let Some(updated) = self.complete_batch_if_tx_on_chain(txn, batch_transfer)? {
-                return Ok(Some(updated));
+            if let Some(txid) = &batch_transfer.txid {
+                match self.indexer().get_tx_confirmations(txid)? {
+                    Some(confirmations) if confirmations > 0 => {
+                        return Ok(Some(self.broadcast_batch(txn, batch_transfer)?));
+                    }
+                    Some(_) => {
+                        info!(
+                            self.logger(),
+                            "NACKed transfer whose TX is in the mempool: waiting for it to confirm"
+                        );
+                        return Ok(None);
+                    }
+                    None => {}
+                }
             }
             return Ok(Some(
                 self.fail_batch_transfer(txn, batch_transfer)
