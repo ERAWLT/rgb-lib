@@ -3273,6 +3273,9 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
             self.update_backup_info(&txn, false)?;
         }
         txn.commit()?;
+        if changed {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Delete transfer completed");
         Ok(changed)
     }

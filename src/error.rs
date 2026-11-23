@@ -836,6 +836,17 @@ pub enum Error {
         details: String,
     },
 
+    /// The consistency check failed on a wallet that was just restored from a VSS backup,
+    /// meaning the backup itself is inconsistent or older than other wallet state
+    #[error(
+        "The restored VSS backup is inconsistent ({details}). The backup is likely stale or was \
+         taken mid-operation; restore a newer backup or recover from the original wallet data."
+    )]
+    RestoredBackupInconsistent {
+        /// Error details
+        details: String,
+    },
+
     /// Error during RGB inspection
     #[error("Error during RGB inspection: {details}")]
     RgbInspection {
@@ -950,6 +961,31 @@ pub enum Error {
     UnsupportedWalletManifestVersion {
         /// Wallet manifest version
         version: String,
+    },
+
+    /// VSS authentication failed
+    #[error("VSS authentication failed: {details}")]
+    VssAuth {
+        /// Error details
+        details: String,
+    },
+
+    /// VSS backup not found on server
+    #[error("VSS backup not found")]
+    VssBackupNotFound,
+
+    /// VSS server communication error
+    #[error("VSS error: {details}")]
+    VssError {
+        /// Error details
+        details: String,
+    },
+
+    /// VSS version conflict (concurrent modification)
+    #[error("VSS version conflict: {details}")]
+    VssVersionConflict {
+        /// Error details
+        details: String,
     },
 
     /// The specified wallet directory already exists

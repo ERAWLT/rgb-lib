@@ -93,6 +93,11 @@ zip = { version = "9.4.1", optional = true, default-features = false, features =
     "zstd",
 ] }
 
+# VSS backup (optional), from UTEXO-Protocol/rgb-lib (see ERA.md, "VSS")
+vss-client = { package = "vss-client-ng", git = "https://github.com/lightningdevkit/vss-client", rev = "ad63805047561dcf3117cd992ad6d8bc3881adef", default-features = false, optional = true, features = [
+    "sigs-auth",
+] }
+
 # RGB-related deps
 amplify = { version = "=4.8.1", default-features = false }
 rgb-invoicing = { version = "0.11.2-rc.2", default-features = false }
@@ -121,6 +126,10 @@ mockito = { version = "1", default-features = false }
 once_cell = { version = "1.21", default-features = false }
 regex = { version = "1.13", default-features = false }
 serial_test = { version = "4.0", default-features = false }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }
 tempfile = { version = "3.27.0", default-features = false }
 
 # OS-specific reqwest features
@@ -136,7 +145,7 @@ features = ["rustls"]
 
 [features]
 default = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
-all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
+all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration", "vss"]
 # the wallet functionality; without it only the APIs that don't need a wallet (e.g. consignment
 # inspection and validation with resolvers provided by the caller, or with an indexer with an
 # indexer validation feature) are available, pulling in just the RGB crates and few other
@@ -212,6 +221,8 @@ esplora_validation = [
     "_validation",
     "rgb-ops/esplora_blocking",
 ]
+# VSS (Versioned Storage Service) backups of the wallet directory, from UTEXO-Protocol/rgb-lib
+vss = ["wallet", "dep:vss-client", "tokio/rt", "tokio/rt-multi-thread"]
 camel_case = []
 
 [profile.release]

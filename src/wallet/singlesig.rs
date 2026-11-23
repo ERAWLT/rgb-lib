@@ -273,6 +273,10 @@ impl Wallet {
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
                 #[cfg(feature = "_online")]
                 online_data: None,
+                #[cfg(feature = "vss")]
+                vss_client: None,
+                #[cfg(feature = "vss")]
+                auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
             signers,
@@ -354,6 +358,7 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Get address completed");
         Ok(address.to_string())
     }
@@ -447,6 +452,7 @@ impl Wallet {
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Issue asset NIA completed");
         Ok(res)
     }
@@ -482,6 +488,7 @@ impl Wallet {
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Issue asset UDA completed");
         Ok(res)
     }
@@ -512,6 +519,7 @@ impl Wallet {
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Issue asset CFA completed");
         Ok(res)
     }
@@ -567,6 +575,7 @@ impl Wallet {
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Issue asset IFA completed");
         Ok(res)
     }
@@ -636,6 +645,7 @@ impl Wallet {
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Issue asset BFA completed");
         Ok(res)
     }
@@ -718,6 +728,7 @@ impl Wallet {
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Blind receive completed");
         Ok(ReceiveData {
             invoice: receive_data_internal.invoice_string,
@@ -801,6 +812,7 @@ impl Wallet {
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Witness receive completed");
         Ok(ReceiveData {
             invoice: receive_data_internal.invoice_string,
@@ -852,6 +864,7 @@ impl Wallet {
         let res = self.create_utxos_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Create UTXOs completed");
         Ok(res)
     }
@@ -957,6 +970,7 @@ impl Wallet {
         let tx = self.drain_to_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Drain completed");
         Ok(tx.compute_txid().to_string())
     }
@@ -1013,6 +1027,7 @@ impl Wallet {
         let tx = self.drain_to_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
     }
@@ -1051,6 +1066,7 @@ impl Wallet {
         let res = self.send_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Send completed");
         Ok(res)
     }
@@ -1144,6 +1160,9 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if !dry_run {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Send (begin) completed");
         Ok(SendBeginResult {
             psbt: begin_op_data.psbt.to_string(),
@@ -1182,6 +1201,7 @@ impl Wallet {
         let res = self.send_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Send (end) completed");
         Ok(res)
     }
@@ -1222,6 +1242,7 @@ impl Wallet {
             self.provide_out_of_band_consignment_impl(&txn, &consignment_path, media_file_paths)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Provide out-of-band consignment completed");
         Ok(res)
     }
@@ -1254,6 +1275,7 @@ impl Wallet {
         let res = self.provide_out_of_band_ack_impl(&txn, recipient_id)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Provide out-of-band ACK completed");
         Ok(res)
     }
@@ -1373,6 +1395,7 @@ impl Wallet {
         let res = self.inflate_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Inflate completed");
         Ok(res)
     }
@@ -1427,6 +1450,9 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if !dry_run {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Inflate (begin) completed");
         Ok(InflateBeginResult {
             psbt: begin_operation_data.psbt.to_string(),
@@ -1464,6 +1490,7 @@ impl Wallet {
         let res = self.inflate_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Inflate (end) completed");
         Ok(res)
     }
@@ -1639,6 +1666,7 @@ impl Wallet {
         let res = self.link_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Link completed");
         Ok(res)
     }
@@ -1695,6 +1723,9 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if !dry_run {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Link (begin) completed");
         Ok(LinkBeginResult {
             psbt: begin_operation_data.psbt.to_string(),
@@ -1736,6 +1767,7 @@ impl Wallet {
         let res = self.link_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Link (end) completed");
         Ok(res)
     }
@@ -1812,6 +1844,7 @@ impl Wallet {
         )?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Minting (begin) completed");
         Ok(MintBeginResult {
             psbt: begin_op_data.psbt.to_string(),
@@ -1881,7 +1914,46 @@ impl Wallet {
         };
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Minting (end) completed");
         Ok(res)
+    }
+}
+
+#[cfg(feature = "vss")]
+impl Wallet {
+    /// Configure VSS backup for this wallet.
+    pub fn configure_vss_backup(
+        &mut self,
+        config: super::vss::VssBackupConfig,
+    ) -> Result<(), Error> {
+        WalletBackup::configure_vss_backup(self, config)
+    }
+
+    /// Disable VSS auto-backup.
+    pub fn disable_vss_auto_backup(&mut self) {
+        WalletBackup::disable_vss_auto_backup(self)
+    }
+
+    /// Perform a VSS backup.
+    pub async fn vss_backup(&self, client: &super::vss::VssBackupClient) -> Result<i64, Error> {
+        WalletBackup::vss_backup(self, client).await
+    }
+
+    /// Get VSS backup info.
+    pub async fn vss_backup_info(
+        &self,
+        client: &super::vss::VssBackupClient,
+    ) -> Result<super::vss::VssBackupInfo, Error> {
+        WalletBackup::vss_backup_info(self, client).await
+    }
+
+    /// Returns the configured VSS backup client, if any.
+    ///
+    /// This is the client constructed by [`configure_vss_backup`](Self::configure_vss_backup);
+    /// callers can reuse it for manual backup operations instead of building a
+    /// second client with the same configuration.
+    pub fn vss_client(&self) -> Option<Arc<super::vss::VssBackupClient>> {
+        WalletCore::vss_client(self).clone()
     }
 }
