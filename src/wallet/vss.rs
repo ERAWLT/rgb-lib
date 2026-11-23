@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 use vss_client::client::VssClient;
 use vss_client::error::VssError;
 use vss_client::headers::sigs_auth::SigsAuthProvider;
-use vss_client::types::{GetObjectRequest, KeyValue, PutObjectRequest};
+use vss_client::types::{GetObjectRequest, KeyValue, ListKeyVersionsRequest, PutObjectRequest};
 use vss_client::util::retry::{
     ExponentialBackoffRetryPolicy, MaxAttemptsRetryPolicy, MaxTotalDelayRetryPolicy, RetryPolicy,
 };
@@ -207,6 +207,34 @@ pub struct BackupManifest {
     pub encrypted: bool,
     /// Backup version
     pub version: u8,
+    /// ERA fork (review S5, CC-98): the set the chunks of a chunked backup were uploaded under,
+    /// `backup/chunk/<set>/<i>`, fresh for every upload. `None` for a single-piece backup, and for
+    /// a chunked one uploaded before the set existed, whose chunks are `backup/chunk/<i>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_set: Option<String>,
+}
+
+impl BackupManifest {
+    /// ERA fork: the keys the pieces of this backup are stored under, in order.
+    fn piece_keys(&self) -> Vec<String> {
+        if self.chunk_count == 1 {
+            return vec![BACKUP_KEY_DATA.to_string()];
+        }
+        (0..self.chunk_count)
+            .map(|i| match &self.chunk_set {
+                Some(set) => format!("{BACKUP_KEY_CHUNK_PREFIX}{set}/{i}"),
+                None => format!("{BACKUP_KEY_CHUNK_PREFIX}{i}"),
+            })
+            .collect()
+    }
+}
+
+/// ERA fork (review S5): the length of a chunk set's name, hex of 16 random bytes.
+const CHUNK_SET_LEN: usize = 32;
+
+/// ERA fork (review S5): a fresh chunk set's name.
+fn new_chunk_set() -> String {
+    hex::encode(rand::random::<[u8; CHUNK_SET_LEN / 2]>())
 }
 
 /// VSS backup client wrapper
@@ -307,15 +335,105 @@ impl VssBackupClient {
 
         let total_size = upload_data.len();
 
-        if total_size <= VSS_CHUNK_SIZE {
+        // ERA fork (review S5): the pieces of earlier backups, deleted once this one is in place
+        let stale = self.stale_pieces().await;
+        let (version, kept) = if total_size <= VSS_CHUNK_SIZE {
             // Single chunk upload
-            self.upload_single(upload_data, encryption_metadata, &fingerprint)
-                .await
+            let version = self
+                .upload_single(upload_data, encryption_metadata, &fingerprint)
+                .await?;
+            (version, BACKUP_KEY_DATA.to_string())
         } else {
             // Chunked upload for large backups
-            self.upload_chunked(upload_data, encryption_metadata, &fingerprint)
-                .await
+            let set = new_chunk_set();
+            let version = self
+                .upload_chunked(upload_data, encryption_metadata, &fingerprint, &set)
+                .await?;
+            (version, format!("{BACKUP_KEY_CHUNK_PREFIX}{set}/"))
+        };
+        self.delete_stale_pieces(stale, &kept).await;
+        Ok(version)
+    }
+
+    /// ERA fork (review S5): the pieces (`backup/data` and every chunk) on the server before an
+    /// upload, with their versions: listed, or, where the server does not list, those of the
+    /// backup its manifest describes. Best effort: an error is no piece.
+    async fn stale_pieces(&self) -> Vec<KeyValue> {
+        let mut pieces = vec![];
+        let mut page_token = None;
+        let listed = loop {
+            let request = ListKeyVersionsRequest {
+                store_id: self.store_id.clone(),
+                key_prefix: Some(BACKUP_KEY_CHUNK_PREFIX.to_string()),
+                page_size: None,
+                page_token: page_token.take(),
+            };
+            match self.client.list_key_versions(&request).await {
+                Ok(response) => {
+                    pieces.extend(response.key_versions);
+                    match response.next_page_token {
+                        Some(token) if !token.is_empty() => page_token = Some(token),
+                        _ => break true,
+                    }
+                }
+                Err(_) => break false,
+            }
+            // a server that pages forever is not followed further (a backup is at most 256
+            // chunks, a page holds many)
+            if pieces.len() > 4 * 256 {
+                break true;
+            }
+        };
+        if !listed {
+            pieces.clear();
+            if let Ok(manifest) = self.get_manifest().await
+                && check_manifest(&manifest).is_ok()
+                && manifest.chunk_count > 1
+            {
+                for key in manifest.piece_keys() {
+                    if let Ok(Some(version)) = self.get_current_version(&key).await {
+                        pieces.push(KeyValue {
+                            key,
+                            version,
+                            value: vec![],
+                        });
+                    }
+                }
+            }
         }
+        if let Ok(Some(version)) = self.get_current_version(BACKUP_KEY_DATA).await {
+            pieces.push(KeyValue {
+                key: BACKUP_KEY_DATA.to_string(),
+                version,
+                value: vec![],
+            });
+        }
+        pieces
+    }
+
+    /// ERA fork (review S5): delete the pieces `stale` lists, but those under `kept` (the key, or
+    /// the chunk set's prefix, of the backup just uploaded). Only once the new backup is in place,
+    /// and best effort: a piece left behind is never read (a manifest names the pieces a restore
+    /// reads), and the next upload lists it again.
+    async fn delete_stale_pieces(&self, stale: Vec<KeyValue>, kept: &str) {
+        let delete_items: Vec<KeyValue> = stale
+            .into_iter()
+            .filter(|piece| !piece.key.starts_with(kept))
+            .map(|piece| KeyValue {
+                value: vec![],
+                ..piece
+            })
+            .collect();
+        if delete_items.is_empty() {
+            return;
+        }
+        let request = PutObjectRequest {
+            store_id: self.store_id.clone(),
+            global_version: None,
+            transaction_items: vec![],
+            delete_items,
+        };
+        let _ = self.client.put_object(&request).await;
     }
 
     /// Upload a single backup (non-chunked)
@@ -338,6 +456,7 @@ impl VssBackupClient {
             total_size: data.len(),
             encrypted: encryption_metadata.is_some(),
             version: VSS_BACKUP_VERSION,
+            chunk_set: None,
         };
         let manifest_json = serde_json::to_vec(&manifest).map_err(|e| Error::Internal {
             details: format!("Failed to serialize manifest: {e}"),
@@ -408,33 +527,33 @@ impl VssBackupClient {
     /// Each chunk is uploaded in a separate request to avoid sending the entire
     /// backup in a single HTTP body. The manifest is uploaded last.
     ///
-    /// ERA fork: that does not keep the previous backup. The chunks are written
-    /// under the same keys as the previous backup's (`backup/chunk/<i>`), so an
-    /// upload that stops after its first chunk leaves the previous manifest and
-    /// metadata describing chunks that are no longer all theirs: that backup no
-    /// longer restores (its decryption fails) until an upload completes. Not
-    /// changed here; the upload layout is the host's to settle (ERA.md, section 5).
+    /// ERA fork (review S5, CC-98): the chunks go under a chunk set of their own,
+    /// `backup/chunk/<set>/<i>`, which the manifest names. The previous backup's
+    /// pieces are not touched until the manifest, the fingerprint and the
+    /// encryption metadata of this one replace its own in one request, so an
+    /// upload that stops anywhere before that leaves the previous backup whole
+    /// (they used to be written over in place, `backup/chunk/<i>`, and an upload
+    /// stopped after its first chunk left a backup that no longer decrypted).
+    /// The caller deletes the previous pieces after.
     async fn upload_chunked(
         &self,
         data: Vec<u8>,
         encryption_metadata: Option<VssEncryptionMetadata>,
         fingerprint: &str,
+        set: &str,
     ) -> Result<i64, Error> {
         let chunks: Vec<&[u8]> = data.chunks(VSS_CHUNK_SIZE).collect();
         let chunk_count = chunks.len();
         let total_size = data.len();
 
-        // Upload each chunk in a separate request
+        // Upload each chunk in a separate request, as a new key (version 0)
         for (i, chunk) in chunks.iter().enumerate() {
-            let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
-            let chunk_version = self.get_current_version(&key).await?.unwrap_or(0);
-
             let request = PutObjectRequest {
                 store_id: self.store_id.clone(),
                 global_version: None,
                 transaction_items: vec![KeyValue {
-                    key,
-                    version: chunk_version,
+                    key: format!("{BACKUP_KEY_CHUNK_PREFIX}{set}/{i}"),
+                    version: 0,
                     value: chunk.to_vec(),
                 }],
                 delete_items: vec![],
@@ -452,6 +571,7 @@ impl VssBackupClient {
             total_size,
             encrypted: encryption_metadata.is_some(),
             version: VSS_BACKUP_VERSION,
+            chunk_set: Some(set.to_string()),
         };
         let manifest_json = serde_json::to_vec(&manifest).map_err(|e| Error::Internal {
             details: format!("Failed to serialize manifest: {e}"),
@@ -543,13 +663,7 @@ impl VssBackupClient {
         let mut plaintext = Vec::new();
 
         // one piece under backup/data, or the chunks, as the upload wrote them
-        let keys: Vec<String> = if manifest.chunk_count == 1 {
-            vec![BACKUP_KEY_DATA.to_string()]
-        } else {
-            (0..manifest.chunk_count)
-                .map(|i| format!("{BACKUP_KEY_CHUNK_PREFIX}{i}"))
-                .collect()
-        };
+        let keys = manifest.piece_keys();
         let mut received = 0;
         for key in keys {
             let request = GetObjectRequest {
@@ -688,10 +802,10 @@ impl VssBackupClient {
 
         let mut delete_items = vec![];
 
-        // Delete chunks if any
-        if manifest.chunk_count > 1 {
-            for i in 0..manifest.chunk_count {
-                let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
+        // Delete the pieces: the chunks, or the single data key (ERA fork: as the manifest names
+        // them, so a chunk set too; a manifest no upload could write names none)
+        if check_manifest(&manifest).is_ok() {
+            for key in manifest.piece_keys() {
                 if let Some(version) = self.get_current_version(&key).await? {
                     delete_items.push(KeyValue {
                         key,
@@ -699,15 +813,6 @@ impl VssBackupClient {
                         value: vec![],
                     });
                 }
-            }
-        } else {
-            // Delete single data key
-            if let Some(version) = self.get_current_version(BACKUP_KEY_DATA).await? {
-                delete_items.push(KeyValue {
-                    key: BACKUP_KEY_DATA.to_string(),
-                    version,
-                    value: vec![],
-                });
             }
         }
 
@@ -979,9 +1084,19 @@ const _: () = assert!(VSS_CHUNK_SIZE >= MIN_VSS_CHUNK_SIZE);
 /// [`MIN_VSS_CHUNK_SIZE`] chunks take (so at most 256 requests; no chunk at all adds up to
 /// nothing, which the download refuses). Its numbers come from the server.
 fn check_manifest(manifest: &BackupManifest) -> Result<(), Error> {
+    // ERA fork (review S5): a chunk set is a fresh upload's name, only for chunks
+    let chunk_set_ok = match &manifest.chunk_set {
+        None => true,
+        Some(set) => {
+            manifest.chunk_count > 1
+                && set.len() == CHUNK_SET_LEN
+                && set.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+    };
     if manifest.total_size == 0
         || manifest.total_size > MAX_VSS_BACKUP_SIZE
         || manifest.chunk_count > manifest.total_size.div_ceil(MIN_VSS_CHUNK_SIZE)
+        || !chunk_set_ok
     {
         return Err(Error::VssError {
             details: format!(
@@ -1694,6 +1809,8 @@ pub fn create_backup_data(wallet_dir: &Path, logger: &Logger) -> Result<Vec<u8>,
 mod tests {
     use super::*;
     use bdk_wallet::bitcoin::secp256k1::{Secp256k1, rand::rngs::OsRng};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_signing_key() -> SecretKey {
         let secp = Secp256k1::new();
@@ -1708,6 +1825,7 @@ mod tests {
             total_size: 20_000_000,
             encrypted: true,
             version: 1,
+            chunk_set: None,
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
@@ -2321,6 +2439,7 @@ mod tests {
             total_size: data.len(),
             encrypted,
             version: VSS_BACKUP_VERSION,
+            chunk_set: None,
         })
         .unwrap()
     }
@@ -2957,6 +3076,7 @@ mod tests {
             total_size,
             encrypted,
             version: VSS_BACKUP_VERSION,
+            chunk_set: None,
         })
         .unwrap()
     }
@@ -3257,27 +3377,61 @@ mod tests {
         );
     }
 
+    /// What a [`VssStore`] holds, per key: (version, value).
+    type Kept = HashMap<String, (i64, Vec<u8>)>;
+
     /// A VSS server that keeps what it is given (putObjects) and answers getObject from it.
+    ///
+    /// ERA fork (review S5): it lists keys too (listKeyVersions, one page) unless told not to,
+    /// and can stop an upload after its first chunks: told to, it fails (HTTP 500) every put of a
+    /// chunk past them and every put of a manifest.
     struct VssStore {
         server: mockito::ServerGuard,
-        _mocks: [mockito::Mock; 2],
+        kept: Arc<std::sync::Mutex<Kept>>,
+        stop_after: Arc<std::sync::Mutex<Option<usize>>>,
+        lists: Arc<AtomicBool>,
+        _mocks: [mockito::Mock; 3],
     }
 
     impl VssStore {
         fn start() -> Self {
             use vss_client::prost::Message;
             use vss_client::types::{
-                ErrorCode, ErrorResponse, GetObjectResponse, PutObjectRequest, PutObjectResponse,
+                ErrorCode, ErrorResponse, GetObjectResponse, ListKeyVersionsRequest,
+                ListKeyVersionsResponse, PutObjectRequest, PutObjectResponse,
             };
-            // key: (version, value)
-            type Kept = HashMap<String, (i64, Vec<u8>)>;
             let state: Arc<std::sync::Mutex<Kept>> = Arc::default();
+            let stop_after: Arc<std::sync::Mutex<Option<usize>>> = Arc::default();
+            let lists = Arc::new(AtomicBool::new(true));
+            // whether the upload stops at this put: a chunk past the first ones, or the manifest
+            let stops = |stop_after: &std::sync::Mutex<Option<usize>>,
+                         request: &PutObjectRequest| {
+                let Some(n) = *stop_after.lock().unwrap() else {
+                    return false;
+                };
+                request.transaction_items.iter().any(|item| {
+                    item.key == BACKUP_KEY_MANIFEST
+                        || item.key.starts_with(BACKUP_KEY_CHUNK_PREFIX)
+                            && item
+                                .key
+                                .rsplit('/')
+                                .next()
+                                .and_then(|i| i.parse::<usize>().ok())
+                                .is_some_and(|i| i >= n)
+                })
+            };
+            let put_of = |request: &mockito::Request| {
+                PutObjectRequest::decode(&request.body().unwrap()[..]).unwrap()
+            };
             let key_of = |request: &mockito::Request| {
                 GetObjectRequest::decode(&request.body().unwrap()[..])
                     .unwrap()
                     .key
             };
-            let (known, stored, kept) = (state.clone(), state.clone(), state);
+            let (known, stored, kept, listed) =
+                (state.clone(), state.clone(), state.clone(), state.clone());
+            let (failing, stopping) = (stop_after.clone(), stop_after.clone());
+            let lister = lists.clone();
             let mut server = mockito::Server::new();
             let get = server
                 .mock("POST", mockito::Matcher::Regex("/getObject$".to_string()))
@@ -3309,8 +3463,22 @@ mod tests {
                 .create();
             let put = server
                 .mock("POST", mockito::Matcher::Regex("/putObjects$".to_string()))
+                .with_status_code_from_request(move |request| {
+                    if stops(&failing, &put_of(request)) {
+                        500
+                    } else {
+                        200
+                    }
+                })
                 .with_body_from_request(move |request| {
-                    let request = PutObjectRequest::decode(&request.body().unwrap()[..]).unwrap();
+                    let request = put_of(request);
+                    if stops(&stopping, &request) {
+                        return ErrorResponse {
+                            error_code: ErrorCode::InternalServerException as i32,
+                            message: "stopped (test)".to_string(),
+                        }
+                        .encode_to_vec();
+                    }
                     let mut kept = kept.lock().unwrap();
                     for item in request.transaction_items {
                         let version = kept.get(&item.key).map_or(0, |(v, _)| *v);
@@ -3322,14 +3490,250 @@ mod tests {
                     PutObjectResponse {}.encode_to_vec()
                 })
                 .create();
+            let list = server
+                .mock(
+                    "POST",
+                    mockito::Matcher::Regex("/listKeyVersions$".to_string()),
+                )
+                .with_status_code_from_request(move |_| {
+                    if lister.load(Ordering::SeqCst) {
+                        200
+                    } else {
+                        404
+                    }
+                })
+                .with_body_from_request(move |request| {
+                    let request =
+                        ListKeyVersionsRequest::decode(&request.body().unwrap()[..]).unwrap();
+                    let prefix = request.key_prefix.unwrap_or_default();
+                    let mut key_versions: Vec<KeyValue> = listed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(key, _)| key.starts_with(&prefix))
+                        .map(|(key, (version, _))| KeyValue {
+                            key: key.clone(),
+                            version: *version,
+                            value: vec![],
+                        })
+                        .collect();
+                    key_versions.sort_by(|a, b| a.key.cmp(&b.key));
+                    ListKeyVersionsResponse {
+                        key_versions,
+                        next_page_token: None,
+                        global_version: None,
+                    }
+                    .encode_to_vec()
+                })
+                .create();
             Self {
                 server,
-                _mocks: [get, put],
+                kept: state,
+                stop_after,
+                lists,
+                _mocks: [get, put, list],
             }
         }
 
         fn config(&self, key: SecretKey) -> VssBackupConfig {
             VssBackupConfig::new(self.server.url(), "store".to_string(), key)
+        }
+
+        /// Stop every upload after its first `n` chunks (`None`: stop none).
+        fn stop_uploads_after(&self, n: Option<usize>) {
+            *self.stop_after.lock().unwrap() = n;
+        }
+
+        /// Answer listKeyVersions, or not (HTTP 404, as a server without it).
+        fn set_lists(&self, lists: bool) {
+            self.lists.store(lists, Ordering::SeqCst);
+        }
+
+        /// The keys the server holds, sorted.
+        fn keys(&self) -> Vec<String> {
+            let mut keys: Vec<String> = self.kept.lock().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+
+        /// Hold `value` under `key`, as an earlier upload left it.
+        fn hold(&self, key: &str, value: Vec<u8>) {
+            self.kept
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (1, value));
+        }
+    }
+
+    // ERA fork (review S5, CC-98): a chunked upload goes under a chunk set of its own and replaces
+    // the previous backup only with its manifest, so one that stops anywhere before leaves the
+    // previous backup whole; the previous pieces go once the new backup is in place
+
+    /// A backup of `EXPECTED`'s wallet whose large.bin holds `size` bytes of noise from `seed`
+    /// (stored, so the zip is as large), as `vss_backup` hands it to the upload.
+    fn noise_zip(size: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut x: u64 = seed | 1;
+        let noise: Vec<u8> = (0..size)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let zip = zip_of(&[
+            ("a1b2c3d4/", None),
+            ("a1b2c3d4/some_file.txt", Some(b"test content")),
+            ("a1b2c3d4/large.bin", Some(&noise)),
+        ]);
+        (zip, noise)
+    }
+
+    /// The large.bin a restore from `store` brings back.
+    fn restored_noise(store: &VssStore, key: SecretKey) -> Result<Vec<u8>, Error> {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("data");
+        let wallet_dir = restore(store.config(key), &target, Some(EXPECTED))?;
+        Ok(fs::read(wallet_dir.join("large.bin")).unwrap())
+    }
+
+    /// The chunk sets `store` holds chunks of, and whether it holds chunks of the old layout.
+    fn chunk_sets(store: &VssStore) -> (BTreeSet<String>, bool) {
+        let mut sets = BTreeSet::new();
+        let mut old_layout = false;
+        for key in store.keys() {
+            if let Some(rest) = key.strip_prefix(BACKUP_KEY_CHUNK_PREFIX) {
+                match rest.split_once('/') {
+                    Some((set, _)) => {
+                        sets.insert(set.to_string());
+                    }
+                    None => old_layout = true,
+                }
+            }
+        }
+        (sets, old_layout)
+    }
+
+    #[test]
+    fn a_chunked_upload_that_stops_keeps_the_previous_backup() {
+        let key = test_signing_key();
+        for previous_chunked in [true, false] {
+            let store = VssStore::start();
+            let client = VssBackupClient::new(store.config(key)).unwrap();
+            let previous_size = if previous_chunked {
+                VSS_CHUNK_SIZE * 2 + 100
+            } else {
+                1000
+            };
+            let (previous, previous_noise) = noise_zip(previous_size, 1);
+            block_on(client.upload_backup(previous)).unwrap();
+            let manifest = store.kept.lock().unwrap()[BACKUP_KEY_MANIFEST].clone();
+
+            // stopped after its first chunk (the case CC-98 found), and after every chunk but
+            // before its manifest
+            let (next, next_noise) = noise_zip(VSS_CHUNK_SIZE * 3 + 7, 2);
+            for stop_after in [1, 4] {
+                store.stop_uploads_after(Some(stop_after));
+                let result = block_on(client.upload_backup(next.clone()));
+                assert!(result.is_err(), "{previous_chunked}, {stop_after}");
+                assert_eq!(
+                    store.kept.lock().unwrap()[BACKUP_KEY_MANIFEST],
+                    manifest,
+                    "{previous_chunked}, {stop_after}"
+                );
+                assert_eq!(
+                    restored_noise(&store, key).unwrap(),
+                    previous_noise,
+                    "{previous_chunked}, {stop_after}"
+                );
+            }
+
+            // the next upload that completes replaces it, and only its own chunks are left
+            store.stop_uploads_after(None);
+            block_on(client.upload_backup(next.clone())).unwrap();
+            assert_eq!(restored_noise(&store, key).unwrap(), next_noise);
+            let manifest: BackupManifest =
+                serde_json::from_slice(&store.kept.lock().unwrap()[BACKUP_KEY_MANIFEST].1).unwrap();
+            let set = manifest.chunk_set.clone().unwrap();
+            assert_eq!(manifest.chunk_count, 4);
+            assert_eq!(chunk_sets(&store), (BTreeSet::from([set]), false));
+            assert!(!store.keys().contains(&BACKUP_KEY_DATA.to_string()));
+
+            // and a single-piece upload after it leaves no chunk
+            let (small, small_noise) = noise_zip(1000, 3);
+            block_on(client.upload_backup(small)).unwrap();
+            assert_eq!(restored_noise(&store, key).unwrap(), small_noise);
+            assert_eq!(chunk_sets(&store), (BTreeSet::new(), false));
+        }
+    }
+
+    #[test]
+    fn a_backup_in_the_old_chunk_layout_restores_and_is_replaced() {
+        let key = test_signing_key();
+        for lists in [true, false] {
+            let store = VssStore::start();
+            store.set_lists(lists);
+            // a backup an older upload wrote: chunks under backup/chunk/<i>
+            let (zip, noise) = noise_zip(VSS_CHUNK_SIZE + 100, 4);
+            let metadata = VssEncryptionMetadata::new();
+            let data = encrypt_data(&zip, &key, &metadata, None).unwrap();
+            let chunks = chunks_of(&data, VSS_CHUNK_SIZE);
+            store.hold(
+                BACKUP_KEY_MANIFEST,
+                chunked_manifest(true, chunks.len(), data.len()),
+            );
+            store.hold(BACKUP_KEY_FINGERPRINT, EXPECTED.into());
+            store.hold(BACKUP_KEY_METADATA, serde_json::to_vec(&metadata).unwrap());
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                store.hold(&format!("{BACKUP_KEY_CHUNK_PREFIX}{i}"), chunk);
+            }
+            assert_eq!(restored_noise(&store, key).unwrap(), noise);
+
+            // replaced by a chunked upload: listed or not, the old chunks go once it is in place
+            let client = VssBackupClient::new(store.config(key)).unwrap();
+            let (next, next_noise) = noise_zip(VSS_CHUNK_SIZE * 2, 5);
+            block_on(client.upload_backup(next)).unwrap();
+            assert_eq!(restored_noise(&store, key).unwrap(), next_noise, "{lists}");
+            let (sets, old_layout) = chunk_sets(&store);
+            assert_eq!(sets.len(), 1, "{lists}");
+            assert!(!old_layout, "{lists}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_a_chunk_set_no_upload_writes_is_refused() {
+        let key = test_signing_key();
+        let [_, data, metadata] = uploaded(EXPECTED, &key, true);
+        let manifest = |chunk_count: usize, set: &str| {
+            serde_json::to_vec(&BackupManifest {
+                chunk_count,
+                total_size: 2 * MIN_VSS_CHUNK_SIZE,
+                encrypted: true,
+                version: VSS_BACKUP_VERSION,
+                chunk_set: Some(set.to_string()),
+            })
+            .unwrap()
+        };
+        let good = "0123456789abcdef0123456789abcdef";
+        for manifest in [
+            // a chunk set names chunks, not the single piece
+            manifest(1, good),
+            manifest(2, "../manifest"),
+            manifest(2, "0123456789ABCDEF0123456789ABCDEF"),
+            manifest(2, &good[1..]),
+            manifest(2, ""),
+        ] {
+            let server = VssScript::start(vec![
+                (BACKUP_KEY_MANIFEST, vec![manifest]),
+                (BACKUP_KEY_FINGERPRINT, vec![EXPECTED.into()]),
+                (BACKUP_KEY_DATA, vec![data.clone()]),
+                (BACKUP_KEY_METADATA, vec![metadata.clone()]),
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("data");
+            let result = restore(config(&server, key), &target, Some(EXPECTED));
+            assert!(matches!(result, Err(Error::VssError { .. })), "{result:?}");
+            assert_eq!(server.reads(BACKUP_KEY_DATA), 0);
         }
     }
 
