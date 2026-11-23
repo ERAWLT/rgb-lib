@@ -1345,6 +1345,29 @@ pub trait WalletOnline: WalletOffline {
     fn check_consistency(&mut self, txn: &DbTxn) -> Result<(), Error> {
         info!(self.logger(), "Doing a consistency check...");
 
+        let result = self.check_consistency_inner(txn);
+        #[cfg(feature = "vss")]
+        {
+            let marker = self
+                .wallet_dir()
+                .join(crate::wallet::vss::VSS_RESTORE_MARKER);
+            match &result {
+                // Attribute the failure to the just-restored backup.
+                Err(Error::Inconsistency { details }) if marker.exists() => {
+                    return Err(Error::RestoredBackupInconsistent {
+                        details: details.clone(),
+                    });
+                }
+                Ok(()) => {
+                    let _ = std::fs::remove_file(marker);
+                }
+                Err(_) => {}
+            }
+        }
+        result
+    }
+
+    fn check_consistency_inner(&mut self, txn: &DbTxn) -> Result<(), Error> {
         self.wallet_specific_consistency_checks(txn)?;
 
         let medias = txn.iter_media()?;
@@ -8435,6 +8458,9 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if outcome.transfers_changed {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Fail transfers completed");
         if outcome.cannot_fail {
             return Err(Error::CannotFailBatchTransfer);
@@ -8514,6 +8540,9 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if res.transfers_changed() {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Refresh completed");
         Ok(res)
     }

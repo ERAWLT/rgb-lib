@@ -14,6 +14,8 @@ pub(crate) mod online;
 pub mod rust_only;
 pub(crate) mod singlesig;
 pub mod utils;
+#[cfg(feature = "vss")]
+pub mod vss;
 
 #[cfg(test)]
 pub(crate) mod test;
