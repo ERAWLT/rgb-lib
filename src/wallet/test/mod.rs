@@ -682,6 +682,9 @@ mod delete_transfers;
 mod drain_to;
 // ERA fork: backups an older rev wrote, which must keep restoring
 pub(crate) mod era_fixtures;
+// ERA fork: the fork's own paths on the regtest services (era.yml, era-regtest)
+#[cfg(feature = "electrum")]
+mod era_regtest;
 #[cfg(feature = "electrum")]
 mod fail_transfers;
 #[cfg(feature = "electrum")]
