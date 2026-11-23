@@ -1022,6 +1022,15 @@ impl ScriptedChain {
         self.state().withheld.remove(&Txid::from_str(txid).unwrap());
     }
 
+    /// ERA fork (D63): someone else broadcasts `tx`, e.g. the recipient a sender proxy released
+    /// it to. Panics if the indexer refuses it.
+    pub(crate) fn publish(&self, tx: &Transaction) {
+        let response = self
+            .state()
+            .broadcast(hex::encode(serialize(tx)).as_bytes());
+        assert_eq!(response.status, 200, "the indexer refused the TX");
+    }
+
     /// A transaction in the mempool leaves every mempool.
     pub(crate) fn evict(&self, txid: &str) {
         let txid = Txid::from_str(txid).unwrap();
@@ -1359,7 +1368,9 @@ mod tests {
     }
 
     // CC-99 S1, as upstream rgb-lib meets it: the broadcast reaches the network, its answer and the
-    // lookup that follows are lost, send_end rolls back, and the next go_online refuses the wallet
+    // lookup that follows are lost, send_end rolls back, and the next go_online refuses the wallet.
+    // ERA fork (D63): without the completion, the check lets the spend of the donation's own TX
+    // through instead, and the donation stays Initiated
     #[test]
     #[parallel]
     fn loses_a_relayed_broadcast_answer() {
@@ -1382,8 +1393,8 @@ mod tests {
         assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
 
         party.wallet.go_offline();
-        let result = party.wallet.go_online(online_options(&chain));
-        assert_matches!(result, Err(Error::Inconsistency { .. }));
+        party.online = party.wallet.go_online(online_options(&chain)).unwrap();
+        assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
     }
 
     #[test]

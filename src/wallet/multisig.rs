@@ -273,7 +273,11 @@ impl WalletOffline for MultisigWallet {
 
 #[cfg(feature = "_online")]
 impl WalletOnline for MultisigWallet {
-    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error> {
+    fn wallet_specific_consistency_checks(
+        &mut self,
+        _txn: &DbTxn,
+        _excuse_initiated: bool,
+    ) -> Result<(), Error> {
         Ok(())
     }
 

@@ -561,42 +561,252 @@ fn a_crashed_send_end_leaves_nothing_in_the_stash_to_skip() {
     assert!(is_signed(&stash_witness(&party, &txid)));
 }
 
-// W8: without the option, go_online answers exactly as upstream and asks the indexer nothing
-// about the spend
-#[test]
-#[parallel]
-fn without_the_option_the_check_is_upstream() {
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, true);
-    let txid = psbt_txid(&signed);
-    let inputs: Vec<String> = Psbt::from_str(&signed)
+/// The colored coins a signed PSBT spends.
+fn psbt_inputs(signed: &str) -> Vec<String> {
+    Psbt::from_str(signed)
         .unwrap()
         .unsigned_tx
         .input
         .iter()
         .map(|i| i.previous_output.to_string())
-        .collect();
-    assert_eq!(inputs.len(), 1);
+        .collect()
+}
+
+fn signed_tx_of(signed: &str) -> BdkTransaction {
+    Psbt::from_str(signed).unwrap().extract_tx().unwrap()
+}
+
+// W8: without the option, go_online answers exactly as upstream to a spend that no Initiated
+// transfer's own TX makes (here a drain's, recorded as a wallet transaction) and asks the indexer
+// nothing about it
+#[test]
+#[parallel]
+fn without_the_option_the_check_is_upstream() {
+    let chain = ScriptedChain::start();
+    let (wallet, online) = funded(&chain, UTXOS);
+    let mut party = Issuer {
+        wallet,
+        online,
+        asset_id: s!(""),
+    };
+    let address = get_test_wallet(false, None).get_address().unwrap();
+    let psbt = party
+        .wallet
+        .drain_to_begin(party.online, address, FEE_RATE, false)
+        .unwrap();
+    let signed = party.wallet.sign_psbt(psbt, None).unwrap();
+    let txid = psbt_txid(&signed);
     lose_the_answer(&chain, &txid);
-    let result = party.wallet.send_end(party.online, signed);
+    let result = party.wallet.drain_to_end(party.online, signed);
     assert_matches!(result, Err(Error::Indexer { .. }));
     let digest = state_digest(&party);
 
     let error = reopen(&chain, &mut party, online_options(&chain)).unwrap_err();
-    assert_eq!(
-        error,
-        Error::Inconsistency {
-            details: format!("spent bitcoins with another wallet: [\"{}\"]", inputs[0]),
-        }
+    assert_matches!(
+        &error,
+        Error::Inconsistency { details } if details.starts_with("spent bitcoins with another wallet: ")
     );
     assert_eq!(error.inconsistency_reason(), None);
     assert_eq!(status_lookups(&chain, &txid), 0);
     assert_eq!(state_digest(&party), digest);
+    assert_eq!(party.wallet.list_pending_vanilla_txs().unwrap().len(), 1);
+}
+
+/// D63: a send to a witness recipient whose `send_end` did not commit after registering its signed
+/// TX on the sender proxy and posting its consignment (RGB proxy protocol 1.0), and whose TX the
+/// recipient, once it ACKed, got released and broadcast. Returns its batch transfer, TXID, signed
+/// PSBT and recipient.
+fn interrupted_send_a_recipient_broadcast(
+    chain: &ScriptedChain,
+    party: &mut Issuer,
+) -> (i32, String, String, Recipient) {
+    let (begin, signed, recipient) = begin_send(chain, party, AMOUNT_SMALL, false);
+    let idx = begin.batch_transfer_idx.unwrap();
+    let txid = psbt_txid(&signed);
+    MOCK_SEND_END_CRASH.replace(Some(()));
+    let result = party.wallet.send_end(party.online, signed.clone());
+    assert_matches!(result, Err(Error::Internal { .. }));
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    let methods = chain.proxy_methods();
+    assert!(methods.iter().any(|m| m == "ack.prepare"));
+    assert!(methods.iter().any(|m| m == "consignment.post"));
+    assert!(!chain.knows(&txid));
+    chain.publish(&signed_tx_of(&signed));
+    (idx, txid, signed, recipient)
+}
+
+// D63: without the option, the spend of an interrupted send's own TX, which a recipient
+// broadcast, lets go_online through, as the spend of a send waiting for its counterparty does,
+// and the indexer is asked nothing about it. The send stays Initiated until its send_end, called
+// again, ends it; then it settles as any send.
+#[test]
+#[parallel]
+fn without_the_option_an_interrupted_send_a_recipient_broadcast_goes_online() {
+    let chain = ScriptedChain::start();
+    let mut party = issuer(&chain, vec![AMOUNT]);
+    let (idx, txid, signed, recipient) = interrupted_send_a_recipient_broadcast(&chain, &mut party);
+
+    for _ in 0..2 {
+        reopen(&chain, &mut party, online_options(&chain)).unwrap();
+        assert!(party.wallet.completed_spends().is_empty());
+        assert_eq!(status_lookups(&chain, &txid), 0);
+        assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    }
+
+    party.wallet.send_end(party.online, signed).unwrap();
     assert_eq!(
-        status_of(&party.wallet, begin.batch_transfer_idx.unwrap()),
-        TransferStatus::Initiated
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
     );
+    chain.set_ack(&recipient.recipient_id, true);
+    party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+    settle(&chain, &mut party);
+    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+    assert_eq!(
+        spendable(&party.wallet, &party.asset_id),
+        AMOUNT - AMOUNT_SMALL
+    );
+}
+
+// D63 with the option: go_online's completion moves the interrupted send on, as it does a lost
+// donation, without asking the proxy anything, and the send settles. The stash gets the fascia as
+// a send that is not a donation consumes it.
+#[test]
+#[parallel]
+fn an_interrupted_send_a_recipient_broadcast_completes_at_go_online() {
+    for confirmed in [false, true] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (idx, txid, _, _) = interrupted_send_a_recipient_broadcast(&chain, &mut party);
+        if confirmed {
+            chain.mine(1);
+        }
+
+        let proxy_calls = chain.proxy_methods().len();
+        reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+        assert_eq!(chain.proxy_methods().len(), proxy_calls);
+        assert_eq!(
+            party.wallet.completed_spends(),
+            vec![CompletedSpend {
+                txid: txid.clone(),
+                batch_transfer_idx: Some(idx),
+                previous_status: Some(TransferStatus::Initiated),
+                donation: false,
+                confirmations: u64::from(confirmed),
+            }]
+        );
+        assert_eq!(
+            status_of(&party.wallet, idx),
+            TransferStatus::WaitingConfirmations
+        );
+        assert!(is_unsigned(&stash_witness(&party, &txid)));
+        settle(&chain, &mut party);
+        assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
+        assert_eq!(
+            spendable(&party.wallet, &party.asset_id),
+            AMOUNT - AMOUNT_SMALL
+        );
+    }
+}
+
+// D63: a spend that a go_online without the option let through (an Initiated transfer's own TX)
+// is completed by the first go_online with the option, a lost donation's as an interrupted send's
+#[test]
+#[parallel]
+fn a_spend_let_through_without_the_option_completes_with_it() {
+    for donation in [true, false] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (idx, txid) = if donation {
+            donation_answer_lost(&chain, &mut party)
+        } else {
+            let (idx, txid, _, _) = interrupted_send_a_recipient_broadcast(&chain, &mut party);
+            (idx, txid)
+        };
+
+        reopen(&chain, &mut party, online_options(&chain)).unwrap();
+        assert!(party.wallet.completed_spends().is_empty());
+        assert_eq!(status_lookups(&chain, &txid), 0);
+        assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+
+        reopen(&chain, &mut party, completing_options(&chain)).unwrap();
+        assert_eq!(
+            party.wallet.completed_spends(),
+            vec![CompletedSpend {
+                txid: txid.clone(),
+                batch_transfer_idx: Some(idx),
+                previous_status: Some(TransferStatus::Initiated),
+                donation,
+                confirmations: 0,
+            }]
+        );
+        assert_eq!(
+            status_of(&party.wallet, idx),
+            TransferStatus::WaitingConfirmations
+        );
+    }
+}
+
+// D63, CC-27: only the Initiated transfer's own TX is excused. Another TX spending its coins,
+// here from another install of the wallet, is refused as upstream refuses it, whether or not BDK
+// saw the transfer's own TX before it left the mempool, and whether or not the other is mined.
+#[test]
+#[parallel]
+fn without_the_option_another_spend_of_an_interrupted_sends_coins_is_refused() {
+    for (seen, mined) in [(false, false), (false, true), (true, false), (true, true)] {
+        let chain = ScriptedChain::start();
+        let mut party = issuer(&chain, vec![AMOUNT]);
+        let (mut other, _other_dir) = control(&party);
+        other.online = other.wallet.go_online(online_options(&chain)).unwrap();
+
+        let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
+        let idx = begin.batch_transfer_idx.unwrap();
+        let txid = psbt_txid(&signed);
+        let inputs = psbt_inputs(&signed);
+        assert_eq!(inputs.len(), 1);
+        MOCK_SEND_END_CRASH.replace(Some(()));
+        let crashed = party.wallet.send_end(party.online, signed.clone());
+        assert_matches!(crashed, Err(Error::Internal { .. }));
+        if seen {
+            // the recipient broadcast it, the wallet went online (excused), then it left the
+            // mempool
+            chain.publish(&signed_tx_of(&signed));
+            reopen(&chain, &mut party, online_options(&chain)).unwrap();
+            chain.evict(&txid);
+            // BDK orders unconfirmed conflicts by the second it last saw each
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+
+        let (_, signed_b, _) = begin_send(&chain, &mut other, AMOUNT_SMALL * 2, true);
+        let txid_b = psbt_txid(&signed_b);
+        other.wallet.send_end(other.online, signed_b).unwrap();
+        assert!(chain.knows(&txid_b));
+        if mined {
+            chain.mine(1);
+        }
+
+        let digest = state_digest(&party);
+        let error = reopen(&chain, &mut party, online_options(&chain)).unwrap_err();
+        let Error::Inconsistency { details } = &error else {
+            panic!("seen {seen}, mined {mined}: {error:?}");
+        };
+        assert!(details.starts_with("spent bitcoins with another wallet: "));
+        assert!(details.contains(&inputs[0]), "seen {seen}, mined {mined}");
+        // the go_online that let the transfer's own TX through recorded its change, which the
+        // other TX, replacing it, left without a spender
+        assert_eq!(details.contains(&txid), seen, "mined {mined}");
+        assert!(!details.contains(&txid_b));
+        assert_eq!(error.inconsistency_reason(), None);
+        assert_eq!(state_digest(&party), digest);
+        assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
+    }
 }
 
 // W9: with the check skipped nothing is looked up or completed, and each go_online replaces the
@@ -1032,7 +1242,8 @@ impl TxStatusLookup for Lookup {
 }
 
 /// A wallet state with own spends that lost their record, scanned by a go_online without the
-/// option (which refused, and left BDK knowing the spends).
+/// option, which left BDK knowing the spends: it refused those no Initiated transfer's own TX
+/// makes, and let the others through (D63).
 struct Base {
     _chain: ScriptedChain,
     party: Issuer,
@@ -1050,7 +1261,19 @@ impl Base {
         party.wallet.go_offline();
         let details = match party.wallet.go_online(online_options(&chain)) {
             Err(Error::Inconsistency { details }) => details,
-            other => panic!("expected the upstream refusal, got {other:?}"),
+            // what the check says of the coins when it refuses them (the completion's input)
+            Ok(_) => {
+                party.wallet.go_offline();
+                let txn = party.wallet.database().begin_transaction().unwrap();
+                let divergence: Vec<String> = colored_divergence(party.wallet.bdk_wallet(), &txn)
+                    .unwrap()
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect();
+                assert!(!divergence.is_empty());
+                format!("spent bitcoins with another wallet: {divergence:?}")
+            }
+            other => panic!("expected the upstream refusal or the D63 excuse, got {other:?}"),
         };
         spends.sort();
         Self {
