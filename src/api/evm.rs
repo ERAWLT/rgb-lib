@@ -273,9 +273,18 @@ struct BlockHeader {
 
 impl EvmClient {
     pub(crate) fn new(rpc_url: &str) -> Result<Self, Error> {
+        // ERA fork: the RPC URL is the host's route, in the ERA app the loopback forwarder's,
+        // whose path carries its session secret. A redirect would send the request, and with it
+        // that URL, to the host the answer names, and so would a system proxy (HTTP_PROXY) or a
+        // Referer header: none is followed, read or sent, as for the forwarder's own client
+        // (Forwarder::client). A node that answers with a redirect is an error, as an answer
+        // that is not JSON-RPC.
         let client = rest_client_builder()?
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .no_proxy()
             .build()?;
         Ok(Self {
             client,
