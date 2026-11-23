@@ -3,7 +3,7 @@
 //!
 //! One local HTTP server answers the Esplora API rgb-lib and BDK use (blocks, script hash
 //! histories, transactions, their status and spends, broadcast, fee estimates) from an in-memory
-//! chain, and the RGB proxy's JSON-RPC at [`PROXY_PATH`]. Transactions are what the wallets under
+//! chain, and the RGB proxy's JSON-RPC (protocol 1.0) at [`PROXY_PATH`]. Transactions are what the wallets under
 //! test broadcast plus funding transactions the test makes up; nothing checks signatures or
 //! amounts, since only the wallet reads this chain. Blocks are mined when the test says so.
 //!
@@ -43,6 +43,10 @@ use bdk_wallet::bitcoin::{
 };
 use serde_json::{Value as Json, json};
 
+// (explicit: the test module imports it with the electrum feature only, and the app builds
+// without it)
+use crate::utils::recipient_id_from_script_buf;
+
 /// Where the scripted RGB proxy answers.
 pub(crate) const PROXY_PATH: &str = "/json-rpc";
 
@@ -65,11 +69,59 @@ struct Fault {
     body: String,
 }
 
+/// The scripted RGB proxy (protocol 1.0, as rgb-lib beta.8 speaks it): it takes every invoice and
+/// transfer, asks for no proof of work, and answers a sender's `ack.get` with the ACKs the test set
+/// for its recipients, signed with the recipient keys the test holds (see
+/// [`ScriptedChain::recipient_key`]).
 #[derive(Default)]
 struct Proxy {
+    // the ACK (or NACK) the test set, by recipient ID
     acks: HashMap<String, bool>,
-    posted: Vec<String>,
+    // the Ed25519 keys of the recipients the test made, by recipient ID
+    recipient_keys: HashMap<String, ed25519_dalek::SigningKey>,
+    // posted transfers: transfer ID -> (invoice ID, consignment hash)
+    posted: HashMap<String, (String, String)>,
     methods: Vec<String>,
+}
+
+impl Proxy {
+    /// The recipient a posted transfer is for.
+    fn recipient_of(&self, invoice_id: &str) -> Option<String> {
+        self.recipient_keys
+            .iter()
+            .find(|(recipient_id, sk)| {
+                crate::encryption::invoice_id(
+                    recipient_id,
+                    &hex::encode(sk.verifying_key().to_bytes()),
+                ) == invoice_id
+            })
+            .map(|(recipient_id, _)| recipient_id.clone())
+    }
+
+    /// `ack.get`: the ACKs the test set for the recipients of `transfer_ids`, each signed with
+    /// its recipient's key over `transfer_id ‖ ack ‖ consignment_hash`.
+    fn acks_of(&self, transfer_ids: &[String]) -> Json {
+        let mut acks = serde_json::Map::new();
+        let mut signatures = serde_json::Map::new();
+        for transfer_id in transfer_ids {
+            let Some((invoice_id, consignment_hash)) = self.posted.get(transfer_id) else {
+                continue;
+            };
+            let Some(recipient_id) = self.recipient_of(invoice_id) else {
+                continue;
+            };
+            let Some(ack) = self.acks.get(&recipient_id) else {
+                continue;
+            };
+            let message = format!("{transfer_id}{ack}{consignment_hash}");
+            let digest = crate::encryption::sha256_digest(message.as_bytes());
+            let sk = &self.recipient_keys[&recipient_id];
+            let signature = crate::encryption::sign_ed25519(sk, &digest);
+            acks.insert(transfer_id.clone(), json!(ack));
+            signatures.insert(transfer_id.clone(), json!(hex::encode(signature)));
+        }
+        json!({"acks": acks, "signatures": signatures})
+    }
 }
 
 struct State {
@@ -317,7 +369,7 @@ impl State {
             }
             ("GET", ["blocks"]) | ("GET", ["blocks", _]) => {
                 let start = match segments.get(1) {
-                    Some(h) => h.parse::<u32>().ok()?.min(self.tip()),
+                    Some(h) => Ord::min(h.parse::<u32>().ok()?, self.tip()),
                     None => self.tip(),
                 };
                 let blocks: Vec<Json> = (0..=start)
@@ -426,22 +478,69 @@ impl State {
             )
         };
         self.proxy.methods.push(method.clone());
-        let recipient_id = params["recipient_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let ids = |key: &str| -> Vec<String> {
+            params[key]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let result = match method.as_str() {
-            "server.info" => json!({"protocol_version": "0.2", "version": "0.2.1", "uptime": 1}),
-            "ack.get" => match self.proxy.acks.get(&recipient_id) {
-                Some(ack) => json!(ack),
-                None => Json::Null,
-            },
-            "consignment.post" => {
-                self.proxy.posted.push(recipient_id);
+            "server.info" => json!({
+                "protocol_version": "1.0",
+                "version": "0.4.0",
+                "uptime": 1,
+                "current_time": now().unix_timestamp().to_string(),
+                "max_expiry_secs": "2592000",
+                "max_quota": "100",
+                "max_pow_difficulty": "0",
+                "retention_grace_secs": "86400",
+                "max_media": "21",
+            }),
+            // every invoice is reserved and open, and asks for no proof of work
+            "invoice.check" => Json::Object(
+                ids("invoice_ids")
+                    .into_iter()
+                    .map(|id| (id, json!({"status": "available", "pow_difficulty": "0"})))
+                    .collect(),
+            ),
+            "invoice.prepare" | "media.post" | "ack.prepare" | "transfer.retrieved" => {
                 json!(true)
             }
-            "media.post" | "ack.post" => json!(true),
-            "consignment.get" | "media.get" => Json::Null,
+            "consignment.post" => {
+                let transfer_id = params["transfer_id"].as_str().unwrap_or_default();
+                let invoice_id = params["invoice_id"].as_str().unwrap_or_default();
+                let consignment_hash = params["consignment_hash"].as_str().unwrap_or_default();
+                self.proxy.posted.insert(
+                    transfer_id.to_string(),
+                    (invoice_id.to_string(), consignment_hash.to_string()),
+                );
+                json!(true)
+            }
+            "ack.get" => self.proxy.acks_of(&ids("transfer_ids")),
+            // a TX a recipient ACKed has been released to it, and cannot be revoked any more
+            "ack.clean" => {
+                let released = self
+                    .proxy
+                    .acks_of(&ids("transfer_ids"))
+                    .get("acks")
+                    .and_then(|a| a.as_object())
+                    .is_some_and(|a| a.values().any(|ack| ack == &json!(true)));
+                if released {
+                    return Response::json(
+                        200,
+                        &json!({"jsonrpc": "2.0", "id": null, "result": null,
+                            "error": {"code": -107, "message": "TX already released"}}),
+                    );
+                }
+                json!(true)
+            }
+            "ack.post" => json!({"result": true, "sender_pk": null, "signed_tx": null}),
+            // no transfer was posted to the wallet's own invoices
+            "transfer.list" => json!({}),
             _ => {
                 self.unmatched.push(format!("proxy {method}"));
                 return Response::text(404, "unknown method");
@@ -865,6 +964,18 @@ impl ScriptedChain {
         });
     }
 
+    /// A recipient the test holds the key of: the proxy signs the ACKs set for it with that key.
+    /// Returns the public key to put in the recipient (the invoice's `pk`).
+    pub(crate) fn recipient_key(&self, recipient_id: &str) -> String {
+        let sk = crate::encryption::gen_ed25519();
+        let pk = hex::encode(sk.verifying_key().to_bytes());
+        self.state()
+            .proxy
+            .recipient_keys
+            .insert(recipient_id.to_string(), sk);
+        pk
+    }
+
     /// The RGB proxy's ACK (or NACK) for a recipient.
     pub(crate) fn set_ack(&self, recipient_id: &str, ack: bool) {
         self.state()
@@ -925,9 +1036,12 @@ pub(crate) struct Issuer {
 
 pub(crate) fn online_options(chain: &ScriptedChain) -> OnlineOptions {
     OnlineOptions {
-        indexer_url: chain.url(),
+        indexer_config: IndexerConfig::Esplora { url: chain.url() },
         skip_consistency_check: false,
         vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK as u32,
+        failed_witness_receive_grace_secs: FAILED_WITNESS_RECEIVE_GRACE_SECS,
+        proxy_auth_keys: HashMap::new(),
+        evm_chains: HashMap::new(),
         forwarder_url: None,
         complete_unrecorded_spends: false,
     }
@@ -971,14 +1085,22 @@ pub(crate) fn witness_recipient(chain: &ScriptedChain, amount: u64) -> Recipient
         .unwrap()
         .assume_checked()
         .script_pubkey();
+    let recipient_id = recipient_id_from_script_buf(script, BitcoinNetwork::Regtest);
+    let public_key = chain.recipient_key(&recipient_id);
     Recipient {
-        recipient_id: recipient_id_from_script_buf(script, BitcoinNetwork::Regtest),
+        recipient_id,
         witness_data: Some(WitnessData {
             amount_sat: WITNESS_SATS,
             blinding: None,
         }),
         assignment: Assignment::Fungible(amount),
         transport_endpoints: vec![chain.proxy_endpoint()],
+        public_key: Some(public_key),
+        encryption: Encryption::Unsupported,
+        // the operation's expiration (DURATION_SEND_TRANSFER) has to leave time before it
+        expiration_timestamp: Some(
+            (now().unix_timestamp() + 2 * DURATION_SEND_TRANSFER as i64) as u64,
+        ),
     }
 }
 
@@ -999,8 +1121,8 @@ pub(crate) fn begin_send(
             FEE_RATE,
             MIN_CONFIRMATIONS,
             (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64,
+            Some(chain.proxy_endpoint()),
             false,
-            None,
         )
         .unwrap();
     let signed = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
@@ -1017,7 +1139,7 @@ pub(crate) fn psbt_txid(psbt: &str) -> String {
 
 pub(crate) fn status_of(wallet: &Wallet, batch_transfer_idx: i32) -> TransferStatus {
     wallet
-        .list_transfers(AssetFilter::AnyOrNone, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.batch_transfer_idx == batch_transfer_idx)

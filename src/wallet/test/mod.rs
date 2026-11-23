@@ -744,9 +744,8 @@ mod new;
 mod refresh;
 #[cfg(feature = "electrum")]
 mod rust_only;
-// ERA fork: a chain for offline wallet tests (era_beta8_pending: speaks the RGB proxy protocol
-// 0.2 and the pre-beta.8 OnlineOptions; see ERA.md, "Carried onto beta.8")
-#[cfg(all(feature = "esplora", era_beta8_pending))]
+// ERA fork: a chain for offline wallet tests (an Esplora indexer and an RGB proxy, protocol 1.0)
+#[cfg(feature = "esplora")]
 pub(crate) mod scripted_chain;
 #[cfg(feature = "_online")]
 mod send;
