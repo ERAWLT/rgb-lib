@@ -268,6 +268,49 @@ jobs:
       - name: Migration crate with its CLI (the authoring binary still builds)
         run: cargo test --locked -p rgb-lib-migration
 
+
+  # The regtest subset the fork's level-A review asked for before the app
+  # turns OnlineOptions::complete_unrecorded_spends on (ERA.md, "Carried onto
+  # beta.8", Gates): upstream's own tests over its regtest services
+  # (tests/regtest.sh: bitcoind, electrs, esplora, the RGB proxies 0.4.0 and
+  # 0.3.0, nginx, the multisig hub, an anvil EVM node), which the tests start
+  # themselves (`initialize()`, no SKIP_INIT) as upstream's test.yml does.
+  # Natively on ubuntu-latest: most of the images are amd64-only. send,
+  # blind and witness receive, create_utxos, refresh, file backups, IFA, BFA
+  # (issue, mint on anvil, and validation with upstream's mock claim
+  # resolver), and the legacy migration.
+  era-regtest:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: Regtest subset (default features + vss)
+        run: |
+          set -o pipefail
+          cargo test --locked --profile reldebug --lib --features vss -- \
+            wallet::test::send::success wallet::test::send::send_received_success \
+            wallet::test::send::witness_success wallet::test::send::ack \
+            wallet::test::send::nack wallet::test::send::batch_donation_success \
+            wallet::test::send::ifa_success \
+            wallet::test::blind_receive:: wallet::test::witness_receive:: \
+            wallet::test::create_utxos:: wallet::test::refresh:: \
+            wallet::test::backup:: wallet::backup::tests:: \
+            wallet::test::issue_asset_ifa:: wallet::test::issue_asset_bfa:: \
+            wallet::test::mint::success wallet::test::mint::witness_recipient \
+            wallet::test::mint::received_mint_amount \
+            wallet::test::mint::minted_asset_transfer_acked \
+            wallet::test::validate_consignment::mint \
+            wallet::test::migrate:: 2>&1 | tee regtest-tests.log
+          grep -q '^test result: ok\.' regtest-tests.log
+      - name: Stop the regtest services
+        if: always()
+        run: ./tests/regtest.sh stop_services || true
+
   https:
     # Real TLS handshakes: UTEXO's signet RGB proxy (protocol 1.0) through
     # the rustls config of api::rest_client_builder, and a public mainnet
