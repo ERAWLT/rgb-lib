@@ -1582,6 +1582,19 @@ pub trait WalletOnline: WalletOffline {
                 return Err(e);
             }
         };
+        // ERA fork: a wallet a forwarder routes does not go direct by a go_online that names none
+        // (review N4): that would move its proxy and reject-list traffic off the forwarder
+        // without the host asking for it. It goes offline, as for a refused URL; a host that means
+        // to go direct calls go_offline first.
+        if forwarder.is_none() && self.forwarder().is_some() {
+            *self.online_data_mut() = None;
+            return Err(Error::InvalidForwarderUrl {
+                details: s!(
+                    "a wallet a forwarder routes goes direct only after go_offline, not by a \
+                     go_online without forwarder_url"
+                ),
+            });
+        }
         // ERA fork: a forwarder before or after this call (see the probe of a new indexer URL)
         let routed = forwarder.is_some() || self.forwarder().is_some();
         let online = if let Some(online_data) = self.online_data().as_ref() {
@@ -1616,7 +1629,16 @@ pub trait WalletOnline: WalletOffline {
                     forwarder_url: _, // ERA fork: validated above, applied after every branch
                     complete_unrecorded_spends: _, // ERA fork (CC-99): only used during this call
                 } = online_options;
-                let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
+                // ERA fork: a refused option goes offline when routed, as every other failure of
+                // this call does (review N4)
+                let proxy_auth_keys = match parse_proxy_auth_keys(proxy_auth_keys) {
+                    Ok(keys) => keys,
+                    Err(e) if routed => {
+                        *self.online_data_mut() = None;
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let evm_chains = match self.check_evm_chains(online_options) {
                     Ok(evm_chains) => evm_chains,
                     // ERA fork: as for a new indexer below the forwarder's last session: the
