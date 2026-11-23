@@ -243,7 +243,20 @@ fn read_transfer_file(
     txid: &str,
     batch_transfer_idx: Option<i32>,
 ) -> Result<String, Error> {
-    fs::read_to_string(path).map_err(|e| match e.kind() {
+    read_transfer_bytes(path, txid, batch_transfer_idx).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|e| Error::IO {
+            details: io::Error::new(io::ErrorKind::InvalidData, e).to_string(),
+        })
+    })
+}
+
+/// [`read_transfer_file`] of a binary file (the fascia, strict-encoded since beta.8).
+fn read_transfer_bytes(
+    path: &Path,
+    txid: &str,
+    batch_transfer_idx: Option<i32>,
+) -> Result<Vec<u8>, Error> {
+    fs::read(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => refusal(
             txid,
             UnrecordedSpendReason::TransferDataMissing,
@@ -536,12 +549,16 @@ fn plan_send(
         idx,
     )?)
     .map_err(|_| missing())?;
-    let mut fascia: Fascia = serde_json::from_str(&read_transfer_file(
+    // strict-encoded since beta.8 (write_fascia), JSON before: one the migration did not convert
+    // does not decode either way
+    let mut fascia: Fascia = Confined::<Vec<u8>, 0, FASCIA_MAX_LEN>::try_from(read_transfer_bytes(
         &transfer_dir.join(FASCIA_FILE),
         txid,
         idx,
     )?)
-    .map_err(|_| missing())?;
+    .ok()
+    .and_then(|bytes| Fascia::from_strict_serialized::<FASCIA_MAX_LEN>(bytes).ok())
+    .ok_or_else(missing)?;
     if info
         .transfers
         .values()
