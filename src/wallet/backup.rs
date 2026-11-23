@@ -1002,4 +1002,53 @@ mod tests {
         let result = restore_backup(backup.to_str().unwrap(), PASSWORD, target.to_str().unwrap());
         assert!(matches!(result, Err(Error::Internal { .. })), "{result:?}");
     }
+
+    // ERA fork: the tripwire of ERA.md section 7 on beta.8. The wallet of the d82e21a seal was
+    // written on UTEXO's v0.3.0-beta.34 (its database holds UTEXO's two migrations, BDK lives in
+    // bdk_db_watch_only, the RGB stock in rgb/): it has to open here, BDK's data and the RGB stock
+    // migrated into rgb_lib_db, or every wallet the app holds would be refused after the update
+    #[test]
+    #[cfg(all(
+        feature = "bdk_file_store_migration",
+        feature = "rgb_fs_store_migration"
+    ))]
+    fn d82e21a_wallet_opens_on_this_base() {
+        let fixtures = fixture_dir("d82e21a");
+        let fingerprint = fs::read_to_string(fixtures.join("vss_backup_fingerprint.txt")).unwrap();
+        let fingerprint = fingerprint.trim();
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("seal").join("file_backup.bin");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::copy(fixtures.join("file_backup.bin"), &backup).unwrap();
+        let target = root.path().join("data");
+        restore_backup(
+            backup.to_str().unwrap(),
+            FIXTURE_PASSWORD,
+            target.to_str().unwrap(),
+        )
+        .unwrap();
+        let wallet_dir = target.join(fingerprint);
+        let manifest_before =
+            fs::read_to_string(wallet_dir.join(crate::wallet::core::WALLET_MANIFEST_FILE)).unwrap();
+
+        let mut wallet = Wallet::load(target.to_str().unwrap(), fingerprint, None).unwrap();
+        let descriptors = wallet.get_descriptors();
+        let unspents = RgbWalletOpsOffline::list_unspents(&mut wallet, None, false, true).unwrap();
+        drop(wallet);
+
+        // the legacy stores were imported and retired
+        assert!(!wallet_dir.join("rgb").exists());
+        assert!(!wallet_dir.join("bdk_db_watch_only").exists());
+        // a new watch-only wallet: its two descriptors, nothing received
+        assert!(descriptors.colored.starts_with("tr(["), "{descriptors:?}");
+        assert!(descriptors.vanilla.starts_with("tr(["), "{descriptors:?}");
+        assert!(unspents.is_empty());
+        // and it opens again, from the database alone
+        let wallet = Wallet::load(target.to_str().unwrap(), fingerprint, None).unwrap();
+        assert_eq!(wallet.get_descriptors().colored, descriptors.colored);
+        assert_eq!(wallet.get_descriptors().vanilla, descriptors.vanilla);
+        drop(wallet);
+        // the manifest is the beta.34 one, still readable (rewritten only by Wallet::new)
+        assert!(manifest_before.contains("\"vanilla_keychain\""));
+    }
 }

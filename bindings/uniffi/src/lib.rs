@@ -90,6 +90,9 @@ pub struct OnlineOptions {
     pub failed_witness_receive_grace_secs: u32,
     pub proxy_auth_keys: HashMap<String, String>,
     pub evm_chains: HashMap<u64, EvmChain>,
+    // ERA fork
+    pub forwarder_url: Option<String>,
+    pub complete_unrecorded_spends: bool,
 }
 impl From<OnlineOptions> for RgbLibOnlineOptions {
     fn from(orig: OnlineOptions) -> Self {
@@ -100,6 +103,8 @@ impl From<OnlineOptions> for RgbLibOnlineOptions {
             failed_witness_receive_grace_secs: orig.failed_witness_receive_grace_secs,
             proxy_auth_keys: orig.proxy_auth_keys,
             evm_chains: orig.evm_chains,
+            forwarder_url: orig.forwarder_url,
+            complete_unrecorded_spends: orig.complete_unrecorded_spends,
         }
     }
 }

@@ -241,7 +241,48 @@ pub(crate) mod tests {
 
     use super::*;
 
+    // Proxy protocol v1.0 (beta.8) names a transfer by its transfer ID, signs most calls and
+    // proves work on a post, where 0.2 took a recipient ID. These tests are about the route, not
+    // the protocol, so each method is called with placeholders through these shims: the ACK of
+    // transfer "rid" as a bool, the post of a consignment with placeholder data.
+    fn ack_get(client: &ProxyClient) -> Result<Option<bool>, Error> {
+        client
+            .get_ack(&[s!("rid")], "sig", "0")
+            .map(|r| r.result.and_then(|a| a.acks.get("rid").copied()))
+    }
+
+    fn ack_post(client: &ProxyClient) -> Result<Option<bool>, Error> {
+        client
+            .post_ack("rid", true, "sig")
+            .map(|r| r.result.map(|a| a.result))
+    }
+
+    fn consignment_post(client: &ProxyClient, path: &Path) -> Result<Option<bool>, Error> {
+        let data = crate::api::proxy::PostConsignmentData {
+            invoice_id: s!("iid"),
+            transfer_id: s!("rid"),
+            sender_transport_endpoint: s!("rpc://127.0.0.1/json-rpc"),
+            sender_pk: s!("00"),
+            consignment_hash: s!("00"),
+            batch: false,
+            signature: s!("sig"),
+        };
+        client
+            .post_consignment(&data, path, "0", "0")
+            .map(|r| r.result)
+    }
+
+    /// A v1.0 `ack.get` result holding the ACK of transfer "rid".
+    fn ack_get_result(ack: bool) -> serde_json::Value {
+        json!({"acks": {"rid": ack}, "signatures": {"rid": "00"}})
+    }
+
     const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":null,"result":true,"error":null}"#;
+    /// A v1.0 `ack.get` answer holding the ACK of transfer "rid".
+    static ACK_GET_OK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        json!({"jsonrpc": "2.0", "id": null, "result": ack_get_result(true), "error": null})
+            .to_string()
+    });
     // the path of the forwarder's URL in these tests (the session's secret in the app)
     const FWD_PATH: &str = "/session-6c1f0e/rgb";
 
@@ -380,17 +421,22 @@ pub(crate) mod tests {
                 &mut fwd,
                 &target,
                 "server.info",
-                json!({"protocol_version": "0.2", "version": "0.2.1", "uptime": 1}),
+                json!({"protocol_version": "1.0", "version": "0.4.0", "uptime": 1}),
             ),
-            forwarded_json(&mut fwd, &target, "ack.get", json!(true)),
+            forwarded_json(&mut fwd, &target, "ack.get", ack_get_result(true)),
             forwarded_json(
                 &mut fwd,
                 &target,
                 "consignment.get",
-                json!({"consignment": "AA==", "txid": "00", "vout": null, "validated": null}),
+                json!({"consignment": "AA==", "sender_transport_endpoint": "rpc://127.0.0.1/json-rpc", "sender_pk": "00", "consignment_hash": "00", "batch": false}),
             ),
             forwarded_json(&mut fwd, &target, "media.get", json!("AA==")),
-            forwarded_json(&mut fwd, &target, "ack.post", json!(true)),
+            forwarded_json(
+                &mut fwd,
+                &target,
+                "ack.post",
+                json!({"result": true, "sender_pk": null, "signed_tx": null}),
+            ),
             forwarded_multipart(&mut fwd, &target, "consignment.post"),
             forwarded_multipart(&mut fwd, &target, "media.post"),
         ];
@@ -398,19 +444,26 @@ pub(crate) mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
         let info = client.get_info().unwrap().result.unwrap();
-        assert_eq!(info.protocol_version, "0.2");
-        assert_eq!(client.get_ack("rid").unwrap().result, Some(true));
+        assert_eq!(info.protocol_version, "1.0");
+        assert_eq!(ack_get(&client).unwrap(), Some(true));
         assert_eq!(
-            client.get_consignment("rid").unwrap().result.unwrap().txid,
-            "00"
+            client
+                .get_consignment("rid")
+                .unwrap()
+                .result
+                .unwrap()
+                .consignment,
+            "AA=="
         );
-        assert_eq!(client.get_media("digest").unwrap().result.unwrap(), "AA==");
-        assert_eq!(client.post_ack("rid", true).unwrap().result, Some(true));
+        assert_eq!(
+            client.get_media("rid", "digest").unwrap().result.unwrap(),
+            "AA=="
+        );
+        assert_eq!(ack_post(&client).unwrap(), Some(true));
+        assert_eq!(consignment_post(&client, file.path()).unwrap(), Some(true));
         let posted = client
-            .post_consignment("rid", file.path(), "00", Some(1))
+            .post_media("rid", "digest", file.path(), "sig")
             .unwrap();
-        assert_eq!(posted.result, Some(true));
-        let posted = client.post_media("digest", file.path()).unwrap();
         assert_eq!(posted.result, Some(true));
 
         for mock in mocks {
@@ -429,9 +482,9 @@ pub(crate) mod tests {
             "https://proxy.example.com:8443/0.2/json-rpc?x=1",
             "http://proxy.example.com/json-rpc",
         ] {
-            let mock = forwarded_json(&mut fwd, target, "ack.get", json!(false));
+            let mock = forwarded_json(&mut fwd, target, "ack.get", ack_get_result(false));
             let client = ProxyClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
-            assert_eq!(client.get_ack("rid").unwrap().result, Some(false));
+            assert_eq!(ack_get(&client).unwrap(), Some(false));
             mock.assert();
         }
     }
@@ -463,13 +516,9 @@ pub(crate) mod tests {
                 "https://proxy.example.com/json-rpc",
             ),
         ] {
-            let mock = forwarded_json(&mut fwd, sent, "ack.get", json!(false));
+            let mock = forwarded_json(&mut fwd, sent, "ack.get", ack_get_result(false));
             let client = ProxyClient::new_routed(given, Some(&forwarder(&fwd))).unwrap();
-            assert_eq!(
-                client.get_ack("rid").unwrap().result,
-                Some(false),
-                "{given}"
-            );
+            assert_eq!(ack_get(&client).unwrap(), Some(false), "{given}");
             mock.assert();
         }
     }
@@ -497,20 +546,17 @@ pub(crate) mod tests {
             };
             let client = ProxyClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
             refused(client.get_info().map(|_| ()));
-            refused(client.get_ack("rid").map(|_| ()));
+            refused(ack_get(&client).map(|_| ()));
             refused(client.get_consignment("rid").map(|_| ()));
-            refused(client.get_media("digest").map(|_| ()));
-            refused(client.post_ack("rid", true).map(|_| ()));
+            refused(client.get_media("rid", "digest").map(|_| ()));
+            refused(ack_post(&client).map(|_| ()));
+            refused(consignment_post(&client, file.path()).map(|_| ()));
             refused(
                 client
-                    .post_consignment("rid", file.path(), "00", Some(1))
+                    .post_media("rid", "digest", file.path(), "sig")
                     .map(|_| ()),
             );
-            refused(client.post_media("digest", file.path()).map(|_| ()));
-            refused(crate::utils::check_proxy_routed(
-                target,
-                Some(&forwarder(&fwd)),
-            ));
+            refused(crate::utils::check_proxy_routed(target, Some(&forwarder(&fwd))).map(|_| ()));
             refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
                 target,
                 &forwarder_url(&fwd),
@@ -538,7 +584,7 @@ pub(crate) mod tests {
             &target,
             "server.info",
             // the protocol version rgb-lib requires (utils::PROXY_PROTOCOL_VERSION)
-            json!({"protocol_version": "0.2", "version": "x", "uptime": 1}),
+            json!({"protocol_version": "1.0", "version": "x", "uptime": 1}),
         );
         crate::wallet::rust_only::check_proxy_url_via_forwarder(&target, &forwarder_url(&fwd))
             .unwrap();
@@ -649,8 +695,9 @@ pub(crate) mod tests {
     #[test]
     #[serial(forwarder)]
     fn without_a_forwarder_the_reject_list_is_read_as_upstream_reads_it() {
-        // upstream reads the body of any answer as the list; the fork changes only the routed
-        // path, so this stays as it is (ERA.md, proxy forwarder)
+        // the fork changes only the routed path, so a direct list is read as upstream reads it.
+        // On the fork's previous base that read a 503 page as the list; beta.8 refuses any answer
+        // that is not a 2xx (3f46995), so this now pins upstream's refusal
         let mut issuer = Server::new();
         let list = issuer
             .mock("GET", "/list")
@@ -659,7 +706,10 @@ pub(crate) mod tests {
             .expect(1)
             .create();
         let client = RejectListClient::new_routed(&format!("{}/list", issuer.url()), None).unwrap();
-        assert_eq!(client.get_reject_list().unwrap(), "unavailable");
+        assert_matches!(
+            client.get_reject_list(),
+            Err(Error::RejectListService { details }) if details.contains("503")
+        );
         list.assert();
     }
 
@@ -673,14 +723,14 @@ pub(crate) mod tests {
             .match_header(FORWARD_TARGET_HEADER, Matcher::Missing)
             .match_header(FORWARD_KIND_HEADER, Matcher::Missing)
             .match_body(Matcher::PartialJson(json!({"method": "ack.get"})))
-            .with_body(RPC_OK)
+            .with_body(ACK_GET_OK.as_str())
             .expect(2)
             .create();
         // new() is upstream's constructor; new_routed(.., None) must be the same client
         let upstream = ProxyClient::new(&target).unwrap();
         let routed = ProxyClient::new_routed(&target, None).unwrap();
-        assert_eq!(upstream.get_ack("rid").unwrap().result, Some(true));
-        assert_eq!(routed.get_ack("rid").unwrap().result, Some(true));
+        assert_eq!(ack_get(&upstream).unwrap(), Some(true));
+        assert_eq!(ack_get(&routed).unwrap(), Some(true));
         ack.assert();
 
         let mut issuer = Server::new();
@@ -749,7 +799,7 @@ pub(crate) mod tests {
         let closed = Forwarder::new("http://127.0.0.1:1/session/rgb").unwrap();
         let client = ProxyClient::new_routed(&target, Some(&closed)).unwrap();
         assert_matches!(client.get_info(), Err(Error::Proxy { .. }));
-        assert_matches!(client.post_ack("rid", true), Err(Error::Proxy { .. }));
+        assert_matches!(ack_post(&client), Err(Error::Proxy { .. }));
         assert_matches!(
             crate::utils::check_proxy_routed(&target, Some(&closed)),
             Err(Error::Proxy { .. })
@@ -769,7 +819,7 @@ pub(crate) mod tests {
             .expect(1)
             .create();
         let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
-        assert_matches!(client.get_ack("rid"), Err(Error::Proxy { .. }));
+        assert_matches!(ack_get(&client), Err(Error::Proxy { .. }));
         redirect.assert();
 
         // a 403 without the refusal header is not a refusal: an error like a proxy that is down
@@ -824,21 +874,18 @@ pub(crate) mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
         refused(client.get_info().map(|_| ()));
-        refused(client.get_ack("rid").map(|_| ()));
+        refused(ack_get(&client).map(|_| ()));
         refused(client.get_consignment("rid").map(|_| ()));
-        refused(client.get_media("digest").map(|_| ()));
-        refused(client.post_ack("rid", true).map(|_| ()));
+        refused(client.get_media("rid", "digest").map(|_| ()));
+        refused(ack_post(&client).map(|_| ()));
+        refused(consignment_post(&client, file.path()).map(|_| ()));
         refused(
             client
-                .post_consignment("rid", file.path(), "00", Some(1))
+                .post_media("rid", "digest", file.path(), "sig")
                 .map(|_| ()),
         );
-        refused(client.post_media("digest", file.path()).map(|_| ()));
         // the proxy check reports it instead of "unable to connect to proxy"
-        refused(crate::utils::check_proxy_routed(
-            &target,
-            Some(&forwarder(&fwd)),
-        ));
+        refused(crate::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))).map(|_| ()));
         refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
             &target,
             &forwarder_url(&fwd),
@@ -890,7 +937,7 @@ pub(crate) mod tests {
             let client = ProxyClient::new_routed(&target, Some(&secret)).unwrap();
             let reject = RejectListClient::new_routed(&target, Some(&secret)).unwrap();
             if refused {
-                assert_matches!(client.get_ack("rid"), Err(Error::ForwarderRefused { .. }));
+                assert_matches!(ack_get(&client), Err(Error::ForwarderRefused { .. }));
                 assert_matches!(
                     reject.get_reject_list(),
                     Err(Error::ForwarderRefused { .. })
@@ -898,7 +945,7 @@ pub(crate) mod tests {
             } else {
                 // an ordinary 403: what a proxy that does not answer JSON-RPC and a list that
                 // is not there come to
-                let ack = client.get_ack("rid");
+                let ack = ack_get(&client);
                 assert!(matches!(ack, Err(Error::Proxy { .. })), "{echo:?}: {ack:?}");
                 let list = reject.get_reject_list();
                 assert!(
@@ -1042,7 +1089,7 @@ pub(crate) mod tests {
             let client =
                 ProxyClient::new_routed(&target, Some(&forwarder(&fwd).with_logger(logger)))
                     .unwrap();
-            let result = client.get_ack("rid");
+            let result = ack_get(&client);
             assert_eq!(
                 matches!(result, Err(Error::ForwarderRefused { .. })),
                 !logged,
@@ -1101,7 +1148,7 @@ pub(crate) mod tests {
         let checked = system_proxy
             .mock("POST", Matcher::Any)
             .match_header("host", "proxy.invalid")
-            .with_body(RPC_OK)
+            .with_body(ACK_GET_OK.as_str())
             .expect(1)
             .create();
         let never = untouchable(&mut system_proxy);
@@ -1143,12 +1190,12 @@ pub(crate) mod tests {
         // the environment does send a client to HTTP_PROXY: proxy.invalid resolves nowhere, so
         // an answer can only come from there
         let upstream = ProxyClient::new(target).unwrap();
-        assert_eq!(upstream.get_ack("rid").unwrap().result, Some(true));
+        assert_eq!(ack_get(&upstream).unwrap(), Some(true));
         // the forwarder's client does not go there
         let mut fwd = Server::new();
-        let mock = forwarded_json(&mut fwd, target, "ack.get", json!(true));
+        let mock = forwarded_json(&mut fwd, target, "ack.get", ack_get_result(true));
         let client = ProxyClient::new_routed(target, Some(&forwarder(&fwd))).unwrap();
-        assert_eq!(client.get_ack("rid").unwrap().result, Some(true));
+        assert_eq!(ack_get(&client).unwrap(), Some(true));
         mock.assert();
     }
 
@@ -1163,10 +1210,11 @@ pub(crate) mod tests {
         for (status, refusal) in [(403, None), (503, None), (503, Some("not-allowlisted"))] {
             let (fwd, _mocks) = answering(status, refusal);
             let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
-            assert_matches!(client.get_ack("rid"), Err(Error::Proxy { .. }));
+            assert_matches!(ack_get(&client), Err(Error::Proxy { .. }));
             assert_matches!(
                 crate::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))),
-                Err(Error::Proxy { details }) if details == "unable to connect to proxy"
+                // beta.8's check_proxy reports the transport error, no longer a fixed text
+                Err(Error::Proxy { .. })
             );
             let reject = RejectListClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
             assert_matches!(
@@ -1179,7 +1227,7 @@ pub(crate) mod tests {
             let (fwd, _mocks) = answering(403, Some(&reason));
             let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
             assert_matches!(
-                client.get_ack("rid"),
+                ack_get(&client),
                 Err(Error::ForwarderRefused { reason, .. }) if reason.len() == kept
             );
         }

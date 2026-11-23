@@ -647,8 +647,10 @@ pub trait WalletCore {
         ProxyClient::new_routed(proxy_url, self.forwarder())
     }
 
-    // ERA fork: see proxy_client; utils::check_proxy on this wallet's route
+    // ERA fork: see proxy_client; utils::check_proxy on this wallet's route (crate-internal, as
+    // the server info it returns)
     #[cfg(feature = "_online")]
+    #[allow(private_interfaces)]
     fn check_proxy_endpoint(&self, proxy_url: &str) -> Result<ServerInfoResponse, Error> {
         check_proxy_routed(proxy_url, self.forwarder())
     }

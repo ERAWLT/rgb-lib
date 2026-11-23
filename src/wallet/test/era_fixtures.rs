@@ -94,7 +94,7 @@ pub(crate) fn zip_listing(zip: &[u8]) -> String {
     let mut lines = vec![];
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).unwrap();
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().to_string();
         if entry.is_dir() {
             lines.push(format!("dir  {name}"));
         } else {

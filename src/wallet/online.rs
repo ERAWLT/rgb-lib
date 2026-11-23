@@ -1346,23 +1346,18 @@ pub trait WalletOnline: WalletOffline {
                 match txn.with_savepoint(|attempt| {
                     self.try_fail_batch_transfer(attempt, batch_transfer, &db_data, false)
                 }) {
-                    // a lookup the indexer fails is skipped too (56e6186; UTEXO's v0.3.0-beta.43-bfa
-                    // skips indexer and network errors here as well)
                     Err(
-                        e @ (Error::ForwarderRefused { .. }
-                        | Error::InvalidForwardTarget { .. }
-                        | Error::Indexer { .. }
-                        | Error::Network { .. }),
+                        e @ (Error::ForwarderRefused { .. } | Error::InvalidForwardTarget { .. }),
                     ) => {
                         warn!(
                             self.logger(),
                             "Not failing batch transfer {}: {e}", batch_transfer.idx
                         );
                     }
-                    // (the error unsaid: it can name the indexer's URL, which carries the
-                    // forwarder's session secret in the app)
+                    // a lookup the indexer fails is skipped too (56e6186; UTEXO's v0.3.0-beta.43-bfa
+                    // skips indexer and network errors here as well), the error unsaid: it can
+                    // name the indexer's URL, which carries the forwarder's session secret in the app
                     Err(Error::Indexer { .. } | Error::Network { .. }) => {
-                        drop(attempt);
                         warn!(
                             self.logger(),
                             "Not failing batch transfer {}: the indexer or the network failed",
@@ -1617,7 +1612,7 @@ pub trait WalletOnline: WalletOffline {
                     vanilla_sync_lookback,
                     failed_witness_receive_grace_secs,
                     proxy_auth_keys,
-                    evm_chains: _, // checked and returned by check_evm_chains below
+                    evm_chains: _,    // checked and returned by check_evm_chains below
                     forwarder_url: _, // ERA fork: validated above, applied after every branch
                     complete_unrecorded_spends: _, // ERA fork (CC-99): only used during this call
                 } = online_options;
@@ -2915,7 +2910,11 @@ pub trait WalletOnline: WalletOffline {
         invoice_id: &str,
         recipient_seed: &[u8],
     ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
-        let transfers = match list_invoice_transfers(&self.proxy_client(proxy_url)?, invoice_id, recipient_seed) {
+        let transfers = match list_invoice_transfers(
+            &self.proxy_client(proxy_url)?,
+            invoice_id,
+            recipient_seed,
+        ) {
             Ok(res) => match (res.result, res.error) {
                 (Some(transfers), None) => transfers,
                 (_, err) => {
@@ -2996,7 +2995,11 @@ pub trait WalletOnline: WalletOffline {
             if tte.kind != TransportEndpointKind::RecipientProxy {
                 continue;
             }
-            let res = list_invoice_transfers(&self.proxy_client(&te.endpoint)?, &invoice_id, recipient_seed);
+            let res = list_invoice_transfers(
+                &self.proxy_client(&te.endpoint)?,
+                &invoice_id,
+                recipient_seed,
+            );
             let nothing_pending = match res {
                 Ok(res) => match (res.result, res.error) {
                     (Some(transfers), None) => transfers
@@ -3027,7 +3030,8 @@ pub trait WalletOnline: WalletOffline {
         let sk = ed25519_from_seed(&seed);
         let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
         let signature = hex::encode(sign_ed25519(&sk, &digest));
-        let res = self.proxy_client(proxy_url)
+        let res = self
+            .proxy_client(proxy_url)
             .and_then(|client| client.transfer_retrieved(transfer_id, &signature));
         match res {
             Ok(r) if r.error.is_none() => {}
@@ -7390,7 +7394,8 @@ pub trait WalletOnline: WalletOffline {
                         for lte in lr.transport_endpoints.iter().filter(|e| e.usable) {
                             // a proxy that cannot be asked is skipped, as another one may still
                             // have the invoice available
-                            let result = match self.proxy_client(&lte.endpoint)
+                            let result = match self
+                                .proxy_client(&lte.endpoint)
                                 .and_then(|c| c.check_invoices(std::slice::from_ref(&invoice_id)))
                             {
                                 Ok(res) => res.result,
@@ -7572,7 +7577,8 @@ pub trait WalletOnline: WalletOffline {
                     })?;
             let sender_proxy_url =
                 self.convert_transport_endpoint_url(sender_transport_endpoint)?;
-            let retention_grace = sender_proxy_retention_grace(&self.proxy_client(&sender_proxy_url)?)?;
+            let retention_grace =
+                sender_proxy_retention_grace(&self.proxy_client(&sender_proxy_url)?)?;
             broadcast_deadline = Some(expiration.saturating_add(i64::from(retention_grace)));
             let proxy_client = self.proxy_client(&sender_proxy_url)?;
             let transfer_ids: Vec<String> = transfer_data.keys().cloned().collect();

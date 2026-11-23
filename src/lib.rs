@@ -559,6 +559,8 @@ use crate::utils::write_fascia;
 use crate::utils::{check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "bitcoind")]
 use crate::wallet::BitcoindClient;
+#[cfg(all(test, feature = "_online"))]
+use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 #[cfg(test)]
 use crate::wallet::test::{
@@ -568,8 +570,6 @@ use crate::wallet::test::{
     mock_mint_kept_amount, mock_retention_grace, mock_send_end_crash, mock_spam_hidden_spends,
     mock_spam_recipient_assignments, skip_build_dag, skip_check_fee_rate, spv_only,
 };
-#[cfg(all(test, feature = "_online"))]
-use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 use crate::{
     api::{
@@ -599,8 +599,8 @@ use crate::{
     },
     no_wallet::{BitcoindAuth, IndexerConfig, script_buf_from_recipient_id},
     utils::{
-        check_proxy, check_proxy_routed, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
-        proxy_retention_grace,
+        check_proxy, check_proxy_routed, detect_indexer, get_indexer_and_resolver, hash_file,
+        proxy_max_media, proxy_retention_grace,
     },
     wallet::{AssignmentsCollection, Indexer, multisig::RespondToOperation},
 };
@@ -656,8 +656,7 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, KeychainLayout, LOG_FILE,
-        PURPOSE,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, KeychainLayout, LOG_FILE, PURPOSE,
         RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
         atomic_write_with, bfa_reject_list_url, from_str_or_number_mandatory,
         from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
@@ -665,8 +664,8 @@ use crate::{
         setup_logger, str_to_xpub,
     },
     wallet::{
-        AssetFilter, Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS,
-        WalletDescriptors,
+        AssetFilter, Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent,
+        NUM_KNOWN_SCHEMAS, WalletDescriptors,
     },
 };
 // the mock electrum server of the validation tests, shared with the wallet ones

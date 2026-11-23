@@ -1242,7 +1242,6 @@ impl UnrecordedSpendReason {
     }
 }
 
-
 #[cfg(feature = "_validation")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
