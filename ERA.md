@@ -374,7 +374,115 @@ too), rgb-multisig-hub 0.1.2 44 MB, foundry v1.9.0 247 MB (arm64 too): about 1.3
 4 GB unpacked plus two image builds, about a dozen containers, most of them amd64-only and so
 emulated on Apple silicon. The shared machine had 15 GB of disk free and its swap nearly full
 (23.11.2026), so it was not pulled; the review's gate for `complete_unrecorded_spends` (one
-`tests/regtest.sh` run) is open, and the bridge ships the option off until it passes.
+`tests/regtest.sh` run) was open, and the bridge shipped the option off until it passed. It runs on
+GitHub since `e9eab56` (era.yml's `era-regtest`), with the fork's own paths since `8ccec08`, and
+passed there: see D63 below.
+
+### D63: an interrupted send of protocol 1.0, and the regtest run (24.11.2026)
+
+**The case.** On RGB proxy protocol 1.0 `send_end` registers the signed TX on the sender proxy
+(`ack.prepare`) and posts the consignments before the commit that moves the transfer to
+`WaitingCounterparty`; the recipient, once it ACKs, gets the TX released and broadcasts it. A
+`send_end` that does not commit (the app killed, a later step failing) leaves the transfer
+`Initiated`, its inputs unspent in the database, while the recipient's broadcast spends them.
+Upstream's check (`singlesig.rs`, `wallet_specific_consistency_checks`) excuses only the inputs of
+a `WaitingCounterparty` transfer's TX, so every later `go_online` refused the wallet with
+"spent bitcoins with another wallet". With the completion off (bridge API 25 and 26), nothing could
+get the wallet online again: the owner's decision D63 kept the app on signet for it.
+
+**The check** (`cd9ce9f`). `wallet_specific_consistency_checks(txn, excuse_initiated)` also
+excuses the inputs of an outgoing transfer still `Initiated` when `excuse_initiated`, which
+`check_consistency_inner` sets when the completion is off. Only what the transfer's **own** TX
+spends is excused, matched by TXID among BDK's canonical transactions, as the
+`WaitingCounterparty` excuse matches: another TX spending those inputs (another install on the
+same seed, CC-27; the transfer's own TX replaced) is still an `Inconsistency`. Excused, the
+transfer stays `Initiated`; its `*_end` called again ends it (`send_end` accepts an `Initiated`
+transfer, upstream's recovery from a crash). With the completion **on**, the check does not excuse
+it: the completion, which already took `Initiated` records (P5), moves the transfer to
+`WaitingConfirmations` at `go_online`, and the refresh settles it. Excusing it there too would
+leave it `Initiated` for good, which nothing but a second `*_end` moves (the refresh reads only the
+waiting statuses). So the two compose: a spend a `go_online` without the option let through is
+completed by the first `go_online` with it. The check excuses a donation's, an inflation's, a
+burn's or a link's own TX too (each broadcasts before its commit); with the completion on, a
+donation is completed as before and the others are `record-kind-unsupported`. In §6's table, the
+row "option off" now reads: upstream's verdict, no lookup made, save an `Initiated` transfer's own
+spend, which `go_online` lets through.
+
+**Scripted-chain tests** (`unrecorded_spends`, in the unit step): the interrupted send whose TX a
+recipient broadcast (`ScriptedChain::publish`) goes online without the option, stays `Initiated`
+through two `go_online`, and settles once `send_end` is called again; with the option it is
+completed at `go_online` (in the mempool and in a block) without a proxy call, the stash gets the
+fascia as a send that is not a donation consumes it, and it settles; a spend let through without
+the option is completed by the first `go_online` with it, a lost donation's as an interrupted
+send's; another install's TX spending an interrupted send's coins is refused as upstream refuses
+it, whether or not BDK saw the send's own TX before it left the mempool and whether or not the
+other is mined (when BDK saw it, the passed `go_online` recorded its change, which the refusal
+names too). W8 (`without_the_option_the_check_is_upstream`) pins the upstream verdict with a lost
+drain, which no `Initiated` transfer names; the scripted chain's own S1 test and `Base::scan` follow
+the excuse. 58 tests in the module.
+
+**The regtest run** (`src/wallet/test/era_regtest.rs`, `8ccec08`, era.yml's `era-regtest`). The
+fork's own paths on upstream's services: bitcoind, Esplora and the RGB proxy 0.4.0, the wallets on
+Esplora and going online with the consistency check, as the app's bridge does (upstream's tests
+skip it):
+
+| Test | What it proves on a real chain |
+|---|---|
+| (a) `era_lost_donation_completes_at_go_online` | a donation whose `send_end` broadcast and died before its commit (the crash hook, S2): let through without the option; completed by the first `go_online` with it (`previous_status` `Initiated`, donation); the recipient receives it; both settle; the next `go_online` completes nothing |
+| (b) `era_lost_drain_completes_at_go_online` | a drain whose record a copy taken after `drain_to_begin` loses (S3, a seal or a VSS backup): refused without the option (a drain is not an `Initiated` transfer); completed with it, the reservations released, nothing left unspent |
+| (c) `era_interrupted_send_completes_at_go_online` | D63 with the option: `send_end` dies after `ack.prepare` and the consignment post; the recipient refreshes, ACKs, gets the TX released and broadcasts it; the sender's `go_online` completes the send; both settle, balances as after a send that went through |
+| (c) `era_interrupted_send_goes_online_and_ends_again_without_the_option` | D63 without the option: `go_online` passes, the send stays `Initiated`; `send_end` called again ends it (`WaitingCounterparty`), the refresh sees the ACK, both settle |
+| (d) `era_a_send_the_migration_failed_with_its_tx_on_chain_is_refused` | review N5, staged: the status a donation broadcast before its commit set to `Failed`, as the `proxy_v1` migration sets it; with the option `UnrecordedSpend { transfer-failed }` naming the transfer, without it upstream's `Inconsistency`; twice, nothing written |
+| (e) `era_a_replaced_payment_of_envelopes_lets_go_online_through` | CC-115: bitcoind's wallet pays two colored addresses handed out (`get_colored_address`), the colored payment sync records it unconfirmed, `bumpfee` replaces it before it confirms (mining held); refused without the option; with it the replaced rows are marked as not existing (`spent` false), the replacement's outputs are the envelopes, and stay so once mined |
+
+**Result** (run 45268107710 on `8ccec08`, 24.11.2026, from the annotations): `check` green, the
+unit step 205 passed and 0 failed, the 58 of `unrecorded_spends` among them; `era-regtest` green,
+79 passed and 0 failed, the six of `era_regtest` among them. The level-A gate of the completion is
+passed; the bridge asks for it again from API 27 (`kEraRgbCompletesUnrecordedSpends` on the Dart
+side, keyed on that, never on the version). The tip after the review fixes below ran again before
+the bridge pinned it.
+
+`.github/scripts/era_test_count.sh` (`b7d0bf0`) reads each test step's log: the counts as a notice
+and each failed test and panic as an error, in the run's **annotations**, which the public API
+serves without the log (the log needs admin rights on this repository):
+`curl -s https://api.github.com/repos/ERAWLT/rgb-lib/check-runs/<job id>/annotations` (job ids:
+`.../actions/runs/<run id>/jobs`). The step fails unless the run printed a result, passed at least
+one test and failed none; the unit step also requires the 58 tests of `unrecorded_spends`, and
+`era-regtest` the six of `era_regtest` (a filter that matches nothing passes with 0 tests). Before
+`b7d0bf0` the regtest step only checked for an `ok` result line, so whether the subset ran its tests
+at `e9eab56` was not known.
+
+**From the review of these commits** (level A, 24.11):
+
+- With the completion on, a D63 send that the completion refuses for damage (`record-mismatch`,
+  `transfer-data-missing`, `stash-refused`) keeps the wallet offline, where the excuse alone would
+  have let it through and a second `send_end` ended it. Accepted: each of these reasons means the
+  transfer's record or files are not what `send_end` wrote, which no excuse should paper over.
+- The bulk `fail_transfers` (no batch transfer named) can fail an expired `Initiated` send of
+  protocol 1.0 whose TX was released to a recipient but not broadcast yet: no `broadcast_deadline`
+  is stored for an `Initiated` transfer (it is written by the commit that did not happen), and
+  the indexer guard only sees a TX on chain. If the recipient broadcasts later, the wallet meets
+  `transfer-failed` (or, without the completion, an `Inconsistency`). The app never calls the
+  bulk form (every caller names a batch transfer); a host that does should first let the
+  expiration plus the proxy's retention grace pass.
+- The CC-27 cases where BDK never saw the send's own TX (`seen` false) pass on `e9eab56` too:
+  they are the controls; the `seen` cases test the TXID match.
+- (d) checks that each refusal leaves the database as it was (its digest), `objects.rs` says what
+  the option off now excuses.
+
+**Review N5, recovered how.** A send the `proxy_v1` migration failed while its TX was on chain is
+refused at every `go_online`, with the option as `transfer-failed`, and (d) pins that nothing is
+written. The library has no way out: the transfer's 0.2 `transfer_data.txt` does not parse on this
+base, and a `Failed` transfer is not completed (by the lead's decision in §6: a failed transfer
+whose TX shows up later is terminal). It needs a wallet that, on a build of API 24 or below, had a
+send whose TX reached the chain without being recorded (a kill or a lost answer right after the
+broadcast) and then saw **no** `go_online` on that build before the update: the first one would
+have completed it (the completion was on from API 16 to 24). So the recovery is before the
+update: open the RGB wallet once on the old build. After it, the wallet's RGB part stays offline
+(its bitcoins are not affected, nothing is lost on chain: the recipient's allocation and this
+wallet's change are in the TX) until a library call completes such a send from the database and
+the migrated fascia; none is written, as RGB is dark in production and no tester's wallet is known
+to hold one. Support asks for the wallet's state rather than wiping it.
 
 ### Public API the bridge (`packages/era_rgb`) absorbs in phase 2
 
@@ -393,8 +501,9 @@ emulated on Apple silicon. The shared machine had 15 GB of disk free and its swa
   `indexer_url`; new `failed_witness_receive_grace_secs`, `proxy_auth_keys` (empty) and
   `evm_chains` (`{42161: EvmChain { rpc_url: <the forwarder's EVM route>, min_mint_lock_blocks,
   max_mint_lock_blocks }}` for USDT); `forwarder_url` as before; `complete_unrecorded_spends`
-  **off** until the regtest gate above passes (review, level A), and with it on, a send waiting
-  for its counterparty is completed by the refresh, not by `go_online` (see above).
+  was **off** until the regtest gate passed (review, level A; bridge API 25 and 26) and is
+  **on** from bridge API 27 (see D63 above); with it on, a send waiting for its
+  counterparty is completed by the refresh, not by `go_online` (see above).
 - **VSS:** a chunked backup this branch uploads is not restored by a build on
   `era/configurable-derivation` (chunk sets, §5 Limits); single-piece backups are.
 - **`WalletData`:** `supported_schemas` gains `AssetSchema::Bfa`; on mainnet
@@ -1739,7 +1848,7 @@ indexer knows T.
 | fascia of another TX or other assets, input colorings outside T, reservations other than T's inputs, `signed.psbt` of another TX | damage, a misplaced file | `record-mismatch` |
 | the stash refuses the transitions | a fascia rgb-ops will not consume | `stash-refused`: nothing of the refused spend is kept, nothing panics; spends of the same plan consumed before it stay in the stash, since rgb-ops commits each fascia on its own (S2's state, skipped by the next `go_online`) |
 | the disk refuses a store of the stash | a full disk, a read-only directory | `Error::IO`, retryable (a panic inside rgb-ops before `ac6724d`) |
-| option off, or `skip_consistency_check` | | upstream: no lookup made |
+| option off, or `skip_consistency_check` | | upstream: no lookup made; with the option off, save an `Initiated` transfer's own spend, which the check lets through (beta.8, D63) |
 
 Outside it on purpose, because none is a divergence: a broadcast that never reached the network
 (nothing is spent anywhere; `go_online` passes and the in-session retries or `fail_transfers`
