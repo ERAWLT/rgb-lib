@@ -770,18 +770,27 @@ impl<'txn> RgbStock<'txn> {
             .map(|w| w.tx)
     }
 
+    ///
+    /// A stock that cannot be read is an error, not an unknown bundle (review N3).
     #[cfg(feature = "_online")]
-    pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
+    pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Result<Option<Fascia>, Error> {
         let seal_witness = fascia.seal_witness().clone();
         let store = self.stock.as_store();
-        let unknown: BTreeMap<ContractId, rgbstd::TransitionBundle> = fascia
-            .into_bundles()
-            .into_iter()
-            .filter(|(_, bundle)| !matches!(store.bundle(bundle.bundle_id()), Ok(Some(_))))
-            .collect();
-        Confined::try_from(unknown)
+        let mut unknown: BTreeMap<ContractId, rgbstd::TransitionBundle> = BTreeMap::new();
+        for (contract_id, bundle) in fascia.into_bundles() {
+            let held = store
+                .bundle(bundle.bundle_id())
+                .map_err(|e| Error::Database {
+                    details: format!("cannot read the RGB stock: {e}"),
+                })?
+                .is_some();
+            if !held {
+                unknown.insert(contract_id, bundle);
+            }
+        }
+        Ok(Confined::try_from(unknown)
             .ok()
-            .map(|bundles| Fascia::new(seal_witness, bundles))
+            .map(|bundles| Fascia::new(seal_witness, bundles)))
     }
 
     #[cfg(feature = "_online")]

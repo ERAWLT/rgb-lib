@@ -642,7 +642,7 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
         else {
             continue;
         };
-        let Some(fascia) = stock.fascia_unknown_part(*fascia.clone()) else {
+        let Some(fascia) = stock.fascia_unknown_part(*fascia.clone())? else {
             debug!(
                 wallet.logger(),
                 "CC-99: the stash already holds the transitions of TX {}", spend.txid
