@@ -693,6 +693,9 @@ mod finalize_psbt;
 // api::forwarder run)
 #[cfg(all(feature = "esplora", era_beta8_pending))]
 mod forwarder;
+// ERA fork: the same on proxy protocol 1.0, for the sender's requests, on the scripted chain
+#[cfg(feature = "esplora")]
+mod forwarder_v1;
 mod get_address;
 mod get_asset_balance;
 #[cfg(feature = "electrum")]
