@@ -1,11 +1,18 @@
 # ERA fork of rgb-lib
 
-`ERAWLT/rgb-lib`, branch `era/configurable-derivation`, is
-[UTEXO-Protocol/rgb-lib](https://github.com/UTEXO-Protocol/rgb-lib) at tag
-`v0.3.0-beta.34` (`62a8c3a`, crate version `0.3.0-beta.7`) plus a short series of
-commits. Its only consumer is the ERA Wallet companion app, which links it through
-`packages/era_rgb` (flutter_rust_bridge) with `default-features = false` and the
-features `esplora` + `vss`, pinned **by rev** of this branch.
+`ERAWLT/rgb-lib` carries a short series of commits for the ERA Wallet companion app, its only
+consumer, which links it through `packages/era_rgb` (flutter_rust_bridge) with
+`default-features = false`, pinned **by rev** of an `era/*` branch. Two bases:
+
+- **`era/beta8-bfa`** (23.11.2026): [RGB-Tools/rgb-lib](https://github.com/RGB-Tools/rgb-lib)
+  `0.3.0-beta.8` (`ea2b745b`), UTEXO's VSS ported onto it, and the series; features `esplora`,
+  `vss` and the two one-time migrations. See
+  [Carried onto RGB-Tools beta.8](#carried-onto-rgb-tools-beta8-erabeta8-bfa): what changed, which
+  commits were adapted or not carried, what is not tested yet.
+- **`era/configurable-derivation`**: [UTEXO-Protocol/rgb-lib](https://github.com/UTEXO-Protocol/rgb-lib)
+  at tag `v0.3.0-beta.34` (`62a8c3a`, crate version `0.3.0-beta.7`) plus the series; features
+  `esplora` + `vss`. Sections 1 to 10 below describe the series as written for this base; where
+  beta.8 differs, the beta.8 section says so.
 
 Rules for the branch:
 
@@ -22,6 +29,305 @@ Rules for the branch:
 - A new UTEXO base gets a **new branch** (see [Carrying the series](#carrying-the-series-onto-a-new-utexo-tag)),
   never a rebase of this one.
 - Commits are authored by people, with no AI co-author trailers.
+
+## Carried onto RGB-Tools beta.8 (`era/beta8-bfa`)
+
+**Base:** [RGB-Tools/rgb-lib](https://github.com/RGB-Tools/rgb-lib) `ea2b745b` ("bump version to
+0.3.0-beta.8", 16.11.2026), not a UTEXO tag. It is the first public rgb-lib that holds USDT on
+Bitcoin as UTEXO issues it, a **BFA** asset (`rgb-schemas` / `rgb-ops` / `rgb-consensus` /
+`rgb-invoicing` `0.11.2-rc.2` on crates.io), and the rev UTEXO's own stage-mainnet bridge signer
+validates BFA with (`UTEXO-Protocol/enclave-signer`, `stage`, `enclave/Cargo.toml:45-60`).
+Branch `era/beta8-bfa`, cut from `ea2b745b`: the rules at the top of this file hold for it
+(never rewritten once pushed, branches only, no AI co-author trailers).
+`era/configurable-derivation` stays as it is for the app versions that pin it.
+
+**What the base changes under the series** (the reasons for most adaptations below):
+
+- **RGB proxy protocol 1.0** (`db5ffbf`): invoices reserved on the proxy (`invoice.prepare`, from
+  `blind_receive` / `witness_receive`, offline methods), transfer and invoice IDs, Ed25519-signed
+  ACKs polled on the *sender's own* proxy, the signed TX released by that proxy, proof of work on
+  a post. Every UTEXO proxy answers protocol "1.0" since November (rgb-proxy.utexo.com,
+  rgb-proxy-mainnet.utexo.com, dev.rgb-proxy.utexo.com, server 0.4.0); the previous base requires
+  exactly "0.2" (`utils.rs` `PROXY_PROTOCOL_VERSION`), so **`era/configurable-derivation` cannot
+  transfer through any UTEXO proxy any more**. This branch keeps beta.8's "1.0".
+- **The RGB stock and BDK's changeset live in `rgb_lib_db`** (`3a6d21e`, `a6013ea`): one SQLite
+  transaction per operation (`persist_and_commit`), the stock written through it (`RgbStock`
+  over `DbTxn`). Two one-time migrations import a wallet of an earlier version:
+  `bdk_file_store_migration` (BDK's `bdk_db*` file) and `rgb_fs_store_migration` (`rgb/`).
+- `OnlineOptions::indexer_config` (`IndexerConfig::{Esplora, Electrum, Bitcoind}`) replaces
+  `indexer_url`; `go_online` destructures its options with no `..`, so a new option has to be
+  handled (the fork's two are). The signed TX is stored (`signed.tx`) instead of the signed PSBT.
+  `list_transfers` takes a `TransferScope`. Schemas IFA and BFA are "reckless" on mainnet: a
+  mainnet wallet supports them only with `WalletData::allow_reckless_schemas` (not pinned by the
+  manifest, so an existing wallet can be reopened with it and `Bfa` in `supported_schemas`).
+
+### VSS (from UTEXO)
+
+RGB-Tools rgb-lib has no VSS. It comes from UTEXO-Protocol/rgb-lib as a module port
+(`Port UTEXO's VSS backup module onto RGB-Tools beta.8`), not commit by commit: UTEXO's VSS history
+(`e6aee5c`, `8ee689e`, `26b7f76`, `724297f`, `88adde0`, `649b4b1`, `87a2d92`, `9f6d159`,
+`39ccfbd` and fixes squashed into their RGB-Tools merge `62a8c3a`) is interleaved with merges of
+RGB-Tools master and with UTEXO features this base does not carry. `src/wallet/vss.rs` is the file
+at `62a8c3a`, the base the series was written on, so the series' VSS commits apply to it as they
+did there; the only change is zip 9's `ZipFile::name()` returning a `Result`. Around it: the `vss`
+feature (vss-client-ng `ad63805`, bitreq held at 0.3.5), the five errors, `WalletInternals`'
+auto-backup client, `WalletBackup::{vss_backup, configure_vss_backup, disable_vss_auto_backup,
+trigger_auto_backup, vss_backup_info}`, the auto-backup triggers after every singlesig operation
+UTEXO triggers on (and beta.8's `issue_asset_bfa`, `link*`, `mint_*`), the `.vss_restored`
+attribution in `check_consistency`, the singlesig `Wallet` wrappers. **Not ported:** UTEXO's VSS
+integration tests (`test/vss.rs`, `test/vss_e2e/`, docker VSS server), the VSS API of the uniffi
+and C-FFI bindings, the multisig wrappers, the examples. On this base a *plaintext* VSS backup
+carries the descriptors inside `rgb_lib_db` (the sanitizer's `bdk_db*` exclusion only covers
+wallets not migrated yet); the app never disables encryption.
+
+### Databases the previous base wrote
+
+UTEXO's `m20260401_000001_create_mpc_address_table` and
+`m20260415_000001_create_reuse_address_index_table` are kept verbatim in the migrator: sea-orm 2
+refuses a database holding an applied migration it has no file for, which every wallet, seal and
+VSS backup the app wrote on `v0.3.0-beta.34` has. `wallet::backup::tests::
+d82e21a_wallet_opens_on_this_base` is the tripwire: the `d82e21a` seal (UTEXO beta.34 database,
+`bdk_db_watch_only`, `rgb/index|state|stash.dat`) restores, `Wallet::load` opens it with both
+migrations, `rgb/` and the BDK file are retired, the descriptors are the wallet's, and it opens
+again from the database alone. A manifest of the previous base (`reuse_addresses`, no
+`allow_reckless_schemas`) reads; `tests_keychain_layout::manifest_keeps_its_shape` pins that the
+layout keys are written back as they were.
+
+### The series on this base
+
+Cherry-picked in order (`git cherry-pick -x`); a commit that needed changes carries a
+"Carried onto RGB-Tools beta.8, adapted:" paragraph saying what and why. Three pairs/triples that
+rewrote each other are one commit each (`2310cc6`+`1fb40da`+`24d3314`, `665f241`+`3b00147`).
+Commits that only touch this file are applied unless folded. "Not carried" means the code has no
+counterpart on this base; nothing was dropped silently.
+
+| Fork | Here | Status | Subject / on beta.8 |
+|---|---|---|---|
+| `6ce375e` | `eeabdd0` | applied | Add a configurable keychain layout to singlesig keys (an import list resolved by hand) |
+| `1d26404` | `c480713` | adapted | Run the fork's own checks on era branches only: beta.8 has none of UTEXO's release / AI-review workflows: the three deletions kept |
+| `f808c7f` | `04fe3d8` | adapted | Carry one TLS stack and no migration CLI in the library: re-applied to beta.8's Cargo.toml (`wallet` / `_validation` features); EvmClient routed through `rest_client_builder` too |
+| `d82e21a` | `c5ae7ba` | applied | Document the ERA fork of rgb-lib |
+| `07e16e5` | `b6eb35d` | applied | Guard HTTP client construction and probe real https in CI |
+| `efaba06` | `2782256` | applied | Correct what ERA.md claims about workflow guards and upkeep |
+| `e7bdaa4` | `4cfe70b` | adapted | Route RGB proxy traffic through an optional loopback forwarder: v1.0 proxy client (`call` / `call_multipart` start from `post()`); helpers in `WalletCore` (offline receive reserves invoices in v1.0); reject lists via the no-wallet `RemoteRejectListResolver` with the wallet's forwarder |
+| `3fe378e` | `a245456` | applied | Document the proxy forwarder patch in ERA.md |
+| `3f0a555` | `56d63fa` | applied | Put the forwarder comment on the forwarder test module |
+| `fafe3bd` | `aea34fb` | adapted | Fail closed when a forwarded reject list is not a 2xx answer: beta.8 already refuses a non-2xx list (3f46995); fork shape kept, upstream body checks in `read_list` |
+| `bef0c03` | `5a6b232` | adapted | Route every proxy call site through the wallet's own helpers: one helper set in `WalletCore`; no `reject_list_client` (the resolver is the one place) |
+| `ccd23e9` | `1126f0b` | adapted | Report a forwarder's refusal as Error::ForwarderRefused: refusal check in `send()`, the one place v1.0 sends; send_end keeps upstream's own refusal next to the forwarder's |
+| `8a0255f` | `3747ade` | adapted | Refuse forward targets that carry userinfo or a fragment: in beta.8's per-send endpoint probe |
+| `cf0afa5` | `bc798f4` | adapted | Apply a new forwarder before go_online probes a new indexer: `indexer_config` instead of `indexer_url` |
+| `9718cac` | `364d712` | adapted | Keep the forwarder's URL out of request errors: scrub in `send()`; reject-list body via `read_list` |
+| `0996972` | `e8a031a` | applied | Describe the reviewed forwarder contract in its rustdoc |
+| `7996d73` | `6481020` | applied | Rewrite the forwarder contract in ERA.md after its review |
+| `29a49bb` | `048e5df` | applied | Run the forwarder tests one at a time |
+| `ff6e73a` | `bc579a3` | adapted | Go offline when go_online fails on a forwarder's new indexer: `indexer_config`; a failed EVM chain check while routed goes offline too |
+| `afe4644` | `5fc88e9` | applied | Accept a refusal only when it echoes the forwarder's path |
+| `aa5187d` | `7187cf3` | adapted | Match "Cannot change ACK" on the proxy's error only: code upstream: v1.0 maps the proxy's code -100 to `ProxyCannotChange`; tests only |
+| `a14cdbb` | `21f0022` | adapted | Let a send the forwarder refuses be failed, and not block others: code superseded: v1.0 polls ACKs on the own (sender) proxy; expired sends fail on refresh errors (c7af41c) |
+| `b8bf73d` | `c0ee0a9` | adapted | Read a forwarded reject list only from a 200 that holds an opout: body via `read_list`, then the opout check |
+| `019b917` | `128610b` | applied | Test what the review's surviving mutations left unchecked |
+| `87d5e88` | `b9b92c8` | applied | Guard check_proxy_url calls and build the bindings in CI |
+| `45c3b39` | `0c8e76e` | applied | Keep the VSS URL and store ID out of the restore log |
+| `777fe57` | `07269ca` | adapted | Check the VSS server's word before a restore acts on it: UDL gains the VSS variants |
+| `24bba10` | `63e88b6` | applied | Document the second review's fixes in ERA.md |
+| `fe7e1b0` | `3f81c51` | adapted | Fail a refused send only if the indexer does not know its TX: code upstream: `complete_batch_if_tx_on_chain` before failing a WaitingCounterparty send |
+| `1051adc` | `aeb88e8` | adapted | Keep an expired send whose TX is on chain from failing on its ACKs: kept for the non-released (out-of-band ACK) case via `complete_batch_if_tx_on_chain` |
+| `1699a6a` | `8a89b13` | adapted | Undo a skipped transfer's attempt when failing every expired one: beta.8's `with_savepoint`; fork `DbTxn::savepoint` dropped |
+| `5a0a980` | `a076218` | adapted | Look for "Cannot change ACK" in the NACK's answer, not in an Err: code upstream (see aa5187d); tests only |
+| `0b14aae` | `d587515` | applied | Go offline when go_online refuses a URL replacing a forwarder |
+| `f62e768` | `f440fa7` | applied | Require a session path in forwarder_url and log unechoed refusals |
+| `ba77828` | `89f0048` | adapted | Read a forwarded reject list only from a body with a checked end: body via `read_list` |
+| `dcc9654` | `446c6d9` | adapted | Refuse backup data that ends without its final block: tests join beta.8's `backup::tests` module |
+| `55cb0c9` | `f9c9efb` | applied | Keep a VSS server's numbers from crashing or sizing a restore |
+| `b8df12d` | `56e0f60` | adapted | Restore only the wallet directory of a VSS backup, and only whole: zip 9 `name()` returns a Result |
+| `6921d07` | `77d51e2` | applied | Refuse a plaintext VSS backup whenever encryption is on |
+| `bb85811` | `92bf848` | applied | Leave nothing behind a VSS restore that fails |
+| `d6357cf` | `156b79f` | adapted | Deprecate restore_from_vss in favour of the expecting variant: UTEXO VSS integration tests not ported, their module lines left out |
+| `8692b69` | `eab59b8` | applied | Catch more ways around the grep guards in era.yml |
+| `bf78cb8` | `b701f84` | applied | Document the third review's fixes in ERA.md |
+| `56e6186` | `be01184` | adapted | Never fail an outgoing transfer whose TX the indexer knows: WaitingCounterparty: upstream completes; Initiated lookup added (answers `Denied`); NACK completes when on chain; bulk skips Indexer/Network |
+| `4ea8ccd` | `e2b0298` | applied | Match a backup's fingerprint ignoring case, and keep its name |
+| `c188e63` | `f8f6c9d` | applied | Remove only what a failed VSS restore made itself |
+| `ba96a80` | `49f99ff` | applied | Bound a VSS manifest's chunks by the chunk size, decrypt as it arrives |
+| `3988f38` | `cd3cd06` | applied | Stop claiming an interrupted chunked upload keeps the previous backup |
+| `c88f20a` | `7ad6d61` | applied | Leave the forwarder's path out of its Debug form |
+| `a140543` | `a1e126a` | applied | Guard every mention of the proxy and reject-list client types |
+| `3437c9d` | `beb3275` | applied | Document the fourth review's fixes in ERA.md |
+| `8877d0b` | `c654b39` | applied | Say per route how the forwarder fails, and that it never relays a 3xx |
+| `18f16ce` | `c72ebaa` | applied | Record that the keychain-layout patch went to UTEXO as PR #104 |
+| `b761c25` | `7ef4066` | applied | Sync a restored wallet before renaming it into place, and its parent |
+| `57dc45e` | `f4cbaba` | applied | Document the durable placement of a restored wallet in ERA.md |
+| `5cab571` | `9bea4ff` | adapted | Split the record half out of broadcast_psbt: split out of `broadcast_signed_tx` (beta.8 split broadcast_psbt itself) |
+| `f82b1c1` | `6e9b855` | adapted | Add a scripted chain for offline wallet tests: carried, compiled only under `era_beta8_pending` (protocol 0.2 proxy mock) |
+| `27d2a5a` | `454138b` | adapted | Refuse a signed.psbt whose txid is not its transfer's: checks the stored signed TX (`signed.tx`) in `broadcast_batch` |
+| `c1feef6` | `38df2de` | adapted | Complete an own spend the indexer knows at go_online (CC-99): consumes through `rgb_stock(txn)` in the check's transaction (no runtime, no persist); signed.tx; tests pending |
+| `4093572` | `51b12cc` | adapted | Let the host tell a recorded vanilla TX from an unknown one: export list |
+| `106a00c` | `1179ec5` | applied | Reserve the external-operation reason for the -bfa carry |
+| `b4eff93` | `d748dad` | applied | Document the CC-99 completion in ERA.md |
+| `ac6724d` | — | not carried | Store the RGB stock atomically, and report a store the disk refused: superseded: the RGB stock is in rgb_lib_db (3a6d21e), written in the operation's DB transaction |
+| `7d07452` | — | not carried | Load the RGB stock only as a whole set: superseded (no stock files); a partial legacy set fails beta.8's one-time migration with `Internal`, nothing written |
+| `52585e6` | `5e5364e` | applied | Document the RGB stock on disk (CC-101) in ERA.md |
+| `74664d9` | `c3fad1f` | applied | Clear the completion report before go_online can fail |
+| `3768cc6` | `7b05ca9` | applied | Keep a failed lookup's text out of the completion's log line |
+| `3b856ac` | `7c2f3ef` | adapted | Test the completion against a stash the disk will not take: file-store parts gone; test pending |
+| `adb712a` | `51ce46d` | applied | Pin what a stash refusal keeps of the spends before it |
+| `fe22585` | `6d5dbcb` | applied | Pin P1 with another install's spend of the same coin |
+| `2b44c76` | `da81239` | applied | Pin offline that the option off is upstream's go_online |
+| `690f041` | `cdd4083` | applied | Test a retryable I/O error and the checks after a completion |
+| `35186ad` | `86b726b` | applied | Correct ERA.md section 6 after the review of the CC-99 commits |
+| `5f5edb8` | — | not carried | Hold the stash back while the index or the state is not stored: superseded (file-store hold-back) |
+| `5fdfa17` | — | not carried | Count a bundle as held only when the index knows it too: superseded (stash and index commit together) |
+| `1a078a7` | — | not carried | Sync rgb/ when a store's directory sync was missed, and at load: superseded (file-store directory sync) |
+| `aee685d` | — | not carried | Say what RgbStockDamaged is: a refusal to open, not a wipe signal: superseded (`RgbStockDamaged` not on this base) |
+| `5dd72f3` | — | not carried | Attribute a restored wallet's unopenable stock to the VSS backup: superseded (same) |
+| `f82cc6b` | — | not carried | Pin a stock an older rev wrote, and one over 64 KiB: superseded; the tripwire is `d82e21a_wallet_opens_on_this_base` |
+| `fd18e92` | `275a859` | adapted | Document the CC-101 review fixes, and the bridge's API as 16: ERA.md only (the rustdoc is CC-101's) |
+| `1ee1caf` | `540a4ae` | adapted | Let a send whose signed.psbt will not be broadcast be failed: code superseded: all-ACKed (released) sends are not failable in v1.0 |
+| `74a2d66` | — | not carried | Test go_online's asset check again, offline and upstream: superseded: beta.8 has no "DB assets vs RGB" check |
+| `50a470b` | — | not carried | Keep the kind when a restored wallet's stock cannot be opened: superseded (`RgbStockDamaged`) |
+| `3889751` | — | not carried | Say a linked rgb is a symbolic link, and touch nothing behind it: superseded (stock files) |
+| `f5d6522` | — | not carried | Pin the undecodable kind and the kinds' codes: superseded (kinds of `RgbStockDamaged`) |
+| `df04de0` | `2df4345` | applied | Stop promising in rustdoc that a refused completion writes nothing |
+| `dea2773` | `79ed786` | applied | Document the verification's fixes of the CC-99 and CC-101 rounds |
+| `0aeac3e` | `d24f151` | applied | Say what the ERA app does with a Drain and a wallet it cannot open |
+| `d326033` | `17d6f6c` | adapted | Build reqwest without HTTP/2: bindings locks pruned |
+| `6415dcc` | `6f931db` | applied | Document the HTTP/1.1-only client and what the size pass kept |
+| `1ed4436` | `c679f28` | adapted | Order InvalidKeychainLayout and merge the SinglesigKeys impls: beta.8's order (InvalidLinkedContract follows) |
+| `2319444` | `06b2516` | adapted | Group the keychain layout overrides into one struct: beta.8 import lists; load test on `PrivateDataDir` |
+| `e230950` | `85feea4` | applied | Refuse account xpubs that contradict the configured coin types |
+| `fe9820a` | `655cf0f` | applied | Record UTEXO's review of #104 and the commits mirroring it |
+| `ebecd8c` | `8529929` | adapted | Hand out a colored address for a payment from outside: `persist_and_commit`; no address reuse on this base; tests pending |
+| `0cf410f` | `c38068f` | applied | Document the colored address for a payment from outside |
+| `0ca2fc9` | `4bf7246` | adapted | Sync colored payments without the orphan reconcile: BDK update committed with the call; beta.8 pending-witness bookkeeping |
+| `4e5ccee` | `9d57080` | applied | Document the colored payment sync and where the public-sync guard is |
+| `2310cc6` | `b81670e` | adapted | Let the colored fast sync see a payment from outside the wallet: one commit with 1fb40da and 24d3314 (the result of 24d3314) |
+| `7339334` | — | folded | Document the colored fast sync that sees a payment from outside: ERA.md folded into e1c4ee2 |
+| `1fb40da` | `b81670e` | adapted | Watch only the colored addresses handed out, not every unused one: with 2310cc6 |
+| `31a36c9` | — | folded | Document the watched colored addresses: ERA.md folded into e1c4ee2 |
+| `24d3314` | `b81670e` | adapted | Stop watching a colored address once a payment reaches it: with 2310cc6 |
+| `1de6980` | `41a15da` | applied | Document watching a colored address only until it is paid |
+| `09cbbda` | `16fd1dc` | adapted | Mark a replaced payment's empty envelopes as gone at go_online: stock part beta.8's; tests pending |
+| `56c38aa` | `8fba1a5` | applied | Document the replaced payment's envelopes (CC-115) |
+| `93a3fc8` | `4e02da8` | applied | Say how a payment leaves BDK's view, and that unspents still list it |
+| `c0e51da` | `7596f0c` | applied | Refuse a replaced TX that a transfer still in play names |
+| `112054c` | `61c31b2` | applied | Pin the marking's way back and its copies, as the review probed |
+| `77f23b3` | `fa85200` | applied | Document the review of the CC-115 change |
+| `663d669` | `2709392` | adapted | Build the completion's helpers only where the completion is: only the `unrecorded_inconsistency` gate (no fork savepoint) |
+| `665f241` | `ad0fa26` | adapted | Let the host forget a payment of envelopes it proved dropped: one commit with 3b00147; eviction stored with the rows in one commit |
+| `8ae6891` | — | folded | Document the forgetting of a dropped payment (ERA.md §10): ERA.md folded into 0cac845 |
+| `282499b` | — | folded | Say which BDK the -bfa tags pin and what merge-tree found (ERA.md §10): ERA.md folded into 0cac845 |
+| `3b00147` | `ad0fa26` | adapted | Set a forgotten payment aside until it is mined, with its rivals: with 665f241 |
+| `7a53485` | — | folded | Document the forget set aside until mined (ERA.md §10): ERA.md folded into 0cac845 |
+
+### Not ported yet: `era_beta8_pending`
+
+Tests carried as written but compiled only under the cfg `era_beta8_pending`, which no build sets
+(`[lints.rust]` declares it; era.yml lists them): the scripted chain (`test/scripted_chain.rs`,
+its RGB proxy answers protocol 0.2 and its wallets go online with `indexer_url`), and every test
+on it: CC-99, CC-115 and L4b (`test/unrecorded_spends.rs`), the colored payments
+(`test/get_colored_address.rs`); and the wallet-level forwarder tests (`test/forwarder.rs`, mock
+proxies speaking 0.2). Their code is carried and compiles; what runs today is the client-level
+forwarder suite (`api::forwarder`, every v1.0 method routed, refusals, framing, scrubbing, the
+system proxy), the VSS and backup suites, the keychain layout, the TLS client, the reject-list and
+EVM clients. Porting them needs a v1.0 proxy in the scripted chain (invoice reservations, signed
+ACKs from a recipient key the test holds, `ack.prepare` / `ack.get` on the sender's proxy, a PoW
+difficulty of 0) and `IndexerConfig::Esplora`. Until then CC-99's completion, CC-115's marking,
+`forget_dropped_payment`, `sync_colored_payments` and the wallet-level forwarder paths are
+**compiled, not tested** on this base.
+
+### CC-101 (the stock on disk) on this base
+
+Not carried: there is no stock file to store atomically or to load as a whole set. beta.8 writes
+the stock in the operation's database transaction, so a store the disk refuses fails the
+operation with nothing written, and a stash can no longer be ahead of the database. What remains
+of the section's concern is the one-time legacy migration: a partial or undecodable `rgb/` fails
+it with `Error::Internal` ("cannot load legacy RGB stash: ...") and nothing written, not as
+`RgbStockDamaged { kind }`, and a wallet whose `rgb/` vanished before the migration opens with no
+contracts (beta.8 dropped the "DB assets vs RGB" check). `RgbStockDamaged`, `RgbStockDamage` and
+`rgb_stock_damage()` are gone; the app's open-and-quarantine logic has to key on the migration's
+refusal instead.
+
+### BFA and the EVM RPC
+
+- **The keychain layout** does not touch BFA: issuance, mint and transfers select colored UTXOs
+  through BDK's colored keychain, whatever path it is on (`colored_keychain` 9, `vanilla_keychain`
+  10 under `m/86'/0'/0'`).
+- **Where rgb-lib talks to an EVM node:** only to the URLs the host configures in
+  `OnlineOptions::evm_chains` (`HashMap<chain_id, EvmChain { rpc_url, min_mint_lock_blocks,
+  max_mint_lock_blocks }>`; Arbitrum One is 42161). `go_online` checks each (chain ID, finalized
+  block, contract state); `refresh` and `provide_out_of_band_consignment` resolve a received BFA
+  asset's mint claims through `MintClaimResolver` (`ResolveClaim`: `getFundsInBlock` of the bridge
+  contract) and read reject lists kept by EVM contracts; `mint_begin` / `mint_end` read the bridge.
+  A chain that is not configured is `NoEvmRpcUrl`, with no request. So the app points `rpc_url` at
+  its forwarder, as it points the indexer and VSS.
+- **The client:** `EvmClient::new` builds on `api::rest_client_builder` (the one rustls-on-ring
+  config; reqwest's own TLS path would panic or need JNI on Android, and the HTTP client guard
+  fires on it). It keeps reqwest's defaults otherwise: it follows redirects and reads
+  `HTTP(S)_PROXY`, like the Esplora client. The forwarder never answers a 3xx on that route and
+  the host sets no proxy variables (as for Esplora and VSS above). Its errors name only the
+  endpoint's scheme and host (`EvmClient::endpoint`), never the path, which carries the
+  forwarder's session secret.
+- **Not verified here:** no BFA transfer, mint or claim resolution ran on this branch (the
+  regtest suite with its anvil node was not run, see below).
+
+### Gates (23.11.2026, macOS, rustc 1.98.1)
+
+Run in a snapshot of the branch, each step of `era.yml` in order with its commands, plus clippy:
+
+| Step | Result |
+|---|---|
+| Format | ok |
+| `cargo check`, app set (`esplora,vss` + both migrations), `esplora,vss` alone, default + `esplora,vss` | ok, ok, ok |
+| Bindings (uniffi UDL mirrors `Error`; C-FFI) | ok |
+| Dependency diet guard (4 mobile targets) | ok: no OpenSSL, native-tls, aws-lc, sqlx-postgres, clap, sea-orm-cli or h2 |
+| HTTP client guard, proxy forwarder guard | ok, ok (expected set updated for this base) |
+| Unit tests (`SKIP_INIT=1`) | 120 passed, 0 failed, 2 ignored (the network test and the system-proxy child) |
+| Pending ports listed; migration crate with its CLI | ok, ok |
+| clippy, app set, `--lib` | no warning |
+| https job (UTEXO's signet RGB proxy, protocol 1.0; blockstream.info mainnet Esplora), app feature set | 2 passed |
+
+**Not run:** rgb-lib's regtest suite (`tests/regtest.sh`: bitcoind, electrs, esplora, the
+proxies, an anvil EVM node, about a dozen images, none of them cached on this machine, which
+several sessions share), so none of upstream's send / receive / create_utxos / refresh / backup /
+BFA / IFA flows ran on this branch; the `era_beta8_pending` tests above; any live signet or
+mainnet transfer.
+
+### Public API the bridge (`packages/era_rgb`) absorbs in phase 2
+
+- **Dependency:** `rgb-lib` from `era/beta8-bfa`, `default-features = false`, features
+  `esplora`, `vss`, `bdk_file_store_migration`, `rgb_fs_store_migration` (the last two open the
+  app's existing wallets, seals and VSS backups; era.yml checks exactly that set). New crates in
+  the graph: `rgb-*` 0.11.2-rc.2, bdk_wallet 3.2.0, `x25519-dalek` / `ed25519-dalek` 3, zip 9,
+  `bdk_file_store` and rgb-ops' `legacy` (the migrations). Copy this repository's `Cargo.lock`
+  as the procedure above says.
+- **Paths:** `generate_keys` is `rgb_lib::keys::generate_keys`, `restore_backup`
+  `rgb_lib::wallet::restore_backup`, `script_buf_from_recipient_id`
+  `rgb_lib::no_wallet::script_buf_from_recipient_id`; `KeychainLayoutOverrides`,
+  `VanillaTxRecord`, `CompletedSpend`, `DroppedPayment`, `InconsistencyReason`,
+  `UnrecordedSpendReason` and the `vss` module keep their names.
+- **`OnlineOptions`:** `indexer_config: IndexerConfig::Esplora { url }` instead of
+  `indexer_url`; new `failed_witness_receive_grace_secs`, `proxy_auth_keys` (empty) and
+  `evm_chains` (`{42161: EvmChain { rpc_url: <the forwarder's EVM route>, min_mint_lock_blocks,
+  max_mint_lock_blocks }}` for USDT); `forwarder_url` and `complete_unrecorded_spends` as before.
+- **`WalletData`:** `supported_schemas` gains `AssetSchema::Bfa`; on mainnet
+  `allow_reckless_schemas: true` (BFA is not allowed on mainnet otherwise); no `reuse_addresses`.
+  Neither is pinned by the manifest.
+- **Calls:** `blind_receive` / `witness_receive` take `online: Option<Online>` first and reserve
+  the invoice on the proxy: call them online, so the request goes through the forwarder;
+  `send_begin` / `send_btc_begin` lose UTEXO's `lock_time`; `Recipient` gains `public_key` and
+  `encryption` (protocol 1.0, taken from the invoice); `list_transfers(asset_filter,
+  TransferScope)`; `sync_colored_payments(online, addresses)`.
+- **Errors:** `RgbStockDamaged` and `RgbStockDamage` / `rgb_stock_damage()` are gone (see
+  CC-101 above); beta.8 adds the protocol-1.0 errors (`InvoiceExpired`, `InvoiceNotReserved`,
+  `InvoiceQuotaExceeded`, `ProxyCannotChange`, `ProxyDraining`, `ProxyTooManyMedia`,
+  `SignedTxCleared`, `TransferIDDeleted`, `OperationNotFound`, ...) and the EVM ones
+  (`NoEvmRpcUrl`, `InvalidEvmRpcUrl`, `EvmChainIdMismatch`, `InvalidEvmChain`, `MintLockExpired`,
+  `MintLockNotFound`, ...); the fork's own errors are unchanged.
+- **Network:** the app's own RGB proxy must speak protocol 1.0 (rgb-proxy-server 0.4.0); it is
+  also the *sender* proxy a send registers its TX and polls its ACKs on. The forwarder allowlists
+  the EVM route per chain (an `X-Era-Forward-*` header is not used there: the URL is the host's,
+  like the indexer's) and never answers it with a 3xx.
 
 ## The series
 
@@ -2292,6 +2598,11 @@ bdk_wallet `=3.1.0`, which every `-bfa` tag from beta.34 to beta.43 pins as well
 (2026-10-08, not compiled): the same conflicting files as at `112054c`, none new.
 
 ## Carrying the series onto a new UTEXO tag
+
+(For a new RGB-Tools release, the way `era/beta8-bfa` was made: a new `era/<name>` branch from the
+RGB-Tools commit, the VSS module port first, then the series from the newest `era/*` branch in
+order, with the notes of [Carried onto RGB-Tools beta.8](#carried-onto-rgb-tools-beta8-erabeta8-bfa).
+The procedure below is the UTEXO-tag one, kept for the record.)
 
 ```sh
 git fetch utexo --tags
