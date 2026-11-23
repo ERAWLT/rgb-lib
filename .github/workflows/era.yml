@@ -285,9 +285,15 @@ jobs:
   # Natively on ubuntu-latest: most of the images are amd64-only. send,
   # blind and witness receive, create_utxos, refresh, file backups, IFA, BFA
   # (issue, mint on anvil, and validation with upstream's mock claim
-  # resolver), and the legacy migration. era_test_count.sh puts the counts
-  # and any failure in the run's annotations (the log needs admin rights) and
-  # fails the step unless tests ran and all passed.
+  # resolver), and the legacy migration. And the fork's own paths
+  # (src/wallet/test/era_regtest.rs) on Esplora with the consistency check, as
+  # the app goes online: a lost donation and a lost drain completed by
+  # go_online (CC-99), the interrupted protocol-1.0 send with the completion
+  # and without it (D63), a send the proxy_v1 migration failed with its TX on
+  # chain (N5), and a replaced payment of envelopes (CC-115).
+  # era_test_count.sh puts the counts and any failure in the run's
+  # annotations (the log needs admin rights) and fails the step unless every
+  # era_regtest test ran and passed.
   era-regtest:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -315,8 +321,10 @@ jobs:
             wallet::test::mint::received_mint_amount \
             wallet::test::mint::minted_asset_transfer_acked \
             wallet::test::validate_consignment::mint \
-            wallet::test::migrate:: 2>&1 | tee regtest-tests.log || status=$?
-          .github/scripts/era_test_count.sh regtest-tests.log era-regtest || status=1
+            wallet::test::migrate:: wallet::test::era_regtest:: \
+            2>&1 | tee regtest-tests.log || status=$?
+          .github/scripts/era_test_count.sh regtest-tests.log era-regtest \
+            'wallet::test::era_regtest::' 6 || status=1
           exit "$status"
       - name: Stop the regtest services
         if: always()
