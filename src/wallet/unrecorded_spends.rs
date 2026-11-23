@@ -101,7 +101,7 @@ impl TxStatusLookup for Indexer {
 /// The colored coins the database holds as unspent (`exists && !spent`) that BDK does not list
 /// as unspent: the set upstream's singlesig check refuses on.
 pub(crate) fn colored_divergence(
-    bdk_wallet: &PersistedWallet<Store<ChangeSet>>,
+    bdk_wallet: &BdkWallet,
     txn: &DbTxn,
 ) -> Result<BTreeSet<BdkOutPoint>, Error> {
     let bdk_unspent: HashSet<BdkOutPoint> = bdk_wallet.list_unspent().map(|u| u.outpoint).collect();
@@ -132,10 +132,7 @@ pub(crate) struct SpendView {
 }
 
 impl SpendView {
-    pub(crate) fn from_bdk(
-        bdk_wallet: &PersistedWallet<Store<ChangeSet>>,
-        divergence: &BTreeSet<BdkOutPoint>,
-    ) -> Self {
+    pub(crate) fn from_bdk(bdk_wallet: &BdkWallet, divergence: &BTreeSet<BdkOutPoint>) -> Self {
         let mut spenders = BTreeMap::new();
         let mut txs = BTreeMap::new();
         let mut canonical = HashSet::new();
@@ -544,7 +541,7 @@ fn plan_send(
     if info
         .transfers
         .values()
-        .any(|t| t.main_transition != TypeOfTransition::Transfer)
+        .any(|t| t.main_transition.transition_type() != TypeOfTransition::Transfer)
     {
         return Err(refusal(
             txid,

@@ -47,7 +47,7 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 #[cfg(feature = "_online")]
 pub fn check_proxy_url_via_forwarder(proxy_url: &str, forwarder_url: &str) -> Result<(), Error> {
     let forwarder = Forwarder::new(forwarder_url)?;
-    check_proxy_routed(proxy_url, Some(&forwarder))
+    check_proxy_routed(proxy_url, Some(&forwarder)).map(|_| ())
 }
 
 /// Load an RGB fascia from the file at the provided path.

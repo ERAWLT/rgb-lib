@@ -240,6 +240,11 @@ esplora_validation = [
 vss = ["wallet", "dep:vss-client", "tokio/rt", "tokio/rt-multi-thread"]
 camel_case = []
 
+# ERA fork: tests carried from the previous base that still need porting to beta.8 are compiled
+# only under this cfg, which no build sets (see ERA.md, "Carried onto beta.8")
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(era_beta8_pending)"] }
+
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts
 overflow-checks = true

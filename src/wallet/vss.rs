@@ -1988,13 +1988,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).unwrap();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            let filename = file
-                .name()
-                .unwrap()
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .to_string();
+            let filename = file.name().unwrap().rsplit('/').next().unwrap().to_string();
             assert_ne!(filename, WALLET_MANIFEST_FILE);
             assert_ne!(filename, format!("{WALLET_MANIFEST_FILE}.tmp"));
             let mut content = Vec::new();
@@ -3340,6 +3334,8 @@ mod tests {
     }
 
     #[test]
+    // beta.8's test wallets (get_test_wallet_raw) exist with the electrum feature only
+    #[cfg(feature = "electrum")]
     fn a_wallet_named_in_upper_case_restores_from_its_own_upload() {
         use crate::keys::{WitnessVersion, generate_keys};
         use crate::wallet::SinglesigKeys;

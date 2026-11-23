@@ -1110,7 +1110,11 @@ fn forward_to_proxy(req: &mockito::Request, body: Vec<u8>) -> Vec<u8> {
     let content_type = req.header(CONTENT_TYPE)[0].clone();
     // the blocking client cannot run inside mockito's async runtime
     std::thread::spawn(move || {
-        RestClient::new()
+        // ERA fork: every client from the one TLS config (api::rest_client_builder)
+        crate::api::rest_client_builder()
+            .unwrap()
+            .build()
+            .unwrap()
             .post(PROXY_URL)
             .header(CONTENT_TYPE, content_type)
             .body(body)

@@ -752,6 +752,27 @@ impl<'txn> RgbStock<'txn> {
         }
     }
 
+    /// ERA fork (CC-99): `fascia` without the bundles the stash already holds, `None` when it holds
+    /// them all.
+    ///
+    /// Completing a spend consumes a fascia the stash may hold already. On beta.8 the stock writes
+    /// through the rgb-lib transaction, so a consume that did not commit leaves nothing behind and
+    /// a held bundle means a committed one; the check stays so that a completion never consumes a
+    /// bundle twice, whatever the store does with a second consume.
+    #[cfg(feature = "_online")]
+    pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
+        let seal_witness = fascia.seal_witness().clone();
+        let store = self.stock.as_store();
+        let unknown: BTreeMap<ContractId, rgbstd::TransitionBundle> = fascia
+            .into_bundles()
+            .into_iter()
+            .filter(|(_, bundle)| !matches!(store.bundle(bundle.bundle_id()), Ok(Some(_))))
+            .collect();
+        Confined::try_from(unknown)
+            .ok()
+            .map(|bundles| Fascia::new(seal_witness, bundles))
+    }
+
     #[cfg(feature = "_online")]
     pub(crate) fn accept_transfer<R: ResolveWitness>(
         &mut self,
@@ -1695,7 +1716,15 @@ mod tests_keychain_layout {
         keys.build_descriptors(&wallet_data.bitcoin_network)
             .unwrap();
         let rewritten = WalletManifest::new(&wallet_data, &keys);
-        assert_eq!(serde_json::to_string_pretty(&rewritten).unwrap(), json);
+        // a manifest of the previous base (UTEXO's reuse_addresses) reads, and is written back in
+        // beta.8's shape, the layout keys as they were
+        assert_eq!(
+            serde_json::to_string_pretty(&rewritten).unwrap(),
+            json.replace(
+                "\"reuse_addresses\": false",
+                "\"allow_reckless_schemas\": false"
+            )
+        );
 
         let json = MANIFEST_JSON_DISTINCT
             .replace("TPUB_V", TPUB_VANILLA)
@@ -1711,7 +1740,15 @@ mod tests_keychain_layout {
             }
         );
         let rewritten = WalletManifest::new(&wallet_data, &keys);
-        assert_eq!(serde_json::to_string_pretty(&rewritten).unwrap(), json);
+        // a manifest of the previous base (UTEXO's reuse_addresses) reads, and is written back in
+        // beta.8's shape, the layout keys as they were
+        assert_eq!(
+            serde_json::to_string_pretty(&rewritten).unwrap(),
+            json.replace(
+                "\"reuse_addresses\": false",
+                "\"allow_reckless_schemas\": false"
+            )
+        );
 
         let json = MANIFEST_JSON_DEFAULT
             .replace("TPUB_V", TPUB_VANILLA)
@@ -1722,6 +1759,14 @@ mod tests_keychain_layout {
         keys.build_descriptors(&wallet_data.bitcoin_network)
             .unwrap();
         let rewritten = WalletManifest::new(&wallet_data, &keys);
-        assert_eq!(serde_json::to_string_pretty(&rewritten).unwrap(), json);
+        // a manifest of the previous base (UTEXO's reuse_addresses) reads, and is written back in
+        // beta.8's shape, the layout keys as they were
+        assert_eq!(
+            serde_json::to_string_pretty(&rewritten).unwrap(),
+            json.replace(
+                "\"reuse_addresses\": false",
+                "\"allow_reckless_schemas\": false"
+            )
+        );
     }
 }
