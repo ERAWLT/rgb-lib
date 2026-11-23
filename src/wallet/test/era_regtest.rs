@@ -358,6 +358,20 @@ fn era_a_send_the_migration_failed_with_its_tx_on_chain_is_refused() {
     txn.update_batch_transfer(&mut failed).unwrap();
     txn.commit().unwrap();
 
+    // the wallet's database (since beta.8 the RGB stock and BDK's changeset too), which a
+    // refusal leaves as it was
+    let wallet_dir = party.wallet.get_wallet_dir();
+    let digest = || {
+        crate::wallet::test::era_fixtures::dir_listing(
+            wallet_dir.parent().unwrap(),
+            &wallet_dir.file_name().unwrap().to_string_lossy(),
+        )
+        .lines()
+        .filter(|l| l.ends_with("/rgb_lib_db"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    let before = digest();
     for _ in 0..2 {
         let error = reopen(&mut party, true).unwrap_err();
         assert_eq!(
@@ -372,6 +386,7 @@ fn era_a_send_the_migration_failed_with_its_tx_on_chain_is_refused() {
         assert_matches!(error, Error::Inconsistency { .. });
         assert_eq!(error.inconsistency_reason(), None);
         assert_eq!(batch_transfer_status(&party, idx), TransferStatus::Failed);
+        assert_eq!(digest(), before);
     }
 }
 
