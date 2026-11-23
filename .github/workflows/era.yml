@@ -238,20 +238,27 @@ jobs:
       # restore backups an older rev wrote (src/wallet/test/fixtures). The
       # scripted-chain ones fund, issue, send and settle on an in-memory chain
       # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs),
-      # and so do the CC-99 ones (unrecorded spends).
+      # and so do the CC-99 ones (unrecorded spends). era_test_count.sh puts the
+      # counts and any failure in the run's annotations (readable without the
+      # log) and fails the step unless the CC-99 module ran all its tests.
       - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets, scripted chain)
         env:
           SKIP_INIT: "1"
-        run: >
-          cargo test --locked --lib --features esplora,vss --
-          tests_keychain_layout tests_rest_client_tls
-          api::forwarder:: wallet::vss::tests::
-          wallet::backup::tests::
-          wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data::
-          api::reject_list:: api::evm::
-          wallet::test::scripted_chain:: wallet::test::unrecorded_spends::
-          wallet::test::get_colored_address:: wallet::test::forwarder_v1::
-          database::rgb::
+        run: |
+          set -o pipefail
+          status=0
+          cargo test --locked --lib --features esplora,vss -- \
+            tests_keychain_layout tests_rest_client_tls \
+            api::forwarder:: wallet::vss::tests:: \
+            wallet::backup::tests:: \
+            wallet::test::new::success wallet::test::load:: wallet::test::get_wallet_data:: \
+            api::reject_list:: api::evm:: \
+            wallet::test::scripted_chain:: wallet::test::unrecorded_spends:: \
+            wallet::test::get_colored_address:: wallet::test::forwarder_v1:: \
+            database::rgb:: 2>&1 | tee unit-tests.log || status=$?
+          .github/scripts/era_test_count.sh unit-tests.log unit \
+            'wallet::test::unrecorded_spends::' 58 || status=1
+          exit "$status"
 
       # Carried from the previous base, not yet ported to beta.8 (RGB proxy
       # protocol 1.0, IndexerConfig): compiled only under the cfg
@@ -278,7 +285,9 @@ jobs:
   # Natively on ubuntu-latest: most of the images are amd64-only. send,
   # blind and witness receive, create_utxos, refresh, file backups, IFA, BFA
   # (issue, mint on anvil, and validation with upstream's mock claim
-  # resolver), and the legacy migration.
+  # resolver), and the legacy migration. era_test_count.sh puts the counts
+  # and any failure in the run's annotations (the log needs admin rights) and
+  # fails the step unless tests ran and all passed.
   era-regtest:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -292,6 +301,7 @@ jobs:
       - name: Regtest subset (default features + vss)
         run: |
           set -o pipefail
+          status=0
           cargo test --locked --profile reldebug --lib --features vss -- \
             wallet::test::send::success wallet::test::send::send_received_success \
             wallet::test::send::witness_success wallet::test::send::ack \
@@ -305,8 +315,9 @@ jobs:
             wallet::test::mint::received_mint_amount \
             wallet::test::mint::minted_asset_transfer_acked \
             wallet::test::validate_consignment::mint \
-            wallet::test::migrate:: 2>&1 | tee regtest-tests.log
-          grep -q '^test result: ok\.' regtest-tests.log
+            wallet::test::migrate:: 2>&1 | tee regtest-tests.log || status=$?
+          .github/scripts/era_test_count.sh regtest-tests.log era-regtest || status=1
+          exit "$status"
       - name: Stop the regtest services
         if: always()
         run: ./tests/regtest.sh stop_services || true
