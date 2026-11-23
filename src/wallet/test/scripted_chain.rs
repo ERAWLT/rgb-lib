@@ -49,6 +49,9 @@ use crate::utils::recipient_id_from_script_buf;
 
 /// Where the scripted RGB proxy answers.
 pub(crate) const PROXY_PATH: &str = "/json-rpc";
+/// ERA fork: where the chain serves a forwarder (`OnlineOptions::forwarder_url`), whose path holds
+/// the session's secret in production. It relays to the chain's own RGB proxy only.
+pub(crate) const FORWARDER_PATH: &str = "/session-6c1f0e/rgb";
 
 const BLOCK_INTERVAL: u64 = 600;
 const PAGE: usize = 25;
@@ -82,6 +85,32 @@ struct Proxy {
     // posted transfers: transfer ID -> (invoice ID, consignment hash)
     posted: HashMap<String, (String, String)>,
     methods: Vec<String>,
+}
+
+/// ERA fork: what the scripted forwarder was given, and what it is told to refuse.
+#[derive(Default)]
+struct Forwarder {
+    // (X-Era-Forward-Target, X-Era-Forward-Kind, JSON-RPC method) of every request
+    forwarded: Vec<(String, String, String)>,
+    // the methods of the proxy requests that reached the proxy without the forwarder
+    direct: Vec<String>,
+    // (method, X-Era-Forward-Refused, refusals left)
+    refusals: Vec<(String, String, usize)>,
+}
+
+/// The JSON-RPC method of a proxy request, in a JSON body or a multipart one.
+fn rpc_method(content_type: &str, body: &[u8]) -> String {
+    if content_type.starts_with("application/json") {
+        serde_json::from_slice::<Json>(body)
+            .ok()
+            .and_then(|request| request["method"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        multipart_fields(content_type, body)
+            .get("method")
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 impl Proxy {
@@ -139,6 +168,9 @@ struct State {
     log: Vec<String>,
     unmatched: Vec<String>,
     proxy: Proxy,
+    forwarder: Forwarder,
+    // the chain's own address, the proxy target the forwarder relays to
+    addr: Option<SocketAddr>,
     funding_nonce: u32,
 }
 
@@ -162,6 +194,8 @@ impl State {
             log: vec![],
             unmatched: vec![],
             proxy: Proxy::default(),
+            forwarder: Forwarder::default(),
+            addr: None,
             funding_nonce: 0,
         }
     }
@@ -552,7 +586,62 @@ impl State {
         )
     }
 
-    fn handle(&mut self, method: &str, path: &str, content_type: &str, body: &[u8]) -> Response {
+    /// ERA fork: a request to the scripted forwarder: refused as told, else relayed to the proxy
+    /// when it is meant for it, with the headers rgb-lib sends.
+    fn forward(&mut self, headers: &HashMap<String, String>, body: &[u8]) -> Response {
+        let header = |name: &str| headers.get(name).cloned().unwrap_or_default();
+        let content_type = header("content-type");
+        let target = header(crate::api::forwarder::FORWARD_TARGET_HEADER);
+        let kind = header(crate::api::forwarder::FORWARD_KIND_HEADER);
+        let method = rpc_method(&content_type, body);
+        self.forwarder
+            .forwarded
+            .push((target.clone(), kind.clone(), method.clone()));
+        if let Some(refusal) = self
+            .forwarder
+            .refusals
+            .iter_mut()
+            .find(|(m, _, left)| *m == method && *left > 0)
+        {
+            refusal.2 -= 1;
+            let mut response = Response::text(403, "refused");
+            response.headers = vec![
+                (
+                    crate::api::forwarder::FORWARD_REFUSED_HEADER,
+                    refusal.1.clone(),
+                ),
+                (
+                    crate::api::forwarder::FORWARD_SESSION_HEADER,
+                    FORWARDER_PATH.to_string(),
+                ),
+            ];
+            return response;
+        }
+        let proxy = self.addr.map(|addr| format!("http://{addr}{PROXY_PATH}"));
+        if kind != crate::api::forwarder::FORWARD_KIND_RGB_PROXY || Some(&target) != proxy.as_ref()
+        {
+            self.unmatched
+                .push(format!("forward {kind} {target} {method}"));
+            return Response::text(502, "no scripted target");
+        }
+        self.proxy(&content_type, body)
+    }
+
+    fn handle(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Response {
+        let content_type = headers.get("content-type").cloned().unwrap_or_default();
+        let content_type = content_type.as_str();
+        if path == FORWARDER_PATH && method == "POST" {
+            return self.forward(headers, body);
+        }
+        if path == PROXY_PATH {
+            self.forwarder.direct.push(rpc_method(content_type, body));
+        }
         let line = format!("{method} {path}");
         if path != PROXY_PATH {
             self.log.push(line.clone());
@@ -634,6 +723,8 @@ fn multipart_fields(content_type: &str, body: &[u8]) -> HashMap<String, String> 
 struct Response {
     status: u16,
     content_type: &'static str,
+    // ERA fork: headers besides these (the forwarder's refusal)
+    headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
 }
 
@@ -642,6 +733,7 @@ impl Response {
         Self {
             status,
             content_type: "text/plain",
+            headers: vec![],
             body: body.as_bytes().to_vec(),
         }
     }
@@ -650,6 +742,7 @@ impl Response {
         Self {
             status,
             content_type: "application/json",
+            headers: vec![],
             body: body.to_string().into_bytes(),
         }
     }
@@ -658,6 +751,7 @@ impl Response {
         Self {
             status,
             content_type: "application/octet-stream",
+            headers: vec![],
             body,
         }
     }
@@ -731,14 +825,15 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
     }
     let body = read_body(&mut reader, &headers);
     let path = target.split('?').next().unwrap_or(target);
-    let content_type = headers.get("content-type").cloned().unwrap_or_default();
-    let response = state
-        .lock()
-        .unwrap()
-        .handle(method, path, &content_type, &body);
+    let response = state.lock().unwrap().handle(method, path, &headers, &body);
     let mut stream = stream;
+    let extra: String = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let head = format!(
-        "HTTP/1.1 {} Scripted\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} Scripted\r\nContent-Type: {}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
         response.status,
         response.content_type,
         response.body.len()
@@ -759,7 +854,10 @@ impl ScriptedChain {
     pub(crate) fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = Arc::new(Mutex::new(State::new()));
+        let state = Arc::new(Mutex::new(State {
+            addr: Some(addr),
+            ..State::new()
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, thread_stop) = (state.clone(), stop.clone());
         thread::spawn(move || {
@@ -997,6 +1095,29 @@ impl ScriptedChain {
     /// The JSON-RPC methods the RGB proxy received.
     pub(crate) fn proxy_methods(&self) -> Vec<String> {
         self.state().proxy.methods.clone()
+    }
+
+    /// ERA fork: the scripted forwarder's URL (`OnlineOptions::forwarder_url`).
+    pub(crate) fn forwarder_url(&self) -> String {
+        format!("http://{}{FORWARDER_PATH}", self.addr)
+    }
+
+    /// ERA fork: (target, kind, method) of every request the forwarder was given.
+    pub(crate) fn forwarded(&self) -> Vec<(String, String, String)> {
+        self.state().forwarder.forwarded.clone()
+    }
+
+    /// ERA fork: the methods of the proxy requests that reached the proxy without the forwarder.
+    pub(crate) fn direct_proxy_methods(&self) -> Vec<String> {
+        self.state().forwarder.direct.clone()
+    }
+
+    /// ERA fork: the forwarder refuses the next `times` requests of `method` with `reason`.
+    pub(crate) fn refuse(&self, method: &str, reason: &str, times: usize) {
+        self.state()
+            .forwarder
+            .refusals
+            .push((method.to_string(), reason.to_string(), times));
     }
 
     pub(crate) fn assert_all_matched(&self) {

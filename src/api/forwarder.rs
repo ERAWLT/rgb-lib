@@ -316,6 +316,8 @@ pub(crate) mod tests {
             }
         }
 
+        // (used by the wallet-level 0.2 tests, behind era_beta8_pending)
+        #[cfg_attr(not(era_beta8_pending), allow(dead_code))]
         pub(crate) fn remove(&self) {
             for mock in &self.0 {
                 mock.remove();
