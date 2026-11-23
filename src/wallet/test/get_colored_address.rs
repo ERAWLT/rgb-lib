@@ -60,10 +60,16 @@ fn lists_envelope(wallet: &mut Wallet, online: Online, txid: &str, sync: bool) -
         .any(|u| u.utxo.outpoint.txid == txid && u.utxo.colorable && u.utxo.exists)
 }
 
+/// A blind receive on the chain's proxy, online: on protocol 1.0 a receive reserves its invoice
+/// on the proxy.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-fn blind_receive(wallet: &mut Wallet, chain: &ScriptedChain) -> Result<ReceiveData, Error> {
+fn blind_receive(
+    wallet: &mut Wallet,
+    online: Online,
+    chain: &ScriptedChain,
+) -> Result<ReceiveData, Error> {
     wallet.blind_receive(
-        None,
+        Some(online),
         None,
         Assignment::Any,
         default_rcv_expiration(),
@@ -96,7 +102,7 @@ fn the_fast_sync_sees_a_payment_from_outside() {
     let online = wallet.go_online(online_options(&chain)).unwrap();
     // no colored UTXO yet: nothing to receive on
     assert_matches!(
-        blind_receive(&mut wallet, &chain),
+        blind_receive(&mut wallet, online, &chain),
         Err(Error::InsufficientAllocationSlots)
     );
 
@@ -107,7 +113,7 @@ fn the_fast_sync_sees_a_payment_from_outside() {
 
     // list_unspents with a sync is a fast sync, as in every *_begin
     assert!(lists_envelope(&mut wallet, online, &txid, true));
-    let receive = blind_receive(&mut wallet, &chain).unwrap();
+    let receive = blind_receive(&mut wallet, online, &chain).unwrap();
     assert!(!receive.invoice.is_empty());
     chain.assert_all_matched();
 }
