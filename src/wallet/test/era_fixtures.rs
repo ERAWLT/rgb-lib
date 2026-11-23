@@ -36,9 +36,7 @@ use walkdir::WalkDir;
 use super::*;
 use crate::utils::hash_bytes_hex;
 #[cfg(feature = "vss")]
-use crate::wallet::vss::{
-    BackupManifest, VSS_CHUNK_SIZE, VssEncryptionMetadata, create_backup_data, encrypt_data,
-};
+use crate::wallet::vss::{VSS_CHUNK_SIZE, VssEncryptionMetadata, create_backup_data, encrypt_data};
 
 /// The password of `file_backup.bin`.
 pub(crate) const FIXTURE_PASSWORD: &str = "era-fixture-seal-password";
@@ -164,12 +162,13 @@ fn generate_backup_fixtures() {
     let vss_metadata = VssEncryptionMetadata::new();
     let data = encrypt_data(&zip, &key, &vss_metadata, None).unwrap();
     assert!(data.len() <= VSS_CHUNK_SIZE);
-    let manifest = BackupManifest {
-        chunk_count: 1,
-        total_size: data.len(),
-        encrypted: true,
-        version: 1,
-    };
+    // (as JSON: the manifest's fields differ between the revs this runs on)
+    let manifest = serde_json::json!({
+        "chunk_count": 1,
+        "total_size": data.len(),
+        "encrypted": true,
+        "version": 1,
+    });
     fs::write(
         out.join("vss_backup_manifest.json"),
         serde_json::to_vec(&manifest).unwrap(),
