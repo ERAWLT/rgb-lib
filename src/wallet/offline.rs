@@ -11,7 +11,7 @@ const CONSIGNMENT_RCV_META_FILE: &str = "rcv_compose.meta.json";
 pub(crate) const MINT_RCV_FILE: &str = "rcv_mint.json";
 pub(crate) const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
-const ASSET_ID_PREFIX: &str = "rgb:";
+pub(crate) const ASSET_ID_PREFIX: &str = "rgb:";
 
 pub(crate) const UDA_FIXED_INDEX: u32 = 0;
 

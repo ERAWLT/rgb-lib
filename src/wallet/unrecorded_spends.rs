@@ -38,6 +38,7 @@
 //! without a spender is refused as before. See the fork's `ERA.md`, section 9.
 
 use super::*;
+use crate::wallet::offline::ASSET_ID_PREFIX;
 use crate::wallet::online::{SIGNED_PSBT_FILE, SIGNED_TX_FILE};
 
 /// ERA fork (CC-99): a spend of this wallet completed by `go_online`
@@ -182,6 +183,9 @@ pub(crate) enum PlannedRecord {
         donation: bool,
         /// The transfer's fascia, with the witness the stash gets
         fascia: Box<Fascia>,
+        /// The hash of each asset's consignment that `send_end` generated, by asset ID: what its
+        /// `update_or_save_transfers` backfills into the transfers still without one (review N2)
+        consignment_hashes: HashMap<String, String>,
     },
     Drain {
         reservations: Vec<DbReservedTxo>,
@@ -532,7 +536,7 @@ fn plan_send(
         idx,
     )?)
     .map_err(|_| missing())?;
-    let fascia: Fascia = serde_json::from_str(&read_transfer_file(
+    let mut fascia: Fascia = serde_json::from_str(&read_transfer_file(
         &transfer_dir.join(FASCIA_FILE),
         txid,
         idx,
@@ -589,34 +593,55 @@ fn plan_send(
     }
 
     // the signed TX send_end saved, if it got that far, is of this TX: signed.tx since beta.8
-    // (3bbedc5), signed.psbt as earlier versions wrote it. The stash gets the fascia as stored,
-    // donation or not, as beta.8's send_end and try_complete_batch consume it
-    // (broadcast_and_update_rgb); the copy of the TX that BDK got from the indexer is never used
-    // as a witness either: the TXID does not commit to the witnesses in it.
+    // (3bbedc5), signed.psbt as earlier versions wrote it. The stash gets the fascia as send_end
+    // consumes it: a donation's witnessed by the TX this wallet signed (send_end embeds it, so
+    // that the recipient can broadcast it), every other send's as stored at send_begin (review
+    // N2). A donation whose signed TX was not saved (a copy taken before its send_end) keeps the
+    // stored one. The copy of the TX that BDK got from the indexer is never used as a witness:
+    // the TXID does not commit to the witnesses in it.
     let signed_tx_path = transfer_dir.join(SIGNED_TX_FILE);
     let signed_psbt_path = transfer_dir.join(SIGNED_PSBT_FILE);
-    let signed_txid = if signed_tx_path.exists() {
+    let (signed_txid, signed_tx) = if signed_tx_path.exists() {
         let tx_hex = read_transfer_file(&signed_tx_path, txid, idx)?;
         let tx_bytes = hex::decode(tx_hex.trim()).map_err(|_| missing())?;
         let signed_tx: BdkTransaction =
             bdk_wallet::bitcoin::consensus::encode::deserialize(&tx_bytes)
                 .map_err(|_| missing())?;
-        Some(signed_tx.compute_txid().to_string())
+        (Some(signed_tx.compute_txid().to_string()), Some(signed_tx))
     } else if signed_psbt_path.exists() {
         let signed_psbt = Psbt::from_str(&read_transfer_file(&signed_psbt_path, txid, idx)?)
             .map_err(|_| missing())?;
-        Some(signed_psbt.unsigned_tx.compute_txid().to_string())
+        let signed_txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        (Some(signed_txid), signed_psbt.extract_tx().ok())
     } else {
-        None
+        (None, None)
     };
     if signed_txid.is_some_and(|signed_txid| signed_txid != *txid) {
         return Err(mismatch());
+    }
+    if info.donation
+        && let Some(signed_tx) = signed_tx
+    {
+        fascia.update_witness_tx(signed_tx);
+    }
+
+    // the consignments send_end generated (before the signed TX, so before the broadcast), whose
+    // hashes its update_or_save_transfers backfills; an asset without one gets none
+    let mut consignment_hashes = HashMap::new();
+    for asset_id in info.transfers.keys() {
+        let consignment = transfer_dir
+            .join(asset_id.replace(ASSET_ID_PREFIX, ""))
+            .join(CONSIGNMENT_FILE);
+        if consignment.is_file() {
+            consignment_hashes.insert(asset_id.clone(), hash_file(&consignment)?);
+        }
     }
 
     Ok(PlannedRecord::Send {
         batch_transfer,
         donation: info.donation,
         fascia: Box::new(fascia),
+        consignment_hashes,
     })
 }
 
@@ -675,6 +700,7 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
             PlannedRecord::Send {
                 batch_transfer,
                 donation,
+                consignment_hashes,
                 ..
             } => {
                 let previous_status = batch_transfer.status;
@@ -682,6 +708,22 @@ pub(crate) fn apply<W: WalletOnline + ?Sized>(
                 let mut updated: DbBatchTransferActMod = batch_transfer.into();
                 updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
                 txn.update_batch_transfer(&mut updated)?;
+                // as send_end's update_or_save_transfers (review N2): the transfers send_begin
+                // saved before the consignments existed get their hash. The used flags of the
+                // recipients' endpoints are not: send_end keeps them in memory only, so which
+                // endpoint took a consignment is not known here (every recipient's post
+                // succeeded, or send_end would have stopped before the broadcast); nothing reads
+                // them for a send in WaitingConfirmations
+                for (asset_id, consignment_hash) in consignment_hashes {
+                    for transfer in txn.get_transfers_for_asset(idx, &asset_id)? {
+                        if transfer.consignment_hash.is_none() {
+                            let mut updated_transfer: DbTransferActMod = transfer.into();
+                            updated_transfer.consignment_hash =
+                                ActiveValue::Set(Some(consignment_hash.clone()));
+                            txn.update_transfer(&mut updated_transfer)?;
+                        }
+                    }
+                }
                 warn!(
                     wallet.logger(),
                     "completed batch transfer {idx}: its TX {} is known to the indexer but was \

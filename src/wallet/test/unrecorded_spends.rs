@@ -142,9 +142,14 @@ fn stash_witness(party: &Issuer, txid: &str) -> Option<BdkTransaction> {
     RgbStock::new(&txn).stash_witness_tx(RgbTxid::from_str(txid).unwrap())
 }
 
-/// The stash's witness is the TX as the fascia stored it at send_begin, without signatures: on
-/// beta.8 every send consumes its fascia as stored, a donation's too (the previous base gave a
-/// donation's stash the TX this wallet signed)
+/// The stash's witness is the TX this wallet signed (as a donation's send_end consumes it, review
+/// N2: the port had taken beta.8's send_end to consume every fascia as stored).
+fn is_signed(witness: &Option<BdkTransaction>) -> bool {
+    matches!(witness, Some(tx) if tx.input.iter().all(|i| !i.witness.is_empty()))
+}
+
+/// The stash's witness is the TX as the fascia stored it at send_begin, without signatures (as
+/// every other send consumes it).
 fn is_unsigned(witness: &Option<BdkTransaction>) -> bool {
     matches!(witness, Some(tx) if tx.input.iter().all(|i| i.witness.is_empty()))
 }
@@ -187,8 +192,14 @@ fn a_donation_whose_answer_was_lost_completes_at_go_online() {
             TransferStatus::WaitingConfirmations
         );
         // the stash holds the transition, witnessed by the TX this wallet signed, as send_end
-        // consumes a donation
-        assert!(is_unsigned(&stash_witness(&party, &txid)));
+        // consumes a donation; and the transfers have their consignment's hash, as send_end's
+        // update_or_save_transfers backfills it (review N2)
+        assert!(is_signed(&stash_witness(&party, &txid)));
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let transfers = txn.get_transfers_for_asset(idx, &party.asset_id).unwrap();
+        assert!(!transfers.is_empty());
+        assert!(transfers.iter().all(|t| t.consignment_hash.is_some()));
+        drop(txn);
         assert!(chain.proxy_methods().iter().all(|m| m != "ack.get"));
 
         // the next go_online finds nothing to complete and asks nothing about the TX, and going
@@ -509,7 +520,7 @@ fn a_stash_ahead_of_the_database_ends_as_after_a_send_end() {
         }
         assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
         // the stash is ahead of the database
-        assert!(is_unsigned(&stash_witness(&party, &txid)));
+        assert!(is_signed(&stash_witness(&party, &txid)));
 
         control.wallet.send_end(control.online, signed).unwrap();
         reopen(&chain, &mut party, completing_options(&chain)).unwrap();
@@ -536,7 +547,7 @@ fn a_transition_the_stash_holds_is_not_consumed_again() {
     MOCK_SEND_END_CRASH.replace(Some(()));
     let result = party.wallet.send_end(party.online, signed);
     assert_matches!(result, Err(Error::Internal { .. }));
-    assert!(is_unsigned(&stash_witness(&party, &txid)));
+    assert!(is_signed(&stash_witness(&party, &txid)));
     damage_second_bundle(&party, &txid);
 
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
@@ -1874,7 +1885,7 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
         }
         assert!(stash_witness(&party, &spends[refused].0).is_none());
         if refused == 1 {
-            assert!(is_unsigned(&stash_witness(&party, &spends[0].0)));
+            assert!(is_signed(&stash_witness(&party, &spends[0].0)));
         } else {
             assert_eq!(stash_digest(&party), stash_before);
         }
@@ -1885,7 +1896,7 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
         reopen(&chain, &mut party, completing_options(&chain)).unwrap();
         assert_eq!(party.wallet.completed_spends().len(), 2);
         for (txid, idx) in &spends {
-            assert!(is_unsigned(&stash_witness(&party, txid)));
+            assert!(is_signed(&stash_witness(&party, txid)));
             assert_eq!(
                 status_of(&party.wallet, *idx),
                 TransferStatus::WaitingConfirmations
