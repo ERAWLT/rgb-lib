@@ -1392,7 +1392,14 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error>;
+    // ERA fork (D63): `excuse_initiated` is whether the check lets through a spend of the own TX of
+    // an outgoing transfer still Initiated, as it does one of a transfer waiting for its
+    // counterparty: when the completion of own spends is off (see check_consistency_inner)
+    fn wallet_specific_consistency_checks(
+        &mut self,
+        _txn: &DbTxn,
+        excuse_initiated: bool,
+    ) -> Result<(), Error>;
 
     // ERA fork (CC-99): the upstream verdict on an inconsistency of spent coins, unless the wallet
     // type can complete its own unrecorded spends (the singlesig Wallet, see unrecorded_spends)
@@ -1443,7 +1450,10 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         complete: bool,
     ) -> Result<Vec<CompletedSpend>, Error> {
-        let completed = match self.wallet_specific_consistency_checks(txn) {
+        // ERA fork (D63): with the completion on, a spend of an Initiated transfer's own TX is the
+        // completion's, which moves the transfer on (unrecorded_spends); without it, the check
+        // lets it through, as nothing else would ever let the wallet go online
+        let completed = match self.wallet_specific_consistency_checks(txn, !complete) {
             Ok(()) => vec![],
             // ERA fork (CC-99)
             Err(Error::Inconsistency { details }) if complete => {

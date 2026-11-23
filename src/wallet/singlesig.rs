@@ -199,7 +199,11 @@ impl WalletOffline for Wallet {}
 
 #[cfg(feature = "_online")]
 impl WalletOnline for Wallet {
-    fn wallet_specific_consistency_checks(&mut self, txn: &DbTxn) -> Result<(), Error> {
+    fn wallet_specific_consistency_checks(
+        &mut self,
+        txn: &DbTxn,
+        excuse_initiated: bool,
+    ) -> Result<(), Error> {
         self.sync_wallet(
             txn,
             SyncOptions {
@@ -233,18 +237,32 @@ impl WalletOnline for Wallet {
         let db_utxos: HashSet<String> = HashSet::from_iter(db_utxos);
         // the TX of an outgoing transfer waiting for the counterparty may have been broadcast by
         // a recipient, which leaves its inputs unspent in the DB until the next refresh
-        let waiting_counterparty_txids: HashSet<String> = txn
+        //
+        // ERA fork (D63): so may the TX of one still Initiated, when `excuse_initiated` (the
+        // completion of own spends is off). On RGB proxy protocol 1.0 send_end registers the
+        // signed TX on the sender proxy and posts the consignments before the commit that moves
+        // the transfer to WaitingCounterparty, so one that does not commit leaves it Initiated
+        // while a recipient that ACKs gets the TX released and broadcasts it; a donation's,
+        // inflation's, burn's or link's *_end broadcasts before its commit too. Called again,
+        // the *_end ends it. Only the transfer's own TX is excused, matched by TXID among BDK's
+        // canonical transactions as above: another TX spending its inputs, e.g. from another
+        // wallet on the same seed (CC-27), is still an inconsistency. With the completion on,
+        // the completion moves such a transfer on instead (unrecorded_spends), so its inputs are
+        // not excused here
+        let excused_txids: HashSet<String> = txn
             .iter_batch_transfers()?
             .into_iter()
-            .filter(|bt| !bt.incoming && bt.status == TransferStatus::WaitingCounterparty)
+            .filter(|bt| {
+                !bt.incoming
+                    && (bt.status == TransferStatus::WaitingCounterparty
+                        || (excuse_initiated && bt.status == TransferStatus::Initiated))
+            })
             .filter_map(|bt| bt.txid)
             .collect();
         let spent_by_own_transfers: HashSet<String> = self
             .bdk_wallet()
             .transactions()
-            .filter(|wallet_tx| {
-                waiting_counterparty_txids.contains(&wallet_tx.tx_node.txid.to_string())
-            })
+            .filter(|wallet_tx| excused_txids.contains(&wallet_tx.tx_node.txid.to_string()))
             .flat_map(|wallet_tx| {
                 wallet_tx
                     .tx_node
