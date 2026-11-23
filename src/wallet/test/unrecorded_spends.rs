@@ -8,7 +8,10 @@
 //! design (ERA.md, section 6).
 
 use super::scripted_chain::*;
+// (explicit: the shared test helpers have their own, for the electrum harness)
+use super::scripted_chain::{psbt_txid, witness_recipient};
 use super::*;
+use crate::wallet::online::SIGNED_TX_FILE;
 use crate::wallet::test::era_fixtures::dir_listing;
 
 fn completing_options(chain: &ScriptedChain) -> OnlineOptions {
@@ -67,12 +70,10 @@ fn state_digest(party: &Issuer) -> String {
         .join("\n")
 }
 
+/// The RGB stock's content (since beta.8 in the database, not in rgb/), comparable across wallets.
 fn stash_digest(party: &Issuer) -> String {
-    state_digest(party)
-        .lines()
-        .filter(|l| l.contains("/rgb/"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let txn = party.wallet.database().begin_transaction().unwrap();
+    txn.rgb_stock_digest()
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -136,23 +137,16 @@ fn control(party: &Issuer) -> (Issuer, tempfile::TempDir) {
     )
 }
 
-fn stash_witness(party: &Issuer, txid: &str) -> Option<PubWitness> {
-    party
-        .wallet
-        .rgb_runtime()
-        .unwrap()
-        .stash_pub_witness(RgbTxid::from_str(txid).unwrap())
+fn stash_witness(party: &Issuer, txid: &str) -> Option<BdkTransaction> {
+    let txn = party.wallet.database().begin_transaction().unwrap();
+    RgbStock::new(&txn).stash_witness_tx(RgbTxid::from_str(txid).unwrap())
 }
 
-/// The stash's witness is the TX this wallet signed (as a donation's send_end consumes it).
-fn is_signed(witness: &Option<PubWitness>) -> bool {
-    matches!(witness, Some(PubWitness::Tx(tx)) if tx.input.iter().all(|i| !i.witness.is_empty()))
-}
-
-/// The stash's witness is the TX as the fascia stored it at send_begin, without signatures (as
-/// every other send consumes it).
-fn is_unsigned(witness: &Option<PubWitness>) -> bool {
-    matches!(witness, Some(PubWitness::Tx(tx)) if tx.input.iter().all(|i| i.witness.is_empty()))
+/// The stash's witness is the TX as the fascia stored it at send_begin, without signatures: on
+/// beta.8 every send consumes its fascia as stored, a donation's too (the previous base gave a
+/// donation's stash the TX this wallet signed)
+fn is_unsigned(witness: &Option<BdkTransaction>) -> bool {
+    matches!(witness, Some(tx) if tx.input.iter().all(|i| i.witness.is_empty()))
 }
 
 fn settle(chain: &ScriptedChain, party: &mut Issuer) {
@@ -194,7 +188,7 @@ fn a_donation_whose_answer_was_lost_completes_at_go_online() {
         );
         // the stash holds the transition, witnessed by the TX this wallet signed, as send_end
         // consumes a donation
-        assert!(is_signed(&stash_witness(&party, &txid)));
+        assert!(is_unsigned(&stash_witness(&party, &txid)));
         assert!(chain.proxy_methods().iter().all(|m| m != "ack.get"));
 
         // the next go_online finds nothing to complete and asks nothing about the TX, and going
@@ -515,7 +509,7 @@ fn a_stash_ahead_of_the_database_ends_as_after_a_send_end() {
         }
         assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
         // the stash is ahead of the database
-        assert!(is_signed(&stash_witness(&party, &txid)));
+        assert!(is_unsigned(&stash_witness(&party, &txid)));
 
         control.wallet.send_end(control.online, signed).unwrap();
         reopen(&chain, &mut party, completing_options(&chain)).unwrap();
@@ -542,7 +536,7 @@ fn a_transition_the_stash_holds_is_not_consumed_again() {
     MOCK_SEND_END_CRASH.replace(Some(()));
     let result = party.wallet.send_end(party.online, signed);
     assert_matches!(result, Err(Error::Internal { .. }));
-    assert!(is_signed(&stash_witness(&party, &txid)));
+    assert!(is_unsigned(&stash_witness(&party, &txid)));
     damage_second_bundle(&party, &txid);
 
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
@@ -763,8 +757,8 @@ fn begin_two_asset_donation(
             FEE_RATE,
             MIN_CONFIRMATIONS,
             (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64,
+            Some(chain.proxy_endpoint()),
             false,
-            None,
         )
         .unwrap();
     let signed = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
@@ -812,43 +806,7 @@ fn a_stash_that_refuses_a_spend_keeps_nothing_of_it() {
     );
     assert_eq!(state_digest(&party), digest);
 }
-
-// a stash the disk will not take while a spend is completed (here the wallet's rgb/ directory
-// read-only, so no store can create its new file): the go_online fails with the retryable
-// Error::IO rather than a panic, nothing is committed and the stash is as it was; once the disk
-// takes it again, the next go_online completes the spend and it settles
-#[cfg(unix)]
-#[test]
-#[parallel]
-fn a_stash_the_disk_will_not_take_commits_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let (idx, _) = donation_answer_lost(&chain, &mut party);
-    let rgb_dir = party.wallet.get_wallet_dir().join("rgb");
-    let digest = state_digest(&party);
-    fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o555)).unwrap();
-    if fs::File::create(rgb_dir.join("probe")).is_ok() {
-        // running as root
-        let _ = fs::remove_file(rgb_dir.join("probe"));
-        fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        return;
-    }
-    let result = reopen(&chain, &mut party, completing_options(&chain));
-    fs::set_permissions(&rgb_dir, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_matches!(result, Err(Error::IO { details }) if details.contains("stash.dat"));
-    assert_eq!(state_digest(&party), digest);
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-
-    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert_eq!(party.wallet.completed_spends().len(), 1);
-    settle(&chain, &mut party);
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
-    assert_eq!(
-        spendable(&party.wallet, &party.asset_id),
-        AMOUNT - AMOUNT_SMALL
-    );
-}
+// ERA fork, beta.8: a_stash_the_disk_will_not_take_commits_nothing is not carried: the RGB stock is in rgb_lib_db, there is no rgb/ to make read-only (CC-101 not carried)
 
 // W11: try_complete_batch broadcasts only its own transfer's TX
 #[test]
@@ -868,8 +826,8 @@ fn a_signed_psbt_of_another_tx_is_not_broadcast() {
     // the first transfer's file now holds the second transfer's signed TX
     let transfers_dir = party.wallet.get_transfers_dir();
     fs::copy(
-        transfers_dir.join(&second_txid).join("signed.psbt"),
-        transfers_dir.join(&first_txid).join("signed.psbt"),
+        transfers_dir.join(&second_txid).join(SIGNED_TX_FILE),
+        transfers_dir.join(&first_txid).join(SIGNED_TX_FILE),
     )
     .unwrap();
     chain.set_ack(&first_recipient.recipient_id, true);
@@ -909,8 +867,8 @@ fn a_send_holding_another_tx(
     party.wallet.send_end(party.online, second_signed).unwrap();
     let transfers_dir = party.wallet.get_transfers_dir();
     fs::copy(
-        transfers_dir.join(&second_txid).join("signed.psbt"),
-        transfers_dir.join(&first_txid).join("signed.psbt"),
+        transfers_dir.join(&second_txid).join(SIGNED_TX_FILE),
+        transfers_dir.join(&first_txid).join(SIGNED_TX_FILE),
     )
     .unwrap();
     chain.set_ack(&first_recipient.recipient_id, true);
@@ -984,7 +942,7 @@ fn a_send_whose_signed_psbt_is_empty_can_be_failed() {
             .wallet
             .get_transfers_dir()
             .join(&txid)
-            .join("signed.psbt"),
+            .join(SIGNED_TX_FILE),
         "",
     )
     .unwrap();
@@ -1169,10 +1127,7 @@ fn unrecorded(txid: &str, reason: UnrecordedSpendReason, idx: Option<i32>) -> Er
 
 fn witness_tx(plan: &Plan, i: usize) -> Option<BdkTransaction> {
     match &plan.spends[i].record {
-        PlannedRecord::Send { fascia, .. } => match &fascia.seal_witness().public {
-            PubWitness::Tx(tx) => Some(tx.clone()),
-            PubWitness::Txid(_) => None,
-        },
+        PlannedRecord::Send { fascia, .. } => Some(fascia.seal_witness().tx.clone()),
         PlannedRecord::Drain { .. } => None,
     }
 }
@@ -1224,7 +1179,7 @@ fn plan_table_of_two_donations() {
     // a donation copy without signed.psbt (S3): the fascia as stored, with the unsigned TX
     let plan = base
         .plan_after(|_, transfers| {
-            fs::remove_file(transfers.join(&t0).join(SIGNED_PSBT_FILE)).unwrap();
+            fs::remove_file(transfers.join(&t0).join(SIGNED_TX_FILE)).unwrap();
         })
         .unwrap();
     let witness = witness_tx(&plan, 0).unwrap();
@@ -1451,7 +1406,7 @@ fn plan_table_of_two_donations() {
             rewrite_info(transfers, &t0, |info| {
                 info.transfers
                     .values_mut()
-                    .for_each(|t| t.main_transition = TypeOfTransition::Inflate)
+                    .for_each(|t| t.main_transition = MainTransition::Inflate)
             })
         })
         .err()
@@ -1480,7 +1435,7 @@ fn plan_table_of_two_donations() {
         |dir: &Path| fs::remove_file(dir.join("fascia")).unwrap(),
         |dir: &Path| fs::write(dir.join("fascia"), "{").unwrap(),
         |dir: &Path| fs::write(dir.join(TRANSFER_DATA_FILE), "[]").unwrap(),
-        |dir: &Path| fs::write(dir.join(SIGNED_PSBT_FILE), "not a PSBT").unwrap(),
+        |dir: &Path| fs::write(dir.join(SIGNED_TX_FILE), "not a TX").unwrap(),
     ] {
         assert_eq!(
             base.plan_after(|_, transfers| damage(&transfers.join(&t0)))
@@ -1501,7 +1456,7 @@ fn plan_table_of_two_donations() {
             .unwrap();
         }
     };
-    for change in [other_file("fascia"), other_file(SIGNED_PSBT_FILE)] {
+    for change in [other_file("fascia"), other_file(SIGNED_TX_FILE)] {
         assert_eq!(
             base.plan_after(change).err().unwrap(),
             unrecorded(&t0, RecordMismatch, Some(i0))
@@ -1509,7 +1464,7 @@ fn plan_table_of_two_donations() {
     }
     // the signed PSBT of another TX in a send that is not a donation (not used as a witness, still
     // refused: it is what try_complete_batch would broadcast)
-    let psbt_of_t1 = other_file(SIGNED_PSBT_FILE);
+    let psbt_of_t1 = other_file(SIGNED_TX_FILE);
     assert_eq!(
         base.plan_after(|txn, transfers| {
             psbt_of_t1(txn, transfers);
@@ -1526,9 +1481,10 @@ fn plan_table_of_two_donations() {
                 user_driven: ActiveValue::Set(false),
                 batch_transfer_idx: ActiveValue::Set(i0),
                 asset_id: ActiveValue::Set(
-                    txn.get_asset_ids()
+                    txn.iter_assets()
                         .unwrap()
                         .into_iter()
+                        .map(|a| a.id)
                         .find(|a| *a != base.party.asset_id),
                 ),
                 ..Default::default()
@@ -1688,7 +1644,7 @@ fn plan_table_of_a_drain() {
                     .map(|r| DbReservedTxoActMod {
                         txid: ActiveValue::Set(r.txid),
                         vout: ActiveValue::Set(r.vout),
-                        reserved_for: ActiveValue::Set(Some(idx)),
+                        reserved_for_vanilla: ActiveValue::Set(Some(idx)),
                         ..Default::default()
                     })
                     .collect(),
@@ -1708,11 +1664,9 @@ fn plan_table_of_a_drain() {
 fn apply_refuses_to_leave_a_divergence() {
     let mut base = Base::two_donations();
     let txn = base.party.wallet.database().begin_transaction().unwrap();
-    let mut runtime = base.party.wallet.rgb_runtime().unwrap();
     let result = crate::wallet::unrecorded_spends::apply(
         &mut base.party.wallet,
         &txn,
-        &mut runtime,
         Plan {
             spends: vec![],
             gone_envelopes: vec![],
@@ -1792,53 +1746,8 @@ fn a_drain_record_says_whether_it_is_pending() {
         None
     );
 }
-
-// CC-101: a stash the disk refuses while a spend is completed is an I/O error, which a retry can
-// get past, not the stash's verdict on the transitions; the next go_online completes the spend
-#[test]
-#[parallel]
-fn a_stash_the_disk_refuses_is_an_io_error() {
-    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let (idx, _) = donation_answer_lost(&chain, &mut party);
-    STORE_FAILURES
-        .with_borrow_mut(|f| f.push((s!("stash.dat"), InjectedFailure::HalfWritten, usize::MAX)));
-    let result = reopen(&chain, &mut party, completing_options(&chain));
-    STORE_FAILURES.with_borrow_mut(|f| f.clear());
-    assert_matches!(result, Err(Error::IO { details }) if details.contains("stash.dat"));
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-
-    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert_eq!(party.wallet.completed_spends().len(), 1);
-}
-
-// CC-101: an issuance whose contract the disk refuses is an I/O error, not a panic
-#[test]
-#[parallel]
-fn an_issuance_the_disk_refuses_is_an_io_error() {
-    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
-    let chain = ScriptedChain::start();
-    let (wallet, _online) = funded(&chain, UTXOS);
-    STORE_FAILURES
-        .with_borrow_mut(|f| f.push((s!("stash.dat"), InjectedFailure::HalfWritten, usize::MAX)));
-    let result = wallet.issue_asset_nia(
-        TICKER.to_string(),
-        NAME.to_string(),
-        PRECISION,
-        vec![AMOUNT],
-    );
-    STORE_FAILURES.with_borrow_mut(|f| f.clear());
-    assert_matches!(result, Err(Error::IO { .. }));
-    assert!(
-        wallet
-            .list_assets(vec![])
-            .unwrap()
-            .nia
-            .unwrap_or_default()
-            .is_empty()
-    );
-}
+// ERA fork, beta.8: a_stash_the_disk_refuses_is_an_io_error is not carried: it injects failures into the file stock store (CC-101), which beta.8 does not have
+// ERA fork, beta.8: an_issuance_the_disk_refuses_is_an_io_error is not carried: the same (CC-101 file store)
 
 // the report is the last go_online's, even when that call failed before its check: a refused
 // forwarder URL and a failed probe of a new indexer both leave the online state in place (the
@@ -1859,7 +1768,9 @@ fn a_failed_go_online_leaves_no_report() {
             }
         } else {
             OnlineOptions {
-                indexer_url: s!("http://127.0.0.1:1"),
+                indexer_config: IndexerConfig::Esplora {
+                    url: s!("http://127.0.0.1:1"),
+                },
                 ..completing_options(&chain)
             }
         };
@@ -1963,7 +1874,7 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
         }
         assert!(stash_witness(&party, &spends[refused].0).is_none());
         if refused == 1 {
-            assert!(is_signed(&stash_witness(&party, &spends[0].0)));
+            assert!(is_unsigned(&stash_witness(&party, &spends[0].0)));
         } else {
             assert_eq!(stash_digest(&party), stash_before);
         }
@@ -1974,7 +1885,7 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
         reopen(&chain, &mut party, completing_options(&chain)).unwrap();
         assert_eq!(party.wallet.completed_spends().len(), 2);
         for (txid, idx) in &spends {
-            assert!(is_signed(&stash_witness(&party, txid)));
+            assert!(is_unsigned(&stash_witness(&party, txid)));
             assert_eq!(
                 status_of(&party.wallet, *idx),
                 TransferStatus::WaitingConfirmations
@@ -2118,7 +2029,9 @@ fn a_clean_go_online_asks_for_no_backup() {
 #[parallel]
 fn the_option_is_off_unless_named() {
     let options: OnlineOptions = serde_json::from_str(
-        r#"{"indexer_url":"http://x","skip_consistency_check":false,"vanilla_sync_lookback":1}"#,
+        r#"{"indexer_config":{"Esplora":{"url":"http://x"}},"skip_consistency_check":false,
+            "vanilla_sync_lookback":1,"failed_witness_receive_grace_secs":1,"proxy_auth_keys":{},
+            "evm_chains":{}}"#,
     )
     .unwrap();
     assert!(!options.complete_unrecorded_spends);
@@ -2152,36 +2065,7 @@ fn an_unreadable_transfer_file_is_an_io_error() {
         TransferStatus::WaitingConfirmations
     );
 }
-
-// upstream's asset check refuses a stock without an asset the database has, with the option or
-// without it. Since the stock loads only as a whole set, such a stock is a whole one (here a fresh
-// wallet's); a missing one is refused before (the upstream tests of this check reach it the same
-// way now)
-#[test]
-#[parallel]
-fn the_asset_check_refuses_a_stock_without_the_asset() {
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let fresh = get_test_wallet(true, None);
-    let fresh_rgb_dir = fresh.get_wallet_dir().join(crate::utils::RGB_RUNTIME_DIR);
-    drop(fresh);
-    let rgb_dir = party
-        .wallet
-        .get_wallet_dir()
-        .join(crate::utils::RGB_RUNTIME_DIR);
-    party.wallet.go_offline();
-    fs::remove_dir_all(&rgb_dir).unwrap();
-    copy_dir(&fresh_rgb_dir, &rgb_dir);
-    for options in [online_options(&chain), completing_options(&chain)] {
-        let result = party.wallet.go_online(options);
-        assert_matches!(
-            &result,
-            Err(Error::Inconsistency { details })
-                if details == "DB assets do not match with ones stored in RGB"
-        );
-    }
-}
-
+// ERA fork, beta.8: the_asset_check_refuses_a_stock_without_the_asset is not carried: beta.8 dropped the "DB assets vs RGB" check with the file stock
 // upstream's media check, the last one, still runs after a completion, and still refuses: nothing
 // is committed
 #[test]
@@ -2204,97 +2088,8 @@ fn the_media_check_runs_after_a_completion() {
     assert!(party.wallet.completed_spends().is_empty());
 }
 
-/// Spend the change of the issued asset once more, and settle: the stash knows every transition
-/// the change comes from.
-fn spend_the_change(chain: &ScriptedChain, party: &mut Issuer, spent_before: u64) {
-    let (_, signed, _) = begin_send(chain, party, AMOUNT_SMALL, true);
-    let next = party.wallet.send_end(party.online, signed).unwrap();
-    assert!(chain.knows(&next.txid));
-    settle(chain, party);
-    assert_eq!(
-        spendable(&party.wallet, &party.asset_id),
-        AMOUNT - spent_before - AMOUNT_SMALL
-    );
-}
-
-// CC-101: one of the three stock files failing to store while the stash consumes a spend, during
-// the completion or during send_end itself: Error::IO, the stash no newer than the file that
-// failed (it is held back), the next go_online completes the spend, it settles, and its change
-// is spent again. Were the stash written after a failed index or state, the completion would
-// skip the consume and the change could never be spent.
-#[test]
-#[parallel]
-fn a_stock_file_that_fails_to_store_keeps_the_stash_behind() {
-    use crate::stock_store::{InjectedFailure, STORE_FAILURES};
-    for in_send_end in [false, true] {
-        for name in ["index.dat", "state.dat", "stash.dat"] {
-            let chain = ScriptedChain::start();
-            let mut party = issuer(&chain, vec![AMOUNT]);
-            let stash_path = party.wallet.get_wallet_dir().join("rgb").join("stash.dat");
-            let (idx, stash_before) = if in_send_end {
-                let (begin, signed, _) = begin_send(&chain, &mut party, AMOUNT_SMALL, true);
-                let stash_before = fs::read(&stash_path).unwrap();
-                STORE_FAILURES.with_borrow_mut(|f| {
-                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
-                });
-                let result = party.wallet.send_end(party.online, signed.clone());
-                STORE_FAILURES.with_borrow_mut(|f| f.clear());
-                assert!(
-                    matches!(result, Err(Error::IO { .. })),
-                    "{name}: {result:?}"
-                );
-                assert!(chain.knows(&psbt_txid(&signed)));
-                (begin.batch_transfer_idx.unwrap(), stash_before)
-            } else {
-                let (idx, _) = donation_answer_lost(&chain, &mut party);
-                let stash_before = fs::read(&stash_path).unwrap();
-                STORE_FAILURES.with_borrow_mut(|f| {
-                    f.push((name.to_string(), InjectedFailure::HalfWritten, usize::MAX))
-                });
-                let result = reopen(&chain, &mut party, completing_options(&chain));
-                STORE_FAILURES.with_borrow_mut(|f| f.clear());
-                assert!(
-                    matches!(result, Err(Error::IO { .. })),
-                    "{name}: {result:?}"
-                );
-                (idx, stash_before)
-            };
-            assert_eq!(fs::read(&stash_path).unwrap(), stash_before, "{name}");
-            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-
-            reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-            assert_eq!(party.wallet.completed_spends().len(), 1, "{name}");
-            settle(&chain, &mut party);
-            assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
-            spend_the_change(&chain, &mut party, AMOUNT_SMALL);
-        }
-    }
-}
-
-// CC-101, second line: a stash that holds a spend's bundle while the index does not (as the
-// index and state were written before the stash, a set older than the hold-back could be left
-// so) counts as not holding it: the completion consumes again, and the change is spent
-#[test]
-#[parallel]
-fn a_bundle_the_index_does_not_know_is_consumed_again() {
-    let chain = ScriptedChain::start();
-    let mut party = issuer(&chain, vec![AMOUNT]);
-    let (idx, _) = donation_answer_lost(&chain, &mut party);
-    let index_path = party.wallet.get_wallet_dir().join("rgb").join("index.dat");
-    let old_index = fs::read(&index_path).unwrap();
-    // the completion consumes (all three files stored) and does not commit
-    MOCK_FAIL_BEFORE_COMPLETION_COMMIT.replace(Some(()));
-    let result = reopen(&chain, &mut party, completing_options(&chain));
-    assert_matches!(result, Err(Error::Internal { .. }));
-    party.wallet.go_offline();
-    fs::write(&index_path, old_index).unwrap();
-
-    reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert_eq!(party.wallet.completed_spends().len(), 1);
-    settle(&chain, &mut party);
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
-    spend_the_change(&chain, &mut party, AMOUNT_SMALL);
-}
+// ERA fork, beta.8: a_stock_file_that_fails_to_store_keeps_the_stash_behind is not carried: the file store hold-back (CC-101) is not on this base
+// ERA fork, beta.8: a_bundle_the_index_does_not_know_is_consumed_again is not carried: it puts back an index.dat, a file beta.8 does not have
 
 // ERA fork (T1.1b, the second review's probe): after S1 the fast sync and the colored payment
 // sync, with an address handed out and paid meanwhile, never ask about the lost donation's change
@@ -2475,14 +2270,16 @@ impl EnvelopePayment {
     fn invoice(&mut self) -> Result<String, Error> {
         let receive = self.wallet.blind_receive(
             None,
+            None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![self.chain.proxy_endpoint()],
             MIN_CONFIRMATIONS,
+            None,
         )?;
         let utxo = self
             .wallet
-            .list_transfers(AssetFilter::AnyOrNone, None)
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
             .unwrap()
             .into_iter()
             .find(|t| t.batch_transfer_idx == receive.batch_transfer_idx)
@@ -2816,8 +2613,7 @@ fn a_payment_the_wallet_stands_on_is_not_forgotten() {
     let seen_at = now().unix_timestamp() as u64;
     payment
         .wallet
-        .bdk_wallet_db_mut()
-        .0
+        .bdk_wallet_mut()
         .apply_unconfirmed_txs([(child, seen_at)]);
     assert_eq!(
         payment
@@ -2963,7 +2759,7 @@ fn a_replaced_payment_whose_invoice_failed_lets_go_online_through() {
     assert_eq!(payment.invoice().unwrap(), first);
     let idx = payment
         .wallet
-        .list_transfers(AssetFilter::AnyOrNone, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()[0]
         .batch_transfer_idx;
     assert!(
@@ -3102,7 +2898,7 @@ fn plan_table_of_a_replaced_payment() {
             txn.set_reserved_txos(vec![DbReservedTxoActMod {
                 txid: ActiveValue::Set(first.clone()),
                 vout: ActiveValue::Set(0),
-                reserved_for: ActiveValue::Set(None),
+                reserved_for_vanilla: ActiveValue::Set(None),
                 ..Default::default()
             }])
             .unwrap();
@@ -3366,7 +3162,7 @@ fn a_marked_row_a_deleted_transfer_names_comes_back_as_a_new_row() {
     assert_eq!(payment.invoice().unwrap(), first);
     let idx = payment
         .wallet
-        .list_transfers(AssetFilter::AnyOrNone, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()[0]
         .batch_transfer_idx;
     assert!(

@@ -407,6 +407,66 @@ impl DbTxn {
         Ok(res)
     }
 
+    /// ERA fork (CC-99, tests): a digest of the RGB stock's content (bundles, witnesses and their
+    /// ordering, assignments, outpoint index), without row indexes, so that two wallets holding
+    /// the same transitions compare equal.
+    #[cfg(all(test, feature = "_online"))]
+    pub(crate) fn rgb_stock_digest(&self) -> String {
+        use crate::database::entities::{
+            rgb_assignment, rgb_bundle, rgb_outpoint_opout, rgb_witness, rgb_witness_ord,
+        };
+        let mut rows: Vec<String> = vec![];
+        for b in block_on(rgb_bundle::Entity::find().all(self.inner())).unwrap() {
+            rows.push(format!(
+                "b {} {}",
+                hex::encode(b.bundle_id),
+                hex::encode(b.bundle_blob)
+            ));
+        }
+        for w in block_on(rgb_witness::Entity::find().all(self.inner())).unwrap() {
+            rows.push(format!(
+                "w {} {} {} {}",
+                hex::encode(w.txid),
+                hex::encode(w.tx_blob),
+                hex::encode(w.mpc_merkle_block_blob),
+                hex::encode(w.dbc_proof_blob)
+            ));
+        }
+        for o in block_on(rgb_witness_ord::Entity::find().all(self.inner())).unwrap() {
+            rows.push(format!(
+                "o {} {} {:?}",
+                hex::encode(o.txid),
+                o.status,
+                o.height
+            ));
+        }
+        for a in block_on(rgb_assignment::Entity::find().all(self.inner())).unwrap() {
+            rows.push(format!(
+                "a {} {} {} {} {} {:?} {} {:?} {}",
+                hex::encode(a.contract_id),
+                a.state_type,
+                a.type_id,
+                hex::encode(a.opid),
+                a.output_no,
+                a.seal_txid.map(hex::encode),
+                a.seal_vout,
+                a.bundle_id.map(hex::encode),
+                hex::encode(a.value_blob)
+            ));
+        }
+        for p in block_on(rgb_outpoint_opout::Entity::find().all(self.inner())).unwrap() {
+            rows.push(format!(
+                "p {} {} {} {}",
+                hex::encode(p.contract_id),
+                hex::encode(p.txid),
+                p.vout,
+                hex::encode(p.opout)
+            ));
+        }
+        rows.sort();
+        hex::encode(crate::encryption::sha256_digest(rows.join("\n").as_bytes()))
+    }
+
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         let txn = self.txn.take().expect("txn already consumed");
         block_on(txn.commit())?;

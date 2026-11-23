@@ -759,6 +759,17 @@ impl<'txn> RgbStock<'txn> {
     /// through the rgb-lib transaction, so a consume that did not commit leaves nothing behind and
     /// a held bundle means a committed one; the check stays so that a completion never consumes a
     /// bundle twice, whatever the store does with a second consume.
+    /// ERA fork (CC-99, tests): the TX of the witness the stock holds for `witness_id`.
+    #[cfg(all(test, feature = "_online"))]
+    pub(crate) fn stash_witness_tx(&self, witness_id: RgbTxid) -> Option<BdkTransaction> {
+        self.stock
+            .as_store()
+            .witness(witness_id)
+            .ok()
+            .flatten()
+            .map(|w| w.tx)
+    }
+
     #[cfg(feature = "_online")]
     pub(crate) fn fascia_unknown_part(&self, fascia: Fascia) -> Option<Fascia> {
         let seal_witness = fascia.seal_witness().clone();
