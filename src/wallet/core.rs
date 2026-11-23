@@ -859,6 +859,34 @@ pub trait WalletCore {
         spks
     }
 
+    /// ERA fork: the colored scripts this wallet watches for a payment from outside it, until
+    /// one comes. None by default; the singlesig wallet watches the addresses
+    /// `get_colored_address` handed out and those the host asked `sync_colored_payments` about,
+    /// in this process.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn watched_colored_spks(&self) -> Vec<ScriptBuf> {
+        Vec::new()
+    }
+
+    /// ERA fork: of `watched`, the scripts no TX has paid yet, which is all a sync asks about.
+    /// A paid one is never asked about again, confirmed or not: the indexer answers a script with
+    /// the TXs spending from it too, and once its UTXO is the wallet's an own spend of it (one
+    /// whose record was lost among them) would reach BDK that way.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn colored_spks_still_watched(&self, watched: &HashSet<ScriptBuf>) -> Vec<ScriptBuf> {
+        let spk_index = self.bdk_wallet().spk_index();
+        watched
+            .iter()
+            .filter(|spk| match spk_index.index_of_spk((*spk).clone()) {
+                Some((KeychainKind::External, index)) => {
+                    !spk_index.is_used(KeychainKind::External, *index)
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
     #[cfg(feature = "_online")]
     fn sync_bdk_and_db_txos(
         &mut self,
@@ -948,6 +976,8 @@ pub trait WalletCore {
                                 .map(|s| ScriptBuf::from_hex(s).expect("valid script")),
                         );
                         spks.extend(self.unconfirmed_colored_spks());
+                        // ERA fork: payments from outside to the addresses handed out
+                        spks.extend(self.watched_colored_spks());
                     }
                     SyncKeychain::Vanilla { lookback } => {
                         spks.extend(self.fast_sync_vanilla_spks(lookback));
@@ -967,20 +997,14 @@ pub trait WalletCore {
         Ok(())
     }
 
-    /// ERA fork: ask the indexer about the colored keychain's revealed and unused scripts, and
-    /// record the colored UTXOs it reports there (`Wallet::sync_colored_payments`). Records only:
-    /// never marks a row spent, as the public `sync`'s orphan reconcile does.
+    /// ERA fork: ask the indexer about `spks`, colored scripts of this wallet, and record the
+    /// colored UTXOs it reports there (`Wallet::sync_colored_payments`). Records only: never marks
+    /// a row spent, as the public `sync`'s orphan reconcile does.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn sync_unused_colored_spks(&mut self, txn: &DbTxn) -> Result<(), Error> {
-        let spks: Vec<ScriptBuf> = self
-            .bdk_wallet()
-            .spk_index()
-            .unused_keychain_spks(KeychainKind::External)
-            .map(|(_, spk)| spk)
-            .collect();
+    fn sync_colored_spks(&mut self, txn: &DbTxn, spks: Vec<ScriptBuf>) -> Result<(), Error> {
         debug!(
             self.logger(),
-            "Syncing {} unused colored scripts...",
+            "Syncing {} watched colored scripts...",
             spks.len()
         );
         let request = SyncRequest::builder()
