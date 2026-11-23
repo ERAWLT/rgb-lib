@@ -237,7 +237,7 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{TransferStatus, WalletTransactionType},
-    error::{InconsistencyReason, UnrecordedSpendReason},
+    error::{InconsistencyReason, RgbStockDamage, UnrecordedSpendReason},
     utils::block_on,
 };
 
@@ -606,7 +606,7 @@ use crate::{
 };
 #[cfg(feature = "wallet")]
 use crate::{
-    database::rgb::migrate_rgb_fs_to_db,
+    database::rgb::{check_rgb_stock_holds_assets, load_legacy_rgb_stock, migrate_rgb_fs_to_db},
     database::{
         DbData, DbTxn, RgbLibDatabase, TransportEndpointsByTransfer,
         entities::{

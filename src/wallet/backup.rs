@@ -1051,4 +1051,211 @@ mod tests {
         // the manifest is the beta.34 one, still readable (rewritten only by Wallet::new)
         assert!(manifest_before.contains("\"vanilla_keychain\""));
     }
+
+    /// The wallet of the d82e21a seal, restored under `root`: (data dir, fingerprint, wallet dir).
+    #[cfg(feature = "rgb_fs_store_migration")]
+    fn d82e21a_wallet(root: &Path) -> (PathBuf, String, PathBuf) {
+        let fixtures = fixture_dir("d82e21a");
+        let fingerprint = fs::read_to_string(fixtures.join("vss_backup_fingerprint.txt")).unwrap();
+        let fingerprint = fingerprint.trim().to_string();
+        let backup = root.join("seal").join("file_backup.bin");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::copy(fixtures.join("file_backup.bin"), &backup).unwrap();
+        let target = root.join("data");
+        restore_backup(
+            backup.to_str().unwrap(),
+            FIXTURE_PASSWORD,
+            target.to_str().unwrap(),
+        )
+        .unwrap();
+        let wallet_dir = target.join(&fingerprint);
+        (target, fingerprint, wallet_dir)
+    }
+
+    /// Every entry under `wallet_dir` (a file with its bytes, a directory or a link as such), the
+    /// log left out: a refused open still logs.
+    #[cfg(feature = "rgb_fs_store_migration")]
+    fn wallet_entries(wallet_dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        WalkDir::new(wallet_dir)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name() != crate::utils::LOG_FILE)
+            .map(|e| {
+                let path = e.path().strip_prefix(wallet_dir).unwrap();
+                let bytes = e.file_type().is_file().then(|| fs::read(e.path()).unwrap());
+                (format!("{}", path.display()), bytes)
+            })
+            .collect()
+    }
+
+    // ERA fork (review S2): a legacy stock that cannot be migrated is refused before anything in
+    // the wallet dir is written: the database keeps its migrations, BDK's legacy store its file,
+    // rgb/ its files. Each kind of damage, on the d82e21a wallet (UTEXO's beta.34 layout)
+    #[test]
+    #[cfg(all(
+        feature = "bdk_file_store_migration",
+        feature = "rgb_fs_store_migration"
+    ))]
+    fn d82e21a_wallet_with_a_damaged_stock_is_refused_untouched() {
+        type Damage = fn(&Path);
+        let cases: [(&str, Damage, &str); 7] = [
+            (
+                "state.dat removed",
+                |rgb| fs::remove_file(rgb.join("state.dat")).unwrap(),
+                "missing",
+            ),
+            (
+                "every stock file removed, in a wallet that was set up",
+                |rgb| {
+                    for name in ["stash.dat", "state.dat", "index.dat"] {
+                        fs::remove_file(rgb.join(name)).unwrap();
+                    }
+                },
+                "missing",
+            ),
+            (
+                "stash.dat cut short",
+                |rgb| {
+                    let stash = fs::read(rgb.join("stash.dat")).unwrap();
+                    fs::write(rgb.join("stash.dat"), &stash[..stash.len() / 2]).unwrap();
+                },
+                "cut_short",
+            ),
+            (
+                "index.dat longer than its content",
+                |rgb| {
+                    let mut index = fs::read(rgb.join("index.dat")).unwrap();
+                    index.push(0);
+                    fs::write(rgb.join("index.dat"), index).unwrap();
+                },
+                "trailing",
+            ),
+            (
+                "state.dat a directory",
+                |rgb| {
+                    fs::remove_file(rgb.join("state.dat")).unwrap();
+                    fs::create_dir(rgb.join("state.dat")).unwrap();
+                },
+                "not_a_file",
+            ),
+            (
+                "rgb a file",
+                |rgb| {
+                    fs::remove_dir_all(rgb).unwrap();
+                    fs::write(rgb, b"not a stock").unwrap();
+                },
+                "not_a_file",
+            ),
+            (
+                "rgb a symbolic link",
+                |rgb| {
+                    let moved = rgb.with_file_name("rgb.elsewhere");
+                    fs::rename(rgb, &moved).unwrap();
+                    std::os::unix::fs::symlink(&moved, rgb).unwrap();
+                },
+                "not_a_file",
+            ),
+        ];
+        for (case, damage, kind) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let (target, fingerprint, wallet_dir) = d82e21a_wallet(root.path());
+            damage(&wallet_dir.join("rgb"));
+            let before = wallet_entries(&wallet_dir);
+
+            let result = Wallet::load(target.to_str().unwrap(), &fingerprint, None);
+            let error = result.err().unwrap_or_else(|| panic!("{case}: opened"));
+            assert!(
+                matches!(&error, Error::RgbStockDamaged { kind: k, .. } if k == kind),
+                "{case}: {error:?}"
+            );
+            assert_eq!(
+                error.rgb_stock_damage().map(|k| k.code()),
+                Some(kind),
+                "{case}"
+            );
+            assert_eq!(wallet_entries(&wallet_dir), before, "{case}: written");
+            assert!(wallet_dir.join("bdk_db_watch_only").exists(), "{case}");
+        }
+    }
+
+    // ERA fork (review S2): a wallet just restored from a VSS backup reports the same refusal
+    // against the backup, with its kind
+    #[test]
+    #[cfg(all(
+        feature = "vss",
+        feature = "bdk_file_store_migration",
+        feature = "rgb_fs_store_migration"
+    ))]
+    fn d82e21a_restored_wallet_with_a_damaged_stock_is_refused_against_the_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let (target, fingerprint, wallet_dir) = d82e21a_wallet(root.path());
+        fs::remove_file(wallet_dir.join("rgb").join("index.dat")).unwrap();
+        fs::write(wallet_dir.join(crate::wallet::vss::VSS_RESTORE_MARKER), b"").unwrap();
+
+        let error = Wallet::load(target.to_str().unwrap(), &fingerprint, None)
+            .err()
+            .unwrap();
+        assert_matches!(
+            &error,
+            Error::RestoredBackupInconsistent { details }
+                if details == "RGB state (missing): index.dat missing"
+        );
+        assert_eq!(error.rgb_stock_damage(), Some(RgbStockDamage::Missing));
+        assert!(wallet_dir.join("rgb").join("stash.dat").exists());
+    }
+
+    // ERA fork (review N6): what the old fork's file stock (CC-101) leaves behind does not stop
+    // the migration: a store's `<file>.new` inside rgb/ is not read (the file next to it is the
+    // version that was completely written) and goes with rgb/, a staging dir rgb.new/ (at most an
+    // empty stock) and the runtime's lock of a killed process are swept. The wallet is d82e21a's:
+    // the rev the app pins today (7a53485) writes rgb/ with the same rgb-ops (0.11.1-rc.11) and
+    // strict encoding (1.0.2), whole files instead of field by field but the same bytes, and the
+    // same database migrations and manifest; only these leftovers are its own
+    #[test]
+    #[cfg(all(
+        feature = "bdk_file_store_migration",
+        feature = "rgb_fs_store_migration"
+    ))]
+    fn d82e21a_wallet_with_file_stock_leftovers_migrates() {
+        let root = tempfile::tempdir().unwrap();
+        let (target, fingerprint, wallet_dir) = d82e21a_wallet(root.path());
+        let rgb = wallet_dir.join("rgb");
+        fs::write(rgb.join("stash.dat.new"), b"half a store").unwrap();
+        fs::create_dir(wallet_dir.join("rgb.new")).unwrap();
+        for name in ["stash.dat", "state.dat", "index.dat"] {
+            fs::copy(rgb.join(name), wallet_dir.join("rgb.new").join(name)).unwrap();
+        }
+        fs::write(wallet_dir.join("rgb_runtime.lock"), b"").unwrap();
+
+        let wallet = Wallet::load(target.to_str().unwrap(), &fingerprint, None).unwrap();
+        drop(wallet);
+        assert!(!rgb.exists());
+        assert!(!wallet_dir.join("rgb.new").exists());
+        assert!(!wallet_dir.join("rgb_runtime.lock").exists());
+        assert!(!wallet_dir.join("rgb.deleting").exists());
+        Wallet::load(target.to_str().unwrap(), &fingerprint, None).unwrap();
+    }
+
+    // ERA fork (review N6): an rgb/ holding no stock file in a wallet whose set-up never finished
+    // (no manifest: the old fork's creation died before its stock was renamed into place) is no
+    // stock to migrate: retired, and the wallet opens, and opens again
+    #[test]
+    #[cfg(all(
+        feature = "bdk_file_store_migration",
+        feature = "rgb_fs_store_migration"
+    ))]
+    fn an_unfinished_wallet_with_an_empty_rgb_dir_opens() {
+        let root = tempfile::tempdir().unwrap();
+        let (target, fingerprint, wallet_dir) = d82e21a_wallet(root.path());
+        let wallet = Wallet::load(target.to_str().unwrap(), &fingerprint, None).unwrap();
+        let (wallet_data, keys) = (wallet.get_wallet_data(), wallet.get_keys());
+        drop(wallet);
+        fs::remove_file(wallet_dir.join(crate::wallet::core::WALLET_MANIFEST_FILE)).unwrap();
+        fs::create_dir(wallet_dir.join("rgb")).unwrap();
+        fs::write(wallet_dir.join("rgb").join("index.dat.new"), b"a store's").unwrap();
+
+        drop(Wallet::new(wallet_data.clone(), keys.clone()).unwrap());
+        assert!(!wallet_dir.join("rgb").exists());
+        drop(Wallet::new(wallet_data, keys).unwrap());
+    }
 }

@@ -2065,7 +2065,37 @@ fn an_unreadable_transfer_file_is_an_io_error() {
         TransferStatus::WaitingConfirmations
     );
 }
-// ERA fork, beta.8: the_asset_check_refuses_a_stock_without_the_asset is not carried: beta.8 dropped the "DB assets vs RGB" check with the file stock
+// ERA fork (review S1): the asset check of the fork's file stock (the_asset_check_refuses_a_stock_
+// without_the_asset there) is back on this base, at the wallet's open, which beta.8's
+// consistency check no longer reaches: a stock without the contract of an asset the database lists
+// (here its genesis deleted, as an rgb/ that vanished before its migration leaves it) is refused,
+// and on a wallet just restored from a VSS backup it is reported against the backup
+#[test]
+#[parallel]
+fn the_open_refuses_a_stock_without_the_asset() {
+    let chain = ScriptedChain::start();
+    let party = issuer(&chain, vec![AMOUNT]);
+    let asset_id = party.asset_id.clone();
+    let (wallet_data, keys) = (party.wallet.get_wallet_data(), party.wallet.get_keys());
+    let wallet_dir = party.wallet.get_wallet_dir();
+    let txn = party.wallet.database().begin_transaction().unwrap();
+    txn.del_rgb_geneses().unwrap();
+    txn.commit().unwrap();
+    drop(party);
+
+    let error = Wallet::new(wallet_data.clone(), keys.clone())
+        .err()
+        .unwrap();
+    assert_matches!(
+        &error,
+        Error::RgbStockDamaged { kind, details } if kind == "missing" && details.contains(&asset_id)
+    );
+    fs::write(wallet_dir.join(crate::wallet::vss::VSS_RESTORE_MARKER), b"").unwrap();
+    let error = Wallet::new(wallet_data, keys).err().unwrap();
+    assert_matches!(&error, Error::RestoredBackupInconsistent { .. });
+    assert_eq!(error.rgb_stock_damage(), Some(RgbStockDamage::Missing));
+}
+
 // upstream's media check, the last one, still runs after a completion, and still refuses: nothing
 // is committed
 #[test]
