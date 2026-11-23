@@ -253,10 +253,13 @@ fn a_completion_asks_for_a_backup() {
 }
 
 // W2: the refresh that broadcasts an ACKed send meets S1; it records the failure and commits the
-// ACK, and the next go_online completes the send without asking the RGB proxy anything
+// ACK. ERA fork, beta.8: the next go_online lets it through without completing it, as beta.8's
+// consistency check leaves the inputs of a send waiting for its counterparty to the refresh (a
+// recipient may broadcast the released TX), and asks the RGB proxy nothing; the next refresh
+// completes it (its broadcast repeated harmlessly). The pinned fork completed it at go_online
 #[test]
 #[parallel]
-fn an_acked_send_whose_answer_was_lost_completes_at_go_online() {
+fn an_acked_send_whose_answer_was_lost_completes_at_the_next_refresh() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (begin, signed, recipient) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
@@ -279,16 +282,15 @@ fn an_acked_send_whose_answer_was_lost_completes_at_go_online() {
     let proxy_calls = chain.proxy_methods().len();
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
     assert_eq!(chain.proxy_methods().len(), proxy_calls);
+    assert!(party.wallet.completed_spends().is_empty());
     assert_eq!(
-        party.wallet.completed_spends(),
-        vec![CompletedSpend {
-            txid: txid.clone(),
-            batch_transfer_idx: Some(idx),
-            previous_status: Some(TransferStatus::WaitingCounterparty),
-            donation: false,
-            confirmations: 0,
-        }]
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
     );
+    party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
     assert_eq!(
         status_of(&party.wallet, idx),
         TransferStatus::WaitingConfirmations
@@ -299,11 +301,12 @@ fn an_acked_send_whose_answer_was_lost_completes_at_go_online() {
     assert_eq!(status_of(&party.wallet, idx), TransferStatus::Settled);
 }
 
-// W3: one refresh broadcasts two ACKed sends and loses both answers; one go_online completes both
-// in one commit, and the one after it has nothing to do
+// W3: one refresh broadcasts two ACKed sends and loses both answers. ERA fork, beta.8: as in W2,
+// go_online lets both through and the next refresh completes both (the pinned fork completed both
+// at go_online in one commit); the go_online after it has nothing to do
 #[test]
 #[parallel]
-fn two_sends_whose_answers_were_lost_complete_together() {
+fn two_sends_whose_answers_were_lost_complete_at_the_next_refresh() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
     let mut sends = vec![];
@@ -325,14 +328,11 @@ fn two_sends_whose_answers_were_lost_complete_together() {
     }
 
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    sends.sort();
-    let completed: Vec<(String, i32)> = party
+    assert!(party.wallet.completed_spends().is_empty());
+    party
         .wallet
-        .completed_spends()
-        .into_iter()
-        .map(|c| (c.txid, c.batch_transfer_idx.unwrap()))
-        .collect();
-    assert_eq!(completed, sends);
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
     for (_, idx) in &sends {
         assert_eq!(
             status_of(&party.wallet, *idx),
@@ -487,12 +487,13 @@ fn the_vss_marker_goes_only_with_a_committed_completion() {
     assert!(marker.exists());
 }
 
-// W7: a stash that holds the transition already (a send_end killed after its broadcast and
-// consume; a completion that failed before its commit) is not consumed again, and ends up as the
-// stash of a wallet whose send_end went through
+// W7: a send_end killed after its broadcast and consume, or a completion that failed before its
+// commit, ends up as the stash of a wallet whose send_end went through. ERA fork, beta.8: the
+// stash is no longer ahead of the database in between (the pinned fork's file stock was): the
+// consume went through the transaction that did not commit
 #[test]
 #[parallel]
-fn a_stash_ahead_of_the_database_ends_as_after_a_send_end() {
+fn a_send_end_that_did_not_commit_ends_as_after_a_send_end() {
     for crash_in_send_end in [true, false] {
         let chain = ScriptedChain::start();
         let mut party = issuer(&chain, vec![AMOUNT]);
@@ -519,8 +520,8 @@ fn a_stash_ahead_of_the_database_ends_as_after_a_send_end() {
             assert_matches!(result, Err(Error::Internal { .. }));
         }
         assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-        // the stash is ahead of the database
-        assert!(is_signed(&stash_witness(&party, &txid)));
+        // the stash is not ahead of the database: it holds nothing of the send
+        assert!(stash_witness(&party, &txid).is_none());
 
         control.wallet.send_end(control.online, signed).unwrap();
         reopen(&chain, &mut party, completing_options(&chain)).unwrap();
@@ -533,12 +534,14 @@ fn a_stash_ahead_of_the_database_ends_as_after_a_send_end() {
     }
 }
 
-// a transition the stash holds already is not consumed again: the completion goes by the stash,
-// not by the file (here damaged, which a consume would refuse). On rgb-ops 0.11.1-rc.11 a second
-// consume of an intact fascia changes nothing, so this is the one way to see the difference.
+// ERA fork, beta.8: the pinned fork tested here that a transition its file stock held ahead of the
+// database is not consumed again (the completion going by the stash, not by a damaged file). On
+// this base a stash is never ahead (W7 above), so a crashed send_end of a two-asset donation leaves
+// nothing in the stash and the completion consumes the saved fascia, both bundles, as send_end
+// would have. The check that skips a held bundle (fascia_unknown_part) stays, unreached here.
 #[test]
 #[parallel]
-fn a_transition_the_stash_holds_is_not_consumed_again() {
+fn a_crashed_send_end_leaves_nothing_in_the_stash_to_skip() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (begin, signed) = begin_two_asset_donation(&chain, &mut party);
@@ -547,8 +550,7 @@ fn a_transition_the_stash_holds_is_not_consumed_again() {
     MOCK_SEND_END_CRASH.replace(Some(()));
     let result = party.wallet.send_end(party.online, signed);
     assert_matches!(result, Err(Error::Internal { .. }));
-    assert!(is_signed(&stash_witness(&party, &txid)));
-    damage_second_bundle(&party, &txid);
+    assert!(stash_witness(&party, &txid).is_none());
 
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
     assert_eq!(party.wallet.completed_spends().len(), 1);
@@ -556,6 +558,7 @@ fn a_transition_the_stash_holds_is_not_consumed_again() {
         status_of(&party.wallet, idx),
         TransferStatus::WaitingConfirmations
     );
+    assert!(is_signed(&stash_witness(&party, &txid)));
 }
 
 // W8: without the option, go_online answers exactly as upstream and asks the indexer nothing
@@ -778,17 +781,24 @@ fn begin_two_asset_donation(
 
 /// The second bundle the stash would consume from the saved fascia names a transition its input
 /// map does not: a consume stops there, after the first bundle. The bundle IDs do not change.
+/// (beta.8 saves the fascia strict-encoded, so it is changed as a `Fascia`, not as JSON.)
 fn damage_second_bundle(party: &Issuer, txid: &str) {
     let fascia_path = party.wallet.get_transfers_dir().join(txid).join("fascia");
-    let fascia_str = fs::read_to_string(&fascia_path).unwrap();
-    let fascia: Fascia = serde_json::from_str(&fascia_str).unwrap();
-    let contracts: Vec<String> = fascia.bundles().keys().map(|c| c.to_string()).collect();
-    assert_eq!(contracts.len(), 2);
-    let mut json: serde_json::Value = serde_json::from_str(&fascia_str).unwrap();
-    let first_opid = json["bundles"][&contracts[0]]["knownTransitions"][0]["opid"].clone();
-    assert!(first_opid.is_string());
-    json["bundles"][&contracts[1]]["knownTransitions"][0]["opid"] = first_opid;
-    fs::write(&fascia_path, json.to_string()).unwrap();
+    let fascia = read_fascia(&fascia_path).unwrap();
+    let seal_witness = fascia.seal_witness().clone();
+    let mut bundles: Vec<(ContractId, TransitionBundle)> =
+        fascia.into_bundles().into_iter().collect();
+    assert_eq!(bundles.len(), 2);
+    let first_opid = bundles[0].1.known_transitions[0].opid;
+    let mut known = bundles[1].1.known_transitions.clone().release();
+    known[0].opid = first_opid;
+    bundles[1].1.known_transitions = Confined::try_from(known).unwrap();
+    let bundles: BTreeMap<ContractId, TransitionBundle> = bundles.into_iter().collect();
+    write_fascia(
+        &fascia_path,
+        &Fascia::new(seal_witness, Confined::try_from(bundles).unwrap()),
+    )
+    .unwrap();
 }
 
 // a stash that refuses a spend half way (the second of its two bundles) keeps nothing of that
@@ -886,11 +896,14 @@ fn a_send_holding_another_tx(
     (first.batch_transfer_idx.unwrap(), first_txid)
 }
 
-// A send the W11 guard refuses at every refresh can still be failed before it expires (it was
-// locked until then, its coins reserved), and nothing is broadcast
+// A send the W11 guard refuses at every refresh is not failed once its recipient ACKed. ERA fork,
+// beta.8: on protocol 1.0 the recipient's ACK means the sender proxy released the send's signed TX
+// to the recipient, who may broadcast it, so the fail goes through the refresh first, which stops at
+// the guard (InvalidPsbt), and a released send is denied in any case (the pinned fork, on 0.2,
+// failed it: nothing had left the wallet). Nothing is broadcast, nothing changes
 #[test]
 #[parallel]
-fn a_send_whose_signed_psbt_is_refused_can_be_failed() {
+fn a_released_send_whose_signed_tx_is_refused_is_not_failed() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
     let (idx, txid) = a_send_holding_another_tx(&chain, &mut party, |_| {});
@@ -900,15 +913,22 @@ fn a_send_whose_signed_psbt_is_refused_can_be_failed() {
     let result = party
         .wallet
         .fail_transfers(party.online, Some(idx), false, false);
-    assert_matches!(result, Ok(true));
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert_matches!(
+        result,
+        Err(Error::InvalidPsbt { details }) if details.contains("for another TX")
+    );
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
+    );
     assert!(!chain.requests().contains(&s!("POST /tx")));
     assert!(!chain.knows(&txid));
-    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before);
 }
 
-// ... but not when its own TX is on chain (another copy of the wallet broadcast it): that send
-// happened, and failing it would stop crediting its change
+// ... nor when its own TX is on chain (another copy of the wallet broadcast it): that send
+// happened, and failing it would stop crediting its change. ERA fork, beta.8: refused by the same
+// refresh (InvalidPsbt), where the pinned fork's chain check refused it (CannotFailBatchTransfer)
 #[test]
 #[parallel]
 fn a_send_whose_signed_psbt_is_refused_is_not_failed_with_its_tx_on_chain() {
@@ -929,7 +949,10 @@ fn a_send_whose_signed_psbt_is_refused_is_not_failed_with_its_tx_on_chain() {
     let result = party
         .wallet
         .fail_transfers(party.online, Some(idx), false, false);
-    assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+    assert_matches!(
+        result,
+        Err(Error::InvalidPsbt { details }) if details.contains("for another TX")
+    );
     assert_eq!(
         status_of(&party.wallet, idx),
         TransferStatus::WaitingCounterparty
@@ -937,11 +960,14 @@ fn a_send_whose_signed_psbt_is_refused_is_not_failed_with_its_tx_on_chain() {
     assert!(!chain.requests().contains(&s!("POST /tx")));
 }
 
-// Upstream's own lock of the same kind: a signed.psbt left empty (send_end writes it without a
-// sync) fails every refresh; the send can be failed, and nothing is broadcast
+// Upstream's own lock of the same kind: a signed TX file left empty (send_end writes it without a
+// sync) fails every refresh. ERA fork, beta.8: the file is signed.tx, which does not deserialize
+// (Internal, where the signed.psbt of 0.2 was InvalidPsbt), and the send, released by the
+// recipient's ACK, is not failed (the pinned fork failed it), for the reason above. Nothing is
+// broadcast, nothing changes
 #[test]
 #[parallel]
-fn a_send_whose_signed_psbt_is_empty_can_be_failed() {
+fn a_released_send_whose_signed_tx_is_empty_is_not_failed() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT, AMOUNT]);
     let (begin, signed, recipient) = begin_send(&chain, &mut party, AMOUNT_SMALL, false);
@@ -962,18 +988,27 @@ fn a_send_whose_signed_psbt_is_empty_can_be_failed() {
         .wallet
         .refresh(party.online, None, vec![], false)
         .unwrap();
-    assert_matches!(&refreshed[&idx].failure, Some(Error::InvalidPsbt { .. }));
+    assert_matches!(
+        &refreshed[&idx].failure,
+        Some(Error::Internal { details }) if details.starts_with("invalid signed TX")
+    );
     let before = spendable(&party.wallet, &party.asset_id);
     chain.clear_requests();
 
     let result = party
         .wallet
         .fail_transfers(party.online, Some(idx), false, false);
-    assert_matches!(result, Ok(true));
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Failed);
+    assert_matches!(
+        result,
+        Err(Error::Internal { details }) if details.starts_with("invalid signed TX")
+    );
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingCounterparty
+    );
     assert!(!chain.requests().contains(&s!("POST /tx")));
     assert!(!chain.knows(&txid));
-    assert_eq!(spendable(&party.wallet, &party.asset_id), before + AMOUNT);
+    assert_eq!(spendable(&party.wallet, &party.asset_id), before);
 }
 
 // Planner table (design section 5.1): `plan` over a real wallet state (database, BDK view, transfer
@@ -1829,14 +1864,14 @@ fn a_failed_lookup_leaves_its_text_out_of_the_log() {
     assert!(!log.contains(SECRET));
 }
 
-// two spends in one plan, the stash refusing one of them: rgb-ops commits each fascia on its own,
-// so a spend consumed before the refused one stays in the stash while the database rolls back
-// (S2's state), and one refused first leaves the stash as it was. Either way the refusal is the
-// same on every go_online while the damage lasts, and once the fascia is whole the next one
-// completes both, skipping what the stash holds
+// two spends in one plan, the stash refusing one of them. ERA fork, beta.8: the stash writes
+// through the check's transaction, so the refusal leaves the stash as it was whichever spend it
+// meets, the one consumed before it included (the pinned fork's file stock kept that one, S2's
+// state). The refusal is the same on every go_online while the damage lasts, and once the fascia
+// is whole the next one completes both
 #[test]
 #[parallel]
-fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
+fn a_stash_refusal_keeps_nothing_of_the_plan() {
     for refused in [1, 0] {
         let chain = ScriptedChain::start();
         let (wallet, online) = funded(&chain, 8);
@@ -1862,7 +1897,7 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
             .get_transfers_dir()
             .join(&spends[refused].0)
             .join("fascia");
-        let whole = fs::read_to_string(&fascia_path).unwrap();
+        let whole = fs::read(&fascia_path).unwrap();
         damage_second_bundle(&party, &spends[refused].0);
         let db_digest = |party: &Issuer| {
             state_digest(party)
@@ -1884,11 +1919,8 @@ fn a_stash_refusal_keeps_the_spends_consumed_before_it() {
             assert_eq!(status_of(&party.wallet, *idx), TransferStatus::Initiated);
         }
         assert!(stash_witness(&party, &spends[refused].0).is_none());
-        if refused == 1 {
-            assert!(is_signed(&stash_witness(&party, &spends[0].0)));
-        } else {
-            assert_eq!(stash_digest(&party), stash_before);
-        }
+        assert!(stash_witness(&party, &spends[1 - refused].0).is_none());
+        assert_eq!(stash_digest(&party), stash_before);
         let result = reopen(&chain, &mut party, completing_options(&chain));
         assert_eq!(result.unwrap_err(), refusal);
 
@@ -2201,13 +2233,13 @@ fn a_lost_spend_of_an_envelope_paid_from_outside_lets_go_online_through() {
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
 }
 
-// ERA fork (T1.1b, the review's probe): why the host must not use the public sync for that. Its
-// orphan reconcile marks the donation's inputs spent with no transition, so the next go_online
-// finds no divergence and completes nothing: the donation stays Initiated and its transition
-// never reaches the stash
+// ERA fork (T1.1b, the review's probe): why the host must not use the public sync for that. On the
+// pinned fork its orphan reconcile marked the donation's inputs spent with no transition, so the
+// next go_online found no divergence and completed nothing. ERA fork, beta.8: the public sync no
+// longer marks them, and the next go_online completes the donation as without it
 #[test]
 #[parallel]
-fn the_public_sync_after_s1_preempts_the_completion() {
+fn the_public_sync_after_s1_no_longer_preempts_the_completion() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);
     let (idx, txid) = donation_answer_lost(&chain, &mut party);
@@ -2222,9 +2254,12 @@ fn the_public_sync_after_s1_preempts_the_completion() {
         )
         .unwrap();
     reopen(&chain, &mut party, completing_options(&chain)).unwrap();
-    assert!(party.wallet.completed_spends().is_empty());
-    assert_eq!(status_of(&party.wallet, idx), TransferStatus::Initiated);
-    assert!(stash_witness(&party, &txid).is_none());
+    assert_eq!(party.wallet.completed_spends().len(), 1);
+    assert_eq!(
+        status_of(&party.wallet, idx),
+        TransferStatus::WaitingConfirmations
+    );
+    assert!(is_signed(&stash_witness(&party, &txid)));
 }
 
 // CC-115: an envelope paid from outside the wallet whose payment is replaced (a fee bump, or
@@ -2309,8 +2344,9 @@ impl EnvelopePayment {
 
     /// A blind invoice on an envelope of the wallet: the TXID of the UTXO it took.
     fn invoice(&mut self) -> Result<String, Error> {
+        // online: on protocol 1.0 a receive reserves its invoice on the proxy
         let receive = self.wallet.blind_receive(
-            None,
+            Some(self.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
@@ -2933,13 +2969,20 @@ fn plan_table_of_a_replaced_payment() {
         },
         unchanged,
     ));
-    // reserved (a drain or another vanilla TX begun on it)
+    // reserved (a drain or another vanilla TX begun on it; beta.8 names the reserving TX)
     refused(base.plan(
         |txn, _| {
+            let wallet_transaction = txn
+                .set_wallet_transaction(DbWalletTransactionActMod {
+                    txid: ActiveValue::Set("ab".repeat(32)),
+                    r#type: ActiveValue::Set(WalletTransactionType::SendBtc),
+                    ..Default::default()
+                })
+                .unwrap();
             txn.set_reserved_txos(vec![DbReservedTxoActMod {
                 txid: ActiveValue::Set(first.clone()),
                 vout: ActiveValue::Set(0),
-                reserved_for_vanilla: ActiveValue::Set(None),
+                reserved_for_vanilla: ActiveValue::Set(Some(wallet_transaction)),
                 ..Default::default()
             }])
             .unwrap();
