@@ -1695,7 +1695,7 @@ pub trait WalletOnline: WalletOffline {
         let Some(txid) = &batch_transfer.txid else {
             return Ok(false);
         };
-        let tx = self.get_signed_tx(&self.get_transfer_dir(txid))?;
+        let tx = self.get_signed_tx(&self.get_transfer_dir(txid), txid)?;
         let inputs: HashSet<BdkOutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
         Ok(self.bdk_wallet().transactions().any(|wallet_tx| {
             wallet_tx.chain_position.is_confirmed()
@@ -1745,21 +1745,34 @@ pub trait WalletOnline: WalletOffline {
 
     /// The signed TX of an outgoing transfer, read from its signed PSBT for a transfer created by
     /// a previous version.
-    fn get_signed_tx(&self, transfer_dir: &Path) -> Result<BdkTransaction, Error> {
+    ///
+    /// ERA fork (to report upstream): the file must hold the TX `txid` names, else
+    /// [`Error::InvalidPsbt`]. Another one (a misplaced or restored file) would be broadcast,
+    /// spending coins this transfer never reserved, its fascia consumed as if that TX were its
+    /// witness, or, read to tell whether the transfer's inputs were spent elsewhere, fail a transfer
+    /// whose own TX can still confirm.
+    fn get_signed_tx(&self, transfer_dir: &Path, txid: &str) -> Result<BdkTransaction, Error> {
         let tx_file = transfer_dir.join(SIGNED_TX_FILE);
-        if tx_file.exists() {
+        let tx: BdkTransaction = if tx_file.exists() {
             let invalid = |e: String| Error::Internal {
                 details: format!("invalid signed TX: {e}"),
             };
             let tx_bytes = hex::decode(fs::read_to_string(tx_file)?.trim())
                 .map_err(|e| invalid(e.to_string()))?;
-            return bdk_wallet::bitcoin::consensus::encode::deserialize(&tx_bytes)
-                .map_err(|e| invalid(e.to_string()));
+            bdk_wallet::bitcoin::consensus::encode::deserialize(&tx_bytes)
+                .map_err(|e| invalid(e.to_string()))?
+        } else {
+            let psbt_str = fs::read_to_string(transfer_dir.join(SIGNED_PSBT_FILE))?;
+            Psbt::from_str(&psbt_str)?
+                .extract_tx()
+                .map_err(InternalError::from)?
+        };
+        if tx.compute_txid().to_string() != txid {
+            return Err(Error::InvalidPsbt {
+                details: s!("the signed TX of this transfer is for another TX"),
+            });
         }
-        let psbt_str = fs::read_to_string(transfer_dir.join(SIGNED_PSBT_FILE))?;
-        Ok(Psbt::from_str(&psbt_str)?
-            .extract_tx()
-            .map_err(InternalError::from)?)
+        Ok(tx)
     }
 
     /// Verify a downloaded blob against its expected plaintext hash, first decrypting it with the
@@ -4407,15 +4420,7 @@ pub trait WalletOnline: WalletOffline {
             .as_ref()
             .expect("batch transfer should have a TXID");
         let transfer_dir = self.get_transfers_dir().join(txid);
-        let signed_tx = self.get_signed_tx(&transfer_dir)?;
-        // ERA fork (to report upstream): the file must hold this transfer's TX. Another one (a
-        // misplaced or restored file) would be broadcast, spending coins this transfer never
-        // reserved, and this transfer's fascia would then be consumed as if it were its witness.
-        if signed_tx.compute_txid().to_string() != *txid {
-            return Err(Error::InvalidPsbt {
-                details: s!("the signed TX of this transfer is for another TX"),
-            });
-        }
+        let signed_tx = self.get_signed_tx(&transfer_dir, txid)?;
         let mut stock = self.rgb_stock(txn)?;
         let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
         self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
