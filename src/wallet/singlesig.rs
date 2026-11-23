@@ -301,6 +301,11 @@ impl Wallet {
         // reject settings the wallet wasn't created with before any of them reaches the database
         WalletManifest::check_settings_unchanged(&wallet_dir, &wallet_data, &keys)?;
 
+        // load a legacy filesystem RGB stock, if any, before anything in the wallet dir is
+        // written: one that cannot be migrated is refused with the wallet as it was (review S2)
+        let legacy_rgb_stock =
+            load_legacy_rgb_stock(&wallet_dir).map_err(|e| rgb_state_refusal(&wallet_dir, e))?;
+
         // setup rgb-lib DB
         let database = setup_db(&wallet_dir)?;
 
@@ -314,7 +319,9 @@ impl Wallet {
         )?;
 
         // migrate any legacy filesystem RGB data into the DB (one-time, no-op otherwise)
-        migrate_rgb_fs_to_db(&wallet_dir, &database)?;
+        migrate_rgb_fs_to_db(&wallet_dir, &database, legacy_rgb_stock)?;
+        // refuse a stock that misses the contract of an asset the DB lists (review S1)
+        check_rgb_stock_holds_assets(&database).map_err(|e| rgb_state_refusal(&wallet_dir, e))?;
 
         // keep the signing keys outside the BDK wallet
         let signers = if watch_only {

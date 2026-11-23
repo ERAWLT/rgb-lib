@@ -169,6 +169,7 @@ interface RgbLibError {
   RestClientBuild(string details);
   RestoredBackupInconsistent(string details);
   RgbInspection(string details);
+  RgbStockDamaged(string details, string kind);
   SignedTxCleared();
   TooHighInflationAmounts();
   TooHighIssuanceAmounts();

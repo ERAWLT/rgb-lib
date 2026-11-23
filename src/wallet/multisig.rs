@@ -1080,6 +1080,11 @@ impl MultisigWallet {
         let (wallet_dir, logger, _logger_guard) = setup_new_wallet(&wallet_data, &fingerprint)?;
         fs::create_dir_all(wallet_dir.join(HUB_OPS_DIR))?;
 
+        // load a legacy filesystem RGB stock, if any, before anything in the wallet dir is
+        // written: one that cannot be migrated is refused with the wallet as it was (review S2)
+        let legacy_rgb_stock =
+            load_legacy_rgb_stock(&wallet_dir).map_err(|e| rgb_state_refusal(&wallet_dir, e))?;
+
         // setup rgb-lib DB
         let database = setup_db(&wallet_dir)?;
 
@@ -1093,7 +1098,9 @@ impl MultisigWallet {
         )?;
 
         // migrate any legacy filesystem RGB data into the DB (one-time, no-op otherwise)
-        migrate_rgb_fs_to_db(&wallet_dir, &database)?;
+        migrate_rgb_fs_to_db(&wallet_dir, &database, legacy_rgb_stock)?;
+        // refuse a stock that misses the contract of an asset the DB lists (review S1)
+        check_rgb_stock_holds_assets(&database).map_err(|e| rgb_state_refusal(&wallet_dir, e))?;
 
         // setup RGB
         setup_rgb(

@@ -880,6 +880,15 @@ pub enum Error {
 
     /// The consistency check failed on a wallet that was just restored from a VSS backup,
     /// meaning the backup itself is inconsistent or older than other wallet state
+    ///
+    /// ERA fork (review S1/S2): with the `vss` feature this also comes from `Wallet::new`, not
+    /// only from `go_online`: a wallet whose restore marker is still there and whose RGB state
+    /// cannot be opened gets this instead of [`Error::RgbStockDamaged`], with `details`
+    /// `RGB state (<kind>): <details>`, the kind and the details of that error
+    /// ([`Error::rgb_stock_damage`] reads the kind back). That refusal is not a verdict on the
+    /// backup: a legacy stock may be intact and written by another version of rgb-ops, and then
+    /// a newer backup fails the same way, so the advice of this error's message to restore one
+    /// does not apply (see [`Error::RgbStockDamaged`]).
     #[error(
         "The restored VSS backup is inconsistent ({details}). The backup is likely stale or was \
          taken mid-operation; restore a newer backup or recover from the original wallet data."
@@ -894,6 +903,33 @@ pub enum Error {
     RgbInspection {
         /// Error details
         details: String,
+    },
+
+    /// ERA fork (review S1/S2): the wallet's RGB state cannot be opened, and the wallet is
+    /// refused rather than opened without it.
+    ///
+    /// From `Wallet::new`, for:
+    /// - a legacy filesystem stock (`rgb/stash.dat`, `state.dat`, `index.dat`, written by an
+    ///   rgb-lib before the stock moved into the database) that does not load or convert: a file
+    ///   missing (some but not all three, or none in a wallet that was set up), cut short, longer
+    ///   than its content, not decoding, or a legacy index that does not place an operation. It
+    ///   is checked before the wallet's database or BDK files are opened, so nothing in the
+    ///   wallet directory has been written and `rgb/` is left as it was;
+    /// - a stock in the database that misses the contract of an asset the database lists (an
+    ///   `rgb/` that vanished before its migration, or a database edited by hand). This is
+    ///   checked after the database is opened, so its schema migrations have run.
+    ///
+    /// Files written by another version of rgb-ops fail the same way while being intact. A host
+    /// keeps the directory; it may replace it with a backup only when it can rule out a format
+    /// change. A file the system refuses to read (permissions) is `IO`, not this. There is no
+    /// integrity check: a legacy file that still decodes is accepted as it is.
+    #[error("The wallet's RGB state cannot be opened ({kind}): {details}")]
+    RgbStockDamaged {
+        /// Which file or contract, and how
+        details: String,
+        /// One of the codes of [`RgbStockDamage`]: a hint for diagnostics, not a way to tell a
+        /// format change from damage (random corruption reads as `cut_short` too)
+        kind: String,
     },
 
     /// The proxy's registered signed TX for this operation was previously cleared
@@ -1108,6 +1144,10 @@ pub enum Error {
 // refused to complete an unrecorded spend
 const INCONSISTENCY_REASON_PREFIX: &str = "; reason=";
 
+// ERA fork (review S1/S2): what `details` of a RestoredBackupInconsistent starts with when
+// `Wallet::new` could not open the RGB state of a wallet just restored from a VSS backup
+pub(crate) const RESTORED_RGB_STATE_PREFIX: &str = "RGB state (";
+
 impl Error {
     /// ERA fork (CC-99): why the consistency check of `go_online` with
     /// `OnlineOptions::complete_unrecorded_spends` refused, as [`Error::Inconsistency`] or
@@ -1120,6 +1160,25 @@ impl Error {
             Error::Inconsistency { details } | Error::RestoredBackupInconsistent { details } => {
                 let (_, code) = details.rsplit_once(INCONSISTENCY_REASON_PREFIX)?;
                 InconsistencyReason::from_code(code)
+            }
+            _ => None,
+        }
+    }
+
+    /// ERA fork (review S1/S2): how the RGB state failed to open, from [`Error::RgbStockDamaged`]
+    /// or from the [`Error::RestoredBackupInconsistent`] that `Wallet::new` returns for it on a
+    /// wallet just restored from a VSS backup (`details` starting `RGB state (<kind>): `).
+    ///
+    /// `None` for every other error, including a restored backup that failed the consistency
+    /// check at `go_online`.
+    pub fn rgb_stock_damage(&self) -> Option<RgbStockDamage> {
+        match self {
+            Error::RgbStockDamaged { kind, .. } => RgbStockDamage::from_code(kind),
+            Error::RestoredBackupInconsistent { details } => {
+                let (kind, _) = details
+                    .strip_prefix(RESTORED_RGB_STATE_PREFIX)?
+                    .split_once("): ")?;
+                RgbStockDamage::from_code(kind)
             }
             _ => None,
         }
@@ -1138,6 +1197,61 @@ impl Error {
                 "{details}; spenders: {spenders:?}{INCONSISTENCY_REASON_PREFIX}{}",
                 reason.code()
             ),
+        }
+    }
+}
+
+/// ERA fork (review S1/S2): how the RGB state failed to open (the `kind` of
+/// [`Error::RgbStockDamaged`]). A diagnostic hint only: every kind can come from files another
+/// version of rgb-ops wrote as well as from damage. The codes are those of the fork's file stock
+/// (CC-101), which the bridge already maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RgbStockDamage {
+    /// A legacy stock file missing (some but not all three, or all three in a wallet that was set
+    /// up), or the contract of an asset missing from the stock
+    Missing,
+    /// A legacy file that runs out of bytes before its content ends
+    CutShort,
+    /// A legacy file with bytes after its content
+    Trailing,
+    /// A legacy file whose content does not decode, or a legacy stock that does not convert
+    Undecodable,
+    /// A legacy stock file that is not a regular file, or `rgb` that is not a directory (a
+    /// symbolic link is neither)
+    NotAFile,
+}
+
+impl RgbStockDamage {
+    /// The stable code of the kind.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RgbStockDamage::Missing => "missing",
+            RgbStockDamage::CutShort => "cut_short",
+            RgbStockDamage::Trailing => "trailing",
+            RgbStockDamage::Undecodable => "undecodable",
+            RgbStockDamage::NotAFile => "not_a_file",
+        }
+    }
+
+    /// The kind with this code, if any.
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            RgbStockDamage::Missing,
+            RgbStockDamage::CutShort,
+            RgbStockDamage::Trailing,
+            RgbStockDamage::Undecodable,
+            RgbStockDamage::NotAFile,
+        ]
+        .into_iter()
+        .find(|k| k.code() == code)
+    }
+
+    /// The error for this kind of refusal.
+    #[cfg(feature = "wallet")]
+    pub(crate) fn error(self, details: String) -> Error {
+        Error::RgbStockDamaged {
+            details,
+            kind: self.code().to_string(),
         }
     }
 }

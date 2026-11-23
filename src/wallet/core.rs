@@ -461,6 +461,27 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
     Ok(bdk_wallet)
 }
 
+/// ERA fork (review S1/S2): the refusal of a wallet whose RGB state cannot be opened, reported
+/// against the backup on a wallet just restored from a VSS backup, as the consistency check
+/// attributes an inconsistency. The kind goes along: a format change reads the same as a torn
+/// backup (see [`Error::rgb_stock_damage`]).
+pub(crate) fn rgb_state_refusal(_wallet_dir: &Path, e: Error) -> Error {
+    #[cfg(feature = "vss")]
+    if let Error::RgbStockDamaged { details, kind } = &e
+        && _wallet_dir
+            .join(crate::wallet::vss::VSS_RESTORE_MARKER)
+            .exists()
+    {
+        return Error::RestoredBackupInconsistent {
+            details: format!(
+                "{}{kind}): {details}",
+                crate::error::RESTORED_RGB_STATE_PREFIX
+            ),
+        };
+    }
+    e
+}
+
 pub(crate) fn setup_new_wallet(
     wallet_data: &WalletData,
     fingerprint: &str,

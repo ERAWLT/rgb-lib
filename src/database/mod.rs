@@ -407,6 +407,14 @@ impl DbTxn {
         Ok(res)
     }
 
+    /// ERA fork (review S1, tests): delete every contract genesis of the stock, as a stock that
+    /// lost its contracts holds none.
+    #[cfg(test)]
+    pub(crate) fn del_rgb_geneses(&self) -> Result<(), Error> {
+        block_on(entities::rgb_genesis::Entity::delete_many().exec(self.inner()))?;
+        Ok(())
+    }
+
     /// ERA fork (CC-99, tests): a digest of the RGB stock's content (bundles, witnesses and their
     /// ordering, assignments, outpoint index), without row indexes, so that two wallets holding
     /// the same transitions compare equal.

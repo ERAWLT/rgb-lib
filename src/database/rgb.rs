@@ -1319,21 +1319,69 @@ impl RgbStore for &DbTxn {
 }
 
 #[cfg(feature = "rgb_fs_store_migration")]
-pub(crate) use legacy::migrate_rgb_fs_to_db;
+pub(crate) use legacy::{load_legacy_rgb_stock, migrate_rgb_fs_to_db};
+
+/// ERA fork (review S2): without the `rgb_fs_store_migration` feature there is no legacy stock to
+/// load: a wallet still holding one is refused by [`check_rgb_stock_holds_assets`] when its
+/// database lists assets.
+#[cfg(not(feature = "rgb_fs_store_migration"))]
+pub(crate) struct LegacyRgbStock;
+
+#[cfg(not(feature = "rgb_fs_store_migration"))]
+pub(crate) fn load_legacy_rgb_stock(_wallet_dir: &Path) -> Result<LegacyRgbStock, Error> {
+    Ok(LegacyRgbStock)
+}
 
 #[cfg(not(feature = "rgb_fs_store_migration"))]
 pub(crate) fn migrate_rgb_fs_to_db(
     _wallet_dir: &Path,
     _database: &RgbLibDatabase,
+    _legacy: LegacyRgbStock,
 ) -> Result<(), Error> {
     Ok(())
+}
+
+/// ERA fork (review S1): refuse a stock that misses the contract of an asset the database lists.
+///
+/// On this base the stock and the asset rows are written by the same database transactions, so a
+/// wallet that is not refused here holds the contract of every asset it lists. One that is
+/// refused lost its RGB state some other way: an old fork's `rgb/` that vanished before it was
+/// migrated (neither `rgb/` nor `rgb.deleting/` is there, so the migration has nothing to do and
+/// the wallet would otherwise open with no contracts), or a database edited by hand. Read-only.
+pub(crate) fn check_rgb_stock_holds_assets(database: &RgbLibDatabase) -> Result<(), Error> {
+    let txn = database.begin_transaction()?;
+    let mut missing = vec![];
+    for asset in txn.iter_assets()? {
+        let contract_id = ContractId::from_str(&asset.id).map_err(|e| Error::Internal {
+            details: format!("asset {} has an invalid ID: {e}", asset.id),
+        })?;
+        if txn.get_genesis(&enc(&contract_id)?)?.is_none() {
+            missing.push(asset.id);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let total = missing.len();
+    missing.truncate(3);
+    Err(RgbStockDamage::Missing.error(format!(
+        "the stock has no contract for {total} asset(s) of the database: {}{}",
+        missing.join(", "),
+        if total > missing.len() { ", ..." } else { "" }
+    )))
 }
 
 #[cfg(feature = "rgb_fs_store_migration")]
 mod legacy {
     use super::*;
 
+    use std::io::ErrorKind;
+
+    use rgbstd::persistence::{MemIndexV0, MemStashV0, MemStateV0};
+    use strict_encoding::DecodeError;
+
     use crate::utils::{atomic_write_with, sync_dir};
+    use crate::wallet::core::WALLET_MANIFEST_FILE;
     use crate::wallet::utils::{RGB_RUNTIME_DIR, write_fascia};
     use crate::wallet::{ASSETS_DIR, FASCIA_FILE, TRANSFERS_DIR, UNSIGNED_PSBT_FILE};
 
@@ -1346,28 +1394,249 @@ mod legacy {
     /// below this: the cap only bounds the walk of a tree that has been tampered with.
     const MAX_LEGACY_ENTRIES: usize = 100_000;
 
-    /// One-time migration of the legacy filesystem RGB store and of the legacy
-    /// consignment files.
+    /// The files of a legacy stock, in the order rgb-ops loads them.
+    const LEGACY_STOCK_FILES: [&str; 3] = ["stash.dat", "state.dat", "index.dat"];
+
+    /// Where the old fork's file stock (CC-101) made a new stock before renaming it into place,
+    /// next to `rgb/`. One left behind is a creation that died before its rename: an empty stock,
+    /// never migrated, swept after the migration.
+    const LEGACY_STOCK_STAGING_DIR: &str = "rgb.new";
+
+    /// The lock file of the old fork's RGB runtime, which a process killed while the runtime was
+    /// open leaves behind. Nothing on this base reads it: swept with the legacy store.
+    const LEGACY_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
+
+    /// Sweep what the legacy store leaves next to it once it is retired: failing to is not fatal,
+    /// none of it is read.
+    fn sweep_legacy_leftovers(wallet_dir: &Path) {
+        let _ = fs::remove_dir_all(wallet_dir.join(RGB_RUNTIME_DELETING_DIR));
+        let _ = fs::remove_dir_all(wallet_dir.join(LEGACY_STOCK_STAGING_DIR));
+        let _ = fs::remove_file(wallet_dir.join(LEGACY_RUNTIME_LOCK_FILE));
+    }
+
+    /// ERA fork (review S2): what [`load_legacy_rgb_stock`] found in the wallet dir, loaded and
+    /// converted before anything there is written.
+    pub(crate) enum LegacyRgbStock {
+        /// No `rgb/`: nothing to migrate
+        Absent,
+        /// An `rgb/` holding none of the stock's files, in a wallet whose set-up never finished
+        /// (no manifest: an old fork's creation that died before its stock was renamed into
+        /// place): nothing to migrate, the dir is retired
+        Empty,
+        /// A stock to migrate
+        Stock(Box<LegacyStock>),
+    }
+
+    pub(crate) struct LegacyStock {
+        stash: MemStashV0,
+        state: MemStateV0,
+        index: MemIndexV0,
+        // the stash's witnesses, converted
+        witnesses: Vec<SealWitness>,
+        // the contract of every terminal's operation
+        terminals: Vec<(ContractId, SecretSeal, Opout)>,
+    }
+
+    /// Why a legacy stock file could not be loaded: a file that is not a whole stock file this
+    /// rgb-ops reads is [`Error::RgbStockDamaged`], one the system refuses to read is `IO`.
+    fn load_failure(name: &str, e: DeserializeError) -> Error {
+        match e {
+            DeserializeError::Decode(DecodeError::Io(io)) => match io.kind() {
+                ErrorKind::UnexpectedEof => {
+                    RgbStockDamage::CutShort.error(format!("{name} is cut short"))
+                }
+                ErrorKind::NotFound => RgbStockDamage::Missing.error(format!("{name} is missing")),
+                _ => Error::IO {
+                    details: format!("{RGB_RUNTIME_DIR}/{name}: {io}"),
+                },
+            },
+            DeserializeError::DataNotEntirelyConsumed => {
+                RgbStockDamage::Trailing.error(format!("{name} is longer than its content"))
+            }
+            DeserializeError::Decode(e) => {
+                RgbStockDamage::Undecodable.error(format!("{name} does not decode: {e}"))
+            }
+        }
+    }
+
+    /// ERA fork (review S2): load and convert the legacy filesystem RGB stock of `wallet_dir`,
+    /// reading only, so that `Wallet::new` refuses a stock that cannot be migrated before it opens
+    /// the database (whose schema migrations would run) or imports the legacy BDK store (which
+    /// deletes its file).
+    ///
+    /// A symbolic link is refused, whether `rgb` or a stock file. Some but not all of the three
+    /// files is [`RgbStockDamage::Missing`]; none of them is too in a wallet that was set up (it
+    /// has a manifest), as in the old fork's file stock. A `.new` file its stores left inside
+    /// `rgb/` is not read: the file next to it is the version that was completely written.
+    pub(crate) fn load_legacy_rgb_stock(wallet_dir: &Path) -> Result<LegacyRgbStock, Error> {
+        let rgb_dir = wallet_dir.join(RGB_RUNTIME_DIR);
+        match fs::symlink_metadata(&rgb_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(
+                    RgbStockDamage::NotAFile.error(format!("{RGB_RUNTIME_DIR} is a symbolic link"))
+                );
+            }
+            Ok(_) => {
+                return Err(
+                    RgbStockDamage::NotAFile.error(format!("{RGB_RUNTIME_DIR} is not a directory"))
+                );
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(LegacyRgbStock::Absent),
+            Err(e) => {
+                return Err(Error::IO {
+                    details: format!("{RGB_RUNTIME_DIR}: {e}"),
+                });
+            }
+        }
+        let mut missing = vec![];
+        for name in LEGACY_STOCK_FILES {
+            match fs::symlink_metadata(rgb_dir.join(name)) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(metadata) if metadata.is_symlink() => {
+                    return Err(
+                        RgbStockDamage::NotAFile.error(format!("{name} is a symbolic link"))
+                    );
+                }
+                Ok(_) => {
+                    return Err(RgbStockDamage::NotAFile.error(format!("{name} is not a file")));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => missing.push(name),
+                Err(e) => {
+                    return Err(Error::IO {
+                        details: format!("{RGB_RUNTIME_DIR}/{name}: {e}"),
+                    });
+                }
+            }
+        }
+        if missing.len() == LEGACY_STOCK_FILES.len() {
+            let set_up = !matches!(
+                fs::symlink_metadata(wallet_dir.join(WALLET_MANIFEST_FILE)),
+                Err(e) if e.kind() == ErrorKind::NotFound
+            );
+            if set_up {
+                return Err(RgbStockDamage::Missing
+                    .error(s!("no stock file for a wallet that was already set up")));
+            }
+            return Ok(LegacyRgbStock::Empty);
+        }
+        if !missing.is_empty() {
+            return Err(RgbStockDamage::Missing.error(format!("{} missing", missing.join(", "))));
+        }
+
+        let store = LegacyFsStore::new(rgb_dir);
+        let stash = store
+            .load_stash_v0()
+            .map_err(|e| load_failure(LEGACY_STOCK_FILES[0], e))?;
+        let state = store
+            .load_state_v0()
+            .map_err(|e| load_failure(LEGACY_STOCK_FILES[1], e))?;
+        let index = store
+            .load_index_v0()
+            .map_err(|e| load_failure(LEGACY_STOCK_FILES[2], e))?;
+        let undecodable = |details: String| RgbStockDamage::Undecodable.error(details);
+
+        let mut witnesses = Vec::with_capacity(stash.witnesses().len());
+        for (txid, witness) in stash.witnesses().iter() {
+            // a legacy witness may hold only the txid of its transaction, which cannot be resolved
+            // here (no network access while opening the wallet)
+            witnesses.push(witness.clone().into_v1(None).map_err(|e| {
+                undecodable(format!("legacy RGB witness {txid} does not convert: {e}"))
+            })?);
+        }
+
+        // an entry's validity is decided through its bundle, so one stored without a bundle would
+        // read as genesis state, which is always valid. A transition the legacy index cannot place
+        // in a bundle means that index is inconsistent, so refuse rather than migrate the entry as
+        // if it came from the genesis
+        for (contract_id, mcs) in state.contracts().iter() {
+            for global in mcs.global().values() {
+                for out in global.known().keys() {
+                    if matches!(out.op_witness, OpWitness::Transition(..))
+                        && !index.op_bundle_index().contains_key(&out.opid)
+                    {
+                        return Err(undecodable(format!(
+                            "legacy RGB index has no bundle for operation {} of contract \
+                             {contract_id}",
+                            out.opid
+                        )));
+                    }
+                }
+            }
+        }
+
+        // the legacy terminal index is not contract-scoped, so the contract is resolved through the
+        // opout's operation: for a transition, through its bundle; for a genesis - which has no
+        // bundle, and which the legacy index fed terminals from just like a transition - through
+        // the genesis itself. An opout that is neither means the legacy index is inconsistent, so
+        // refuse rather than migrate a wallet that silently cannot match a blinded receive
+        let genesis_contracts: HashMap<OpId, ContractId> = stash
+            .geneses()
+            .iter()
+            .map(|(contract_id, genesis)| (genesis.id(), *contract_id))
+            .collect();
+        let mut terminals = vec![];
+        for (secret_seal, opouts) in index.terminal_index().iter() {
+            for opout in opouts.iter() {
+                let contract_id = index
+                    .op_bundle_index()
+                    .get(&opout.op)
+                    .and_then(|bundle_id| index.bundle_contract_index().get(bundle_id))
+                    .or_else(|| genesis_contracts.get(&opout.op))
+                    .ok_or_else(|| {
+                        undecodable(format!(
+                            "legacy RGB index has no contract for operation {} of secret seal \
+                             {secret_seal}",
+                            opout.op
+                        ))
+                    })?;
+                terminals.push((*contract_id, *secret_seal, *opout));
+            }
+        }
+
+        Ok(LegacyRgbStock::Stock(Box::new(LegacyStock {
+            stash,
+            state,
+            index,
+            witnesses,
+            terminals,
+        })))
+    }
+
+    /// One-time migration of the legacy filesystem RGB store, loaded by [`load_legacy_rgb_stock`],
+    /// and of the legacy consignment files.
     pub(crate) fn migrate_rgb_fs_to_db(
         wallet_dir: &Path,
         database: &RgbLibDatabase,
+        legacy: LegacyRgbStock,
     ) -> Result<(), Error> {
         let rgb_dir = wallet_dir.join(RGB_RUNTIME_DIR);
-        if !rgb_dir.exists() {
-            // finish the job of a run that crashed after retiring the legacy store (the rename
-            // below, which is what makes the migration complete) but before deleting it. Failing
-            // to delete is not fatal here either, for the same reason as below
-            let _ = fs::remove_dir_all(wallet_dir.join(RGB_RUNTIME_DELETING_DIR));
-            return Ok(());
-        }
-
-        let store = LegacyFsStore::new(rgb_dir.clone());
-        let load_err = |what: &str, e: DeserializeError| Error::Internal {
-            details: format!("cannot load legacy RGB {what}: {e}"),
+        let deleting_dir = wallet_dir.join(RGB_RUNTIME_DELETING_DIR);
+        let legacy = match legacy {
+            LegacyRgbStock::Absent => {
+                // finish the job of a run that crashed after retiring the legacy store (the rename
+                // below, which is what makes the migration complete) but before deleting it.
+                // Failing to delete is not fatal here either, for the same reason as below
+                sweep_legacy_leftovers(wallet_dir);
+                return Ok(());
+            }
+            LegacyRgbStock::Empty => {
+                // nothing to migrate: retire the dir as a migrated one, so that the next open
+                // (with a manifest by then) does not take it for a stock that went missing
+                fs::rename(&rgb_dir, &deleting_dir)?;
+                sync_dir(wallet_dir)?;
+                sweep_legacy_leftovers(wallet_dir);
+                return Ok(());
+            }
+            LegacyRgbStock::Stock(legacy) => legacy,
         };
-        let stash = store.load_stash_v0().map_err(|e| load_err("stash", e))?;
-        let state = store.load_state_v0().map_err(|e| load_err("state", e))?;
-        let index = store.load_index_v0().map_err(|e| load_err("index", e))?;
+        let LegacyStock {
+            stash,
+            state,
+            index,
+            witnesses,
+            terminals,
+        } = *legacy;
 
         let txn = database.begin_transaction()?;
         let mut store: &DbTxn = &txn;
@@ -1381,13 +1650,8 @@ mod legacy {
         for bundle in stash.bundles().values() {
             store.put_bundle(bundle)?;
         }
-        for (txid, witness) in stash.witnesses().iter() {
-            // a legacy witness may hold only the txid of its transaction, which cannot be resolved
-            // here (no network access while opening the wallet)
-            let witness = witness.clone().into_v1(None).map_err(|e| Error::Internal {
-                details: format!("cannot migrate legacy RGB witness {txid}: {e}"),
-            })?;
-            store.put_witness(&witness)?;
+        for witness in &witnesses {
+            store.put_witness(witness)?;
         }
         for graph_seal in stash.secret_seals().iter() {
             store.put_secret_seal(graph_seal, graph_seal.conceal())?;
@@ -1408,11 +1672,7 @@ mod legacy {
                 for (out, data) in global.known().iter() {
                     let (bundle_id, transition_type) = match out.op_witness {
                         OpWitness::Genesis => (None, None),
-                        // an entry's validity is decided through its bundle, so one stored
-                        // without a bundle would read as genesis state, which is always valid.
-                        // A transition the legacy index cannot place in a bundle means that
-                        // index is inconsistent, so stop rather than migrate the entry as if it
-                        // came from the genesis
+                        // placed in a bundle by load_legacy_rgb_stock's check
                         OpWitness::Transition(_, transition_type) => {
                             let Some(bundle_id) = index.op_bundle_index().get(&out.opid).copied()
                             else {
@@ -1458,31 +1718,9 @@ mod legacy {
                 }
             }
         }
-        // the legacy terminal index is not contract-scoped, so the contract is resolved through the
-        // opout's operation: for a transition, through its bundle; for a genesis - which has no
-        // bundle, and which the legacy index fed terminals from just like a transition - through
-        // the genesis itself. An opout that is neither means the legacy index is inconsistent, so
-        // stop rather than migrate a wallet that silently cannot match a blinded receive
-        let genesis_contracts: HashMap<OpId, ContractId> = stash
-            .geneses()
-            .iter()
-            .map(|(contract_id, genesis)| (genesis.id(), *contract_id))
-            .collect();
-        for (secret_seal, opouts) in index.terminal_index().iter() {
-            for opout in opouts.iter() {
-                let contract_id = index
-                    .op_bundle_index()
-                    .get(&opout.op)
-                    .and_then(|bundle_id| index.bundle_contract_index().get(bundle_id))
-                    .or_else(|| genesis_contracts.get(&opout.op))
-                    .ok_or_else(|| Error::Internal {
-                        details: format!(
-                            "legacy RGB index has no contract for operation {} of secret seal {secret_seal}",
-                            opout.op
-                        ),
-                    })?;
-                store.put_secret_opout(*contract_id, *secret_seal, *opout)?;
-            }
+        // resolved to their contracts by load_legacy_rgb_stock
+        for (contract_id, secret_seal, opout) in terminals {
+            store.put_secret_opout(contract_id, secret_seal, opout)?;
         }
         for (opid, bundle_id) in index.op_bundle_index().iter() {
             store.put_op_bundle(*opid, *bundle_id)?;
@@ -1513,7 +1751,6 @@ mod legacy {
         // goes through a rename so that retiring the store is atomic: a crash mid-delete cannot
         // leave a partially-deleted `rgb` dir for the next open to migrate again (which would fail
         // to load it), only a leftover retired dir that the next open sweeps up
-        let deleting_dir = wallet_dir.join(RGB_RUNTIME_DELETING_DIR);
         fs::rename(&rgb_dir, &deleting_dir)?;
         // fsync the wallet dir so the rename (our "already migrated" marker) is durable: the DB
         // writes above are upserts, so a re-run after a power loss that kept later DB commits but
@@ -1521,8 +1758,8 @@ mod legacy {
         sync_dir(wallet_dir)?;
         // the migration is complete and durable by now, so a delete that fails must not fail the
         // wallet open: the leftover is never read and stays out of backups, and the next open
-        // tries again
-        let _ = fs::remove_dir_all(&deleting_dir);
+        // tries again. The old fork's staging dir (review N6) holds at most an empty stock
+        sweep_legacy_leftovers(wallet_dir);
 
         Ok(())
     }
