@@ -696,9 +696,9 @@ mod get_asset_balance;
 mod get_asset_metadata;
 #[cfg(feature = "electrum")]
 mod get_btc_balance;
-// ERA fork: Wallet::get_colored_address and the sync that sees a payment to it
-// (era_beta8_pending: runs on the scripted chain)
-#[cfg(all(feature = "esplora", era_beta8_pending))]
+// ERA fork: Wallet::get_colored_address and the sync that sees a payment to it, on the scripted
+// chain
+#[cfg(feature = "esplora")]
 mod get_colored_address;
 #[cfg(feature = "_online")]
 mod get_fee_estimation;
@@ -756,8 +756,8 @@ mod sign_psbt;
 mod sync;
 #[cfg(feature = "electrum")]
 mod validate_consignment;
-// ERA fork: CC-99 (era_beta8_pending: runs on the scripted chain)
-#[cfg(all(feature = "esplora", era_beta8_pending))]
+// ERA fork: CC-99, CC-115 and L4b, on the scripted chain
+#[cfg(feature = "esplora")]
 mod unrecorded_spends;
 #[cfg(feature = "electrum")]
 mod witness_receive;

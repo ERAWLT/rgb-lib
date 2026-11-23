@@ -64,10 +64,12 @@ fn lists_envelope(wallet: &mut Wallet, online: Online, txid: &str, sync: bool) -
 fn blind_receive(wallet: &mut Wallet, chain: &ScriptedChain) -> Result<ReceiveData, Error> {
     wallet.blind_receive(
         None,
+        None,
         Assignment::Any,
         default_rcv_expiration(),
         vec![chain.proxy_endpoint()],
         MIN_CONFIRMATIONS,
+        None,
     )
 }
 
@@ -154,9 +156,11 @@ fn the_fast_sync_asks_about_the_addresses_handed_out_only() {
     let mut wallet = get_test_wallet(false, None);
     let online = wallet.go_online(online_options(&chain)).unwrap();
     {
-        let (bdk_wallet, bdk_db) = wallet.bdk_wallet_db_mut();
-        bdk_wallet.reveal_next_address(KeychainKind::External);
-        bdk_wallet.persist(bdk_db).unwrap();
+        wallet
+            .bdk_wallet_mut()
+            .reveal_next_address(KeychainKind::External);
+        let txn = wallet.database().begin_transaction().unwrap();
+        wallet.persist_and_commit(txn).unwrap();
     }
     assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
 
@@ -221,34 +225,8 @@ fn the_colored_payment_sync_refuses_another_address() {
         assert!(chain.requests().is_empty());
     }
 }
-
-/// Under `reuse_addresses` the pinned colored address is rgb-lib's change as well: it is not
-/// watched, and none can be named.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-#[test]
-#[parallel]
-fn nothing_is_watched_with_reuse_addresses() {
-    let chain = ScriptedChain::start();
-    create_test_data_dir();
-    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let mut wallet = Wallet::new(
-        WalletData {
-            data_dir: get_test_data_dir_string(),
-            bitcoin_network: BitcoinNetwork::Regtest,
-            database_type: DatabaseType::Sqlite,
-            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-            supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: true,
-        },
-        SinglesigKeys::from_keys_no_mnemonic(&keys, None),
-    )
-    .unwrap();
-    let online = wallet.go_online(online_options(&chain)).unwrap();
-    let address = wallet.get_colored_address().unwrap();
-    assert_eq!(fast_sync_lookups(&mut wallet, online, &chain), 0);
-    let result = wallet.sync_colored_payments(online, vec![address]);
-    assert_matches!(result, Err(Error::InvalidAddress { .. }));
-}
+// ERA fork, beta.8: nothing_is_watched_with_reuse_addresses is not carried: this base has no
+// address reuse (UTEXO's reuse_addresses)
 
 /// `go_online` scans the colored keychain in full: a payment made while the wallet was closed is
 /// there once it is back online, with no sync of its own.
