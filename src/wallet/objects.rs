@@ -221,7 +221,12 @@ pub struct OnlineOptions {
     /// why), [`Error::UnrecordedSpendUnseen`], [`Error::UnrecordedSpend`] or the indexer's
     /// error.
     ///
-    /// `false` (the default, and what a missing field deserializes to) keeps upstream's check.
+    /// `false` (the default, and what a missing field deserializes to) keeps upstream's check,
+    /// save one excuse (D63): the spend of an outgoing transfer still `Initiated` by its own
+    /// transaction (matched by TXID) passes, as upstream passes one of a transfer waiting for its
+    /// counterparty, since on RGB proxy protocol 1.0 a `send_end` that did not commit leaves the
+    /// transfer `Initiated` while its recipient broadcasts the released transaction; the
+    /// transfer's `*_end`, called again, ends it. With this set, that spend is the completion's.
     /// Ignored with `skip_consistency_check`, and on multisig and MPC wallets. The contract is
     /// described in the fork's `ERA.md`.
     #[serde(default)]
