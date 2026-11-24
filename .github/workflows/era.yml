@@ -238,9 +238,11 @@ jobs:
       # restore backups an older rev wrote (src/wallet/test/fixtures). The
       # scripted-chain ones fund, issue, send and settle on an in-memory chain
       # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs),
-      # and so do the CC-99 ones (unrecorded spends). era_test_count.sh puts the
-      # counts and any failure in the run's annotations (readable without the
-      # log) and fails the step unless the CC-99 module ran all its tests.
+      # and so do the CC-99 ones (unrecorded spends) and the S2 ones (an EVM
+      # chain left out of the session, mockito endpoints). era_test_count.sh
+      # puts the counts and any failure in the run's annotations (readable
+      # without the log) and fails the step unless the CC-99 and the S2
+      # modules ran all their tests.
       - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets, scripted chain)
         env:
           SKIP_INIT: "1"
@@ -255,9 +257,12 @@ jobs:
             api::reject_list:: api::evm:: \
             wallet::test::scripted_chain:: wallet::test::unrecorded_spends:: \
             wallet::test::get_colored_address:: wallet::test::forwarder_v1:: \
+            wallet::test::evm_unavailable:: \
             database::rgb:: 2>&1 | tee unit-tests.log || status=$?
           .github/scripts/era_test_count.sh unit-tests.log unit \
             'wallet::test::unrecorded_spends::' 58 || status=1
+          .github/scripts/era_test_count.sh unit-tests.log unit-s2 \
+            'wallet::test::evm_unavailable::' 8 || status=1
           exit "$status"
 
       # Carried from the previous base, not yet ported to beta.8 (RGB proxy
@@ -290,7 +295,9 @@ jobs:
   # the app goes online: a lost donation and a lost drain completed by
   # go_online (CC-99), the interrupted protocol-1.0 send with the completion
   # and without it (D63), a send the proxy_v1 migration failed with its TX on
-  # chain (N5), and a replaced payment of envelopes (CC-115).
+  # chain (N5), a replaced payment of envelopes (CC-115), and a transfer of a
+  # minted BFA asset received while the EVM endpoint is down, settled once it
+  # is back (S2).
   # era_test_count.sh puts the counts and any failure in the run's
   # annotations (the log needs admin rights) and fails the step unless every
   # era_regtest test ran and passed.
@@ -324,7 +331,7 @@ jobs:
             wallet::test::migrate:: wallet::test::era_regtest:: \
             2>&1 | tee regtest-tests.log || status=$?
           .github/scripts/era_test_count.sh regtest-tests.log era-regtest \
-            'wallet::test::era_regtest::' 6 || status=1
+            'wallet::test::era_regtest::' 7 || status=1
           exit "$status"
       - name: Stop the regtest services
         if: always()

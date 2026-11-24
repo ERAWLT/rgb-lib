@@ -113,6 +113,7 @@ impl Services {
             vanilla_sync_lookback: 1,
             forwarder_url,
             complete_unrecorded_spends: false,
+            defer_unavailable_evm_chains: false,
         }
     }
 
@@ -1122,6 +1123,7 @@ impl Session {
             vanilla_sync_lookback: 1,
             forwarder_url: Some(format!("{}/{secret}/rgb", self.server.url())),
             complete_unrecorded_spends: false,
+            defer_unavailable_evm_chains: false,
         }
     }
 }

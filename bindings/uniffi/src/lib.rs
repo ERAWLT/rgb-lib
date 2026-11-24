@@ -95,6 +95,7 @@ pub struct OnlineOptions {
     // ERA fork
     pub forwarder_url: Option<String>,
     pub complete_unrecorded_spends: bool,
+    pub defer_unavailable_evm_chains: bool,
 }
 impl From<OnlineOptions> for RgbLibOnlineOptions {
     fn from(orig: OnlineOptions) -> Self {
@@ -107,6 +108,7 @@ impl From<OnlineOptions> for RgbLibOnlineOptions {
             evm_chains: orig.evm_chains,
             forwarder_url: orig.forwarder_url,
             complete_unrecorded_spends: orig.complete_unrecorded_spends,
+            defer_unavailable_evm_chains: orig.defer_unavailable_evm_chains,
         }
     }
 }

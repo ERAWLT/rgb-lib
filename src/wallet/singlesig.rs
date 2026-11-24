@@ -1346,6 +1346,51 @@ impl Wallet {
             .unwrap_or_default()
     }
 
+    /// ERA fork (S2): the EVM chains left out of the session because their endpoint failed its
+    /// check (`OnlineOptions::defer_unavailable_evm_chains`), sorted by chain ID.
+    ///
+    /// What needs one of them meets [`Error::NoEvmRpcUrl`]: a received consignment that needs it
+    /// stays pending, a send that needs it fails before anything is written. Empty while the
+    /// wallet is offline, and when every configured chain is in use. Each `go_online` replaces it,
+    /// and a refresh or [`check_unavailable_evm_chains`](Wallet::check_unavailable_evm_chains)
+    /// that finds a chain back removes it.
+    pub fn unavailable_evm_chains(&self) -> Vec<UnavailableEvmChain> {
+        let mut chains: Vec<UnavailableEvmChain> = self
+            .online_data()
+            .as_ref()
+            .map(|online_data| {
+                online_data
+                    .unavailable_evm_chains
+                    .iter()
+                    .map(|(chain_id, (_, details))| UnavailableEvmChain {
+                        chain_id: *chain_id,
+                        details: details.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        chains.sort_by_key(|chain| chain.chain_id);
+        chains
+    }
+
+    /// ERA fork (S2): check again the EVM chains left out of the session
+    /// (`OnlineOptions::defer_unavailable_evm_chains`), using from now on each one whose endpoint
+    /// now passes its check, and return the ones still left out (as
+    /// [`unavailable_evm_chains`](Wallet::unavailable_evm_chains)).
+    ///
+    /// A refresh with an incoming transfer to process does this itself; a host calls it before an
+    /// operation that needs a chain, such as a send of an asset whose reject list an EVM contract
+    /// keeps. Nothing is asked when no chain is left out. A failed check is not an error: the
+    /// chain stays left out, with the new error's text.
+    pub fn check_unavailable_evm_chains(
+        &mut self,
+        online: Online,
+    ) -> Result<Vec<UnavailableEvmChain>, Error> {
+        self.check_online(online)?;
+        self.check_unavailable_evm_chains_impl();
+        Ok(self.unavailable_evm_chains())
+    }
+
     /// Send bitcoin funds to the provided address.
     ///
     /// This calls [`drain_to_begin`](Wallet::drain_to_begin), signs the resulting PSBT and finally

@@ -1174,6 +1174,7 @@ pub(crate) fn online_options(chain: &ScriptedChain) -> OnlineOptions {
         evm_chains: HashMap::new(),
         forwarder_url: None,
         complete_unrecorded_spends: false,
+        defer_unavailable_evm_chains: false,
     }
 }
 

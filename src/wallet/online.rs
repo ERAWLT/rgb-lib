@@ -269,6 +269,21 @@ fn invoice_expiration_margin() -> u32 {
     INVOICE_EXPIRATION_MARGIN_SECS
 }
 
+/// The EVM chains a wallet goes online with, by chain ID, and (ERA fork, S2) the ones left out of
+/// the session for an endpoint that failed its check, with the error's text.
+type CheckedEvmChains = (HashMap<u64, EvmChain>, HashMap<u64, (EvmChain, String)>);
+
+/// ERA fork (S2): whether an error of the check of an EVM chain is the endpoint's (down, not an EVM
+/// JSON-RPC server, on another chain, not serving the finalized state), which
+/// `OnlineOptions::defer_unavailable_evm_chains` leaves out of the session, and not the host's
+/// configuration or the client's.
+fn is_evm_endpoint_failure(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::InvalidEvmRpcUrl { .. } | Error::EvmChainIdMismatch { .. } | Error::Network { .. }
+    )
+}
+
 /// The RPC URLs of the given EVM chains, by chain ID.
 fn evm_rpc_urls(evm_chains: &HashMap<u64, EvmChain>) -> HashMap<u64, String> {
     evm_chains
@@ -1483,19 +1498,20 @@ pub trait WalletOnline: WalletOffline {
         self.indexer().fee_estimation(blocks)
     }
 
-    /// The EVM chains to go online with, by chain ID, if the wallet supports bridged assets.
+    /// The EVM chains to go online with, by chain ID, if the wallet supports bridged assets, and
+    /// (ERA fork, S2) the ones left out of the session for an endpoint that failed its check,
+    /// with the error's text, when `OnlineOptions::defer_unavailable_evm_chains` is set.
     ///
     /// Each endpoint is checked to be a working EVM JSON-RPC server on the chain it is
     /// configured for: one on another chain would report meaningless block numbers and locks
     /// for the bridges living on the configured one. It is also checked to serve what confirming
     /// mint locks needs (see [`EvmClient::check_mint_support`]).
-    fn check_evm_chains(
-        &self,
-        online_options: &OnlineOptions,
-    ) -> Result<HashMap<u64, EvmChain>, Error> {
+    fn check_evm_chains(&self, online_options: &OnlineOptions) -> Result<CheckedEvmChains, Error> {
         if !self.supports_schema(&AssetSchema::Bfa) {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), HashMap::new()));
         }
+        // ERA fork: the host's own configuration is checked for every chain before any endpoint
+        // is asked anything, so its mistake fails go_online whatever an endpoint answers
         for (chain_id, evm_chain) in &online_options.evm_chains {
             // with a higher minimum than maximum, no block could be committed to when minting
             if evm_chain.min_mint_lock_blocks > evm_chain.max_mint_lock_blocks {
@@ -1507,25 +1523,102 @@ pub trait WalletOnline: WalletOffline {
                     ),
                 });
             }
-            let evm_rpc_url = &evm_chain.rpc_url;
-            let evm_client = EvmClient::new(evm_rpc_url)?;
-            let actual = evm_client.chain_id().map_err(|e| Error::InvalidEvmRpcUrl {
-                details: e.to_string(),
-            })?;
-            if actual != *chain_id {
-                return Err(Error::EvmChainIdMismatch {
-                    expected: *chain_id,
-                    actual,
-                });
-            }
-            evm_client.check_mint_support()?;
-            debug!(
-                self.logger(),
-                "EVM RPC endpoint for chain ID {chain_id}: {}",
-                evm_client.endpoint()
-            );
         }
-        Ok(online_options.evm_chains.clone())
+        let mut available = HashMap::new();
+        let mut unavailable = HashMap::new();
+        for (chain_id, evm_chain) in &online_options.evm_chains {
+            match self.check_evm_chain(*chain_id, evm_chain) {
+                Ok(()) => {
+                    available.insert(*chain_id, evm_chain.clone());
+                }
+                // ERA fork (S2): an endpoint that is down or answers wrongly is left out of the
+                // session, as if the chain were not configured, instead of failing go_online
+                Err(e)
+                    if online_options.defer_unavailable_evm_chains
+                        && is_evm_endpoint_failure(&e) =>
+                {
+                    warn!(
+                        self.logger(),
+                        "EVM chain ID {chain_id} left out of this session, will retry: {e}"
+                    );
+                    unavailable.insert(*chain_id, (evm_chain.clone(), e.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((available, unavailable))
+    }
+
+    /// Check that the endpoint of the EVM chain with the given ID answers, is on that chain and
+    /// serves what confirming mint locks needs (see [`Self::check_evm_chains`]).
+    fn check_evm_chain(&self, chain_id: u64, evm_chain: &EvmChain) -> Result<(), Error> {
+        let evm_client = EvmClient::new(&evm_chain.rpc_url)?;
+        let actual = evm_client.chain_id().map_err(|e| Error::InvalidEvmRpcUrl {
+            details: e.to_string(),
+        })?;
+        if actual != chain_id {
+            return Err(Error::EvmChainIdMismatch {
+                expected: chain_id,
+                actual,
+            });
+        }
+        evm_client.check_mint_support()?;
+        debug!(
+            self.logger(),
+            "EVM RPC endpoint for chain ID {chain_id}: {}",
+            evm_client.endpoint()
+        );
+        Ok(())
+    }
+
+    /// ERA fork (S2): check again the EVM chains left out of the session for an endpoint that
+    /// failed its check (`OnlineOptions::defer_unavailable_evm_chains`), using from now on each one
+    /// whose check passes and keeping the latest error of the others. Never fails: a chain that
+    /// is still unavailable stays left out.
+    fn check_unavailable_evm_chains_impl(&mut self) {
+        let Some(online_data) = self.online_data().as_ref() else {
+            return;
+        };
+        if online_data.unavailable_evm_chains.is_empty() {
+            return;
+        }
+        let mut chains: Vec<(u64, EvmChain)> = online_data
+            .unavailable_evm_chains
+            .iter()
+            .map(|(chain_id, (evm_chain, _))| (*chain_id, evm_chain.clone()))
+            .collect();
+        chains.sort_by_key(|(chain_id, _)| *chain_id);
+        for (chain_id, evm_chain) in chains {
+            let result = self.check_evm_chain(chain_id, &evm_chain);
+            match &result {
+                Ok(()) => info!(
+                    self.logger(),
+                    "EVM chain ID {chain_id} available again, using it"
+                ),
+                Err(e) => debug!(
+                    self.logger(),
+                    "EVM chain ID {chain_id} still unavailable: {e}"
+                ),
+            }
+            let online_data = self
+                .online_data_mut()
+                .as_mut()
+                .expect("checked online above");
+            match result {
+                Ok(()) => {
+                    online_data.unavailable_evm_chains.remove(&chain_id);
+                    online_data
+                        .evm_rpc_urls
+                        .insert(chain_id, evm_chain.rpc_url.clone());
+                    online_data.evm_chains.insert(chain_id, evm_chain);
+                }
+                Err(e) => {
+                    online_data
+                        .unavailable_evm_chains
+                        .insert(chain_id, (evm_chain, e.to_string()));
+                }
+            }
+        }
     }
 
     fn get_online_data(
@@ -1540,7 +1633,7 @@ pub trait WalletOnline: WalletOffline {
             get_indexer_and_resolver(&online_options.indexer_config, self.bitcoin_network())?;
         indexer.populate_tx_cache(self.bdk_wallet());
 
-        let evm_chains = self.check_evm_chains(online_options)?;
+        let (evm_chains, unavailable_evm_chains) = self.check_evm_chains(online_options)?;
 
         let online_data = OnlineData {
             id: online.id,
@@ -1549,6 +1642,8 @@ pub trait WalletOnline: WalletOffline {
             resolver,
             evm_rpc_urls: evm_rpc_urls(&evm_chains),
             evm_chains,
+            // ERA fork (S2)
+            unavailable_evm_chains,
             hub_client: None,
             user_role: None,
             vanilla_sync_lookback: online_options.vanilla_sync_lookback,
@@ -1638,6 +1733,7 @@ pub trait WalletOnline: WalletOffline {
                     evm_chains: _,    // checked and returned by check_evm_chains below
                     forwarder_url: _, // ERA fork: validated above, applied after every branch
                     complete_unrecorded_spends: _, // ERA fork (CC-99): only used during this call
+                    defer_unavailable_evm_chains: _, // ERA fork (S2): read by check_evm_chains
                 } = online_options;
                 // ERA fork: a refused option goes offline when routed, as every other failure of
                 // this call does (review N4)
@@ -1649,22 +1745,24 @@ pub trait WalletOnline: WalletOffline {
                     }
                     Err(e) => return Err(e),
                 };
-                let evm_chains = match self.check_evm_chains(online_options) {
-                    Ok(evm_chains) => evm_chains,
-                    // ERA fork: as for a new indexer below the forwarder's last session: the
-                    // EVM RPC URLs are routes of the forwarder too
-                    Err(e) if routed => {
-                        *self.online_data_mut() = None;
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                };
+                let (evm_chains, unavailable_evm_chains) =
+                    match self.check_evm_chains(online_options) {
+                        Ok(checked) => checked,
+                        // ERA fork: as for a new indexer below the forwarder's last session: the
+                        // EVM RPC URLs are routes of the forwarder too
+                        Err(e) if routed => {
+                            *self.online_data_mut() = None;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
                 let online_data = self.online_data_mut().as_mut().unwrap();
                 online_data.vanilla_sync_lookback = *vanilla_sync_lookback;
                 online_data.failed_witness_receive_grace_secs = *failed_witness_receive_grace_secs;
                 online_data.proxy_auth_keys = proxy_auth_keys;
                 online_data.evm_rpc_urls = evm_rpc_urls(&evm_chains);
                 online_data.evm_chains = evm_chains;
+                online_data.unavailable_evm_chains = unavailable_evm_chains;
                 online
             }
         } else {
@@ -5063,6 +5161,13 @@ pub trait WalletOnline: WalletOffline {
                 .retain(|t| batch_transfers_ids.contains(&t.idx));
         };
         db_data.batch_transfers.retain(|t| t.waiting());
+
+        // ERA fork (S2): an incoming transfer may need an EVM chain left out of the session (the
+        // mint locks of a received BFA asset are confirmed on it): check those chains again first,
+        // so that one back is used by this refresh
+        if db_data.batch_transfers.iter().any(|t| t.incoming) {
+            self.check_unavailable_evm_chains_impl();
+        }
 
         let mut refresh_result = HashMap::new();
         for transfer in &db_data.batch_transfers {

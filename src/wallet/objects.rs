@@ -92,6 +92,9 @@ pub struct OnlineData {
     pub(crate) forwarder: Option<Forwarder>,
     // ERA fork (CC-99): what the last go_online completed (OnlineOptions::complete_unrecorded_spends)
     pub(crate) completed_spends: Vec<CompletedSpend>,
+    // ERA fork (S2): the EVM chains whose endpoint failed its check, left out of evm_chains and
+    // evm_rpc_urls until a check passes (OnlineOptions::defer_unavailable_evm_chains), by chain ID
+    pub(crate) unavailable_evm_chains: HashMap<u64, (EvmChain, String)>,
 }
 
 #[cfg(feature = "_online")]
@@ -231,6 +234,45 @@ pub struct OnlineOptions {
     /// described in the fork's `ERA.md`.
     #[serde(default)]
     pub complete_unrecorded_spends: bool,
+    /// ERA fork (S2): whether an EVM chain whose endpoint fails its check (see
+    /// [`evm_chains`](OnlineOptions::evm_chains)) is left out of the session instead of failing
+    /// `go_online`.
+    ///
+    /// The check fails when the endpoint cannot be reached or does not answer as an EVM JSON-RPC
+    /// server ([`Error::InvalidEvmRpcUrl`]), answers for another chain
+    /// ([`Error::EvmChainIdMismatch`]) or does not serve what confirming mint locks needs
+    /// ([`Error::InvalidEvmRpcUrl`]). Upstream fails the whole `go_online` then, so an EVM node that
+    /// is down takes the wallet offline, its bitcoins and its other schemas included. With this
+    /// set, such a chain is left out of the session as if it were not configured, and the wallet
+    /// goes online: what needs the chain meets [`Error::NoEvmRpcUrl`], which leaves a received
+    /// consignment that needs it (the mint locks of a BFA asset) pending, to be validated at a later
+    /// refresh, and fails a send that needs it (a reject list kept by an EVM contract) before
+    /// anything is written. Each refresh that has an incoming transfer to process checks the chains
+    /// left out again, as does [`Wallet::check_unavailable_evm_chains`](crate::wallet::Wallet::check_unavailable_evm_chains),
+    /// and a chain whose check passes is used from then on; so does the next `go_online`. The
+    /// chains left out are read with
+    /// [`Wallet::unavailable_evm_chains`](crate::wallet::Wallet::unavailable_evm_chains).
+    ///
+    /// A chain configured with inconsistent mint lock blocks ([`Error::InvalidEvmChain`]) is the
+    /// host's mistake, not the endpoint's, and fails `go_online` either way. `false` (the default,
+    /// and what a missing field deserializes to) is upstream's `go_online`. Only used when the
+    /// wallet supports the [`AssetSchema::Bfa`] schema. The contract is described in the fork's
+    /// `ERA.md`.
+    #[serde(default)]
+    pub defer_unavailable_evm_chains: bool,
+}
+
+/// ERA fork (S2): an EVM chain left out of the session because its endpoint failed its check, see
+/// [`OnlineOptions::defer_unavailable_evm_chains`].
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct UnavailableEvmChain {
+    /// The EIP-155 chain ID the endpoint is configured for
+    pub chain_id: u64,
+    /// Why its last check failed: the error's text, which names the endpoint by its scheme and
+    /// host only (never its path, query or user info)
+    pub details: String,
 }
 
 /// An EVM chain mint operations use, see [`OnlineOptions::evm_chains`].

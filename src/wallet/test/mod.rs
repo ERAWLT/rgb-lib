@@ -691,6 +691,9 @@ mod fail_transfers;
 mod fill_spv_proofs;
 #[cfg(feature = "electrum")]
 mod finalize_psbt;
+// ERA fork (S2): OnlineOptions::defer_unavailable_evm_chains, on the scripted chain
+#[cfg(feature = "esplora")]
+mod evm_unavailable;
 // ERA fork: OnlineOptions::forwarder_url, wallet level (era_beta8_pending: its mock proxies
 // speak protocol 0.2 and its wallets go online with indexer_url; the client-level tests in
 // api::forwarder run)

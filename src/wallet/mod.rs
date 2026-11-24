@@ -57,6 +57,7 @@ pub use objects::{
     BurnBeginResult, BurnDetails, EvmChain, InflateBeginResult, InflateDetails, LinkBeginResult,
     LinkDetails, MintBeginResult, MintDetails, OnlineOptions, OperationResult, RefreshFilter,
     RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
+    UnavailableEvmChain,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
