@@ -563,6 +563,7 @@ dictionary OnlineOptions {
   record<u64, EvmChain> evm_chains;
   string? forwarder_url = null;
   boolean complete_unrecorded_spends = false;
+  boolean defer_unavailable_evm_chains = false;
 };
 
 [Remote]

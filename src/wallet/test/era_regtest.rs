@@ -2,7 +2,9 @@
 //! Esplora, the RGB proxy 0.4.0), run by era.yml's `era-regtest` job: the completion of an own
 //! spend whose record was lost (CC-99, `OnlineOptions::complete_unrecorded_spends`), the
 //! consistency check's excuse of an interrupted send (D63), a send the `proxy_v1` migration
-//! failed while its TX was on chain (review N5), and a replaced payment of envelopes (CC-115).
+//! failed while its TX was on chain (review N5), a replaced payment of envelopes (CC-115), and a
+//! received BFA transfer waiting for an EVM chain whose endpoint is down (S2,
+//! `OnlineOptions::defer_unavailable_evm_chains`).
 //! The scripted chain (`unrecorded_spends`) tests the same verdicts without services; these run
 //! them on a real node, indexer and proxy. The wallets use Esplora, as the ERA app does, and go
 //! online with the consistency check, as the app's bridge does (upstream's tests skip it).
@@ -482,4 +484,187 @@ fn era_a_replaced_payment_of_envelopes_lets_go_online_through() {
     reopen(&mut party, true).unwrap();
     assert_eq!(envelopes(&mut party, &replacement).len(), 2);
     assert!(rows(&party, &first).iter().all(|t| !t.exists));
+}
+
+/// An EVM endpoint the test takes down and brings back (S2): a loopback HTTP server that answers
+/// every request with a 503 while down and hands it to the regtest anvil node while up, one
+/// request per connection.
+struct EvmRelay {
+    addr: std::net::SocketAddr,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EvmRelay {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay_up = up.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let up = relay_up.load(std::sync::atomic::Ordering::SeqCst);
+                let _ = Self::serve(stream, up);
+            }
+        });
+        Self { addr, up }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+
+    fn bring_up(&self) {
+        self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn serve(stream: std::net::TcpStream, up: bool) -> std::io::Result<()> {
+        use std::io::{BufRead, Read, Write};
+        let mut reader = std::io::BufReader::new(stream.try_clone()?);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
+        let mut stream = stream;
+        if !up {
+            return stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+        let node = EVM_RPC_URL.trim_start_matches("http://");
+        let mut upstream = std::net::TcpStream::connect(node)?;
+        write!(
+            upstream,
+            "POST / HTTP/1.1\r\nHost: {node}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        upstream.write_all(&body)?;
+        let mut answer = vec![];
+        upstream.read_to_end(&mut answer)?;
+        stream.write_all(&answer)
+    }
+}
+
+/// S2 (`OnlineOptions::defer_unavailable_evm_chains`): a wallet whose EVM endpoint is down goes
+/// online without the chain; a transfer of a minted BFA asset it receives meanwhile waits, neither
+/// refused nor failed, its sender waiting too; once the endpoint is back, the next refresh uses
+/// the chain, validates the consignment and ACKs it, and the transfer settles.
+#[test]
+#[parallel]
+#[serial(evm)]
+fn era_a_bfa_transfer_waits_for_an_evm_chain_down() {
+    initialize();
+
+    // a BFA asset minted on anvil's bridge, settled at `holder`
+    let token = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge = deploy_bridge(&token.address);
+    let mut minter = get_funded_party!();
+    let mut holder = get_funded_party!();
+    let asset = minter.issue_asset_bfa(2, bridge.address.clone(), None);
+    let mint_receive = holder.blind_receive();
+    let res = minter.mint_begin(
+        minter.online,
+        &asset.asset_id,
+        Recipient {
+            assignment: Assignment::Fungible(AMOUNT),
+            recipient_id: mint_receive.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(mint_receive.public_key.clone()),
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
+        },
+    );
+    erc20_approve(&token.address, &bridge.address, AMOUNT);
+    bridge_funds_in(&bridge.address, AMOUNT, &mint_lock_id(&res));
+    holder.refresh_all();
+    evm_mine(EVM_FINALITY_DEPTH);
+    holder.wait_for_refresh(None);
+    let signed = minter.wallet.sign_psbt(res.psbt, None).unwrap();
+    minter.mint_end(minter.online, signed);
+    mine(false);
+    holder.wait_for_transfer_status_recipient(
+        None,
+        &mint_receive.recipient_id,
+        TransferStatus::Settled,
+    );
+    assert_eq!(holder.get_asset_balance(&asset.asset_id).settled, AMOUNT);
+
+    // the recipient goes online on Esplora, with its EVM endpoint down
+    let relay = EvmRelay::start();
+    let mut recipient = funded();
+    let options = || OnlineOptions {
+        evm_chains: test_evm_chains(HashMap::from([(ANVIL_CHAIN_ID, relay.url())])),
+        defer_unavailable_evm_chains: true,
+        ..era_options(true)
+    };
+    recipient.wallet.go_offline();
+    assert_matches!(
+        recipient.wallet.go_online(OnlineOptions {
+            defer_unavailable_evm_chains: false,
+            ..options()
+        }),
+        Err(Error::InvalidEvmRpcUrl { .. })
+    );
+    recipient.online = recipient.wallet.go_online(options()).unwrap();
+    let left_out = |party: &SinglesigParty| -> Vec<u64> {
+        party
+            .wallet
+            .unavailable_evm_chains()
+            .into_iter()
+            .map(|c| c.chain_id)
+            .collect()
+    };
+    assert_eq!(left_out(&recipient), vec![ANVIL_CHAIN_ID]);
+
+    // a transfer of the minted asset (the mint in its history) waits for the chain: no failure, no
+    // NACK, at either end
+    let receive = recipient.blind_receive();
+    let txid = holder.send_retry(&blind_recipient_map(
+        &asset.asset_id,
+        &receive,
+        Assignment::Fungible(AMOUNT / 2),
+    ));
+    for _ in 0..3 {
+        let result = recipient.refresh_result(None, &[]).unwrap();
+        let refreshed = &result[&receive.batch_transfer_idx];
+        assert!(refreshed.failure.is_none(), "{refreshed:?}");
+        assert_eq!(refreshed.updated_status, None);
+        holder.refresh_result(None, &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert_eq!(
+        batch_transfer_status(&recipient, receive.batch_transfer_idx),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(holder.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+    assert_eq!(left_out(&recipient), vec![ANVIL_CHAIN_ID]);
+
+    // the chain is back: the next refresh uses it and the transfer goes through
+    relay.bring_up();
+    recipient.wait_for_refresh(None);
+    assert!(recipient.wallet.unavailable_evm_chains().is_empty());
+    holder.wait_for_refresh(None);
+    mine(false);
+    recipient.wait_for_transfer_status_recipient(
+        None,
+        &receive.recipient_id,
+        TransferStatus::Settled,
+    );
+    holder.wait_for_transfer_status_sender(None, &txid, TransferStatus::Settled);
+    assert_eq!(
+        recipient.get_asset_balance(&asset.asset_id).settled,
+        AMOUNT / 2
+    );
 }

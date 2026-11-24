@@ -874,6 +874,7 @@ pub(crate) fn test_go_online_options(indexer_url: Option<&str>) -> OnlineOptions
         )])),
         forwarder_url: None,
         complete_unrecorded_spends: false,
+        defer_unavailable_evm_chains: false,
     }
 }
 
