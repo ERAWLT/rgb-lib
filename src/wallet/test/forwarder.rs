@@ -45,7 +45,7 @@ use crate::api::forwarder::{
     FORWARD_KIND_HEADER, FORWARD_KIND_REJECT_LIST, FORWARD_KIND_RGB_PROXY, FORWARD_REFUSED_HEADER,
     FORWARD_SESSION_HEADER, FORWARD_TARGET_HEADER, tests::Untouchable,
 };
-use crate::utils::{append_recipient_nonce, derive_proxy_recipient_id};
+use crate::wallet::utils::{append_recipient_nonce, derive_proxy_recipient_id};
 
 const REGTEST_GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
 // what a proxy answers when it holds no consignment for the recipient yet
@@ -470,7 +470,7 @@ fn proxy_traffic_goes_through_the_forwarder() {
     let invoice_endpoints = invoice.invoice_data().transport_endpoints;
     assert_eq!(invoice_endpoints.len(), 1);
     assert_eq!(
-        crate::utils::extract_recipient_nonce(&invoice_endpoints[0]).0,
+        crate::wallet::utils::extract_recipient_nonce(&invoice_endpoints[0]).0,
         endpoint
     );
     assert!(
@@ -1290,7 +1290,7 @@ fn a_nack_that_meets_an_ack_fails_the_receive_and_says_so() {
     get.assert();
     nack.assert();
     // and the log says why (the wallet's logger is flushed when the wallet goes)
-    let log = wallet.get_wallet_dir().join(crate::utils::LOG_FILE);
+    let log = wallet.get_wallet_dir().join(crate::wallet::utils::LOG_FILE);
     drop(wallet);
     let log = fs::read_to_string(log).unwrap();
     assert!(log.contains("Found an ACK when trying NACK"), "{log}");
@@ -1319,7 +1319,7 @@ fn a_refusal_without_the_session_echo_is_in_the_wallet_log() {
     );
     refusal.assert();
     // the wallet's log says why, and never names the forwarder's path
-    let log = wallet.get_wallet_dir().join(crate::utils::LOG_FILE);
+    let log = wallet.get_wallet_dir().join(crate::wallet::utils::LOG_FILE);
     drop(wallet);
     let log = fs::read_to_string(log).unwrap();
     assert!(log.contains(FORWARD_SESSION_HEADER), "{log}");

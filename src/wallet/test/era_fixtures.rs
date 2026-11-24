@@ -34,7 +34,7 @@ use bdk_wallet::bitcoin::secp256k1::SecretKey;
 use walkdir::WalkDir;
 
 use super::*;
-use crate::utils::hash_bytes_hex;
+use crate::wallet::utils::hash_bytes_hex;
 #[cfg(feature = "vss")]
 use crate::wallet::vss::{VSS_CHUNK_SIZE, VssEncryptionMetadata, create_backup_data, encrypt_data};
 

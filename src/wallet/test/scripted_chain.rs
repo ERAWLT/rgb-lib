@@ -45,7 +45,7 @@ use serde_json::{Value as Json, json};
 
 // (explicit: the test module imports it with the electrum feature only, and the app builds
 // without it)
-use crate::utils::recipient_id_from_script_buf;
+use crate::wallet::utils::recipient_id_from_script_buf;
 
 /// Where the scripted RGB proxy answers.
 pub(crate) const PROXY_PATH: &str = "/json-rpc";

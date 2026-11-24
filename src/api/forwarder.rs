@@ -558,7 +558,10 @@ pub(crate) mod tests {
                     .post_media("rid", "digest", file.path(), "sig")
                     .map(|_| ()),
             );
-            refused(crate::utils::check_proxy_routed(target, Some(&forwarder(&fwd))).map(|_| ()));
+            refused(
+                crate::wallet::utils::check_proxy_routed(target, Some(&forwarder(&fwd)))
+                    .map(|_| ()),
+            );
             refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
                 target,
                 &forwarder_url(&fwd),
@@ -803,7 +806,7 @@ pub(crate) mod tests {
         assert_matches!(client.get_info(), Err(Error::Proxy { .. }));
         assert_matches!(ack_post(&client), Err(Error::Proxy { .. }));
         assert_matches!(
-            crate::utils::check_proxy_routed(&target, Some(&closed)),
+            crate::wallet::utils::check_proxy_routed(&target, Some(&closed)),
             Err(Error::Proxy { .. })
         );
         let reject = RejectListClient::new_routed(&target, Some(&closed)).unwrap();
@@ -887,7 +890,9 @@ pub(crate) mod tests {
                 .map(|_| ()),
         );
         // the proxy check reports it instead of "unable to connect to proxy"
-        refused(crate::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))).map(|_| ()));
+        refused(
+            crate::wallet::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))).map(|_| ()),
+        );
         refused(crate::wallet::rust_only::check_proxy_url_via_forwarder(
             &target,
             &forwarder_url(&fwd),
@@ -1087,7 +1092,8 @@ pub(crate) mod tests {
             .expect(1)
             .create();
             let log_name = format!("log-{n}");
-            let (logger, guard) = crate::utils::setup_logger(dir.path(), Some(&log_name)).unwrap();
+            let (logger, guard) =
+                crate::wallet::utils::setup_logger(dir.path(), Some(&log_name)).unwrap();
             let client =
                 ProxyClient::new_routed(&target, Some(&forwarder(&fwd).with_logger(logger)))
                     .unwrap();
@@ -1214,7 +1220,7 @@ pub(crate) mod tests {
             let client = ProxyClient::new_routed(&target, Some(&forwarder(&fwd))).unwrap();
             assert_matches!(ack_get(&client), Err(Error::Proxy { .. }));
             assert_matches!(
-                crate::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))),
+                crate::wallet::utils::check_proxy_routed(&target, Some(&forwarder(&fwd))),
                 // beta.8's check_proxy reports the transport error, no longer a fixed text
                 Err(Error::Proxy { .. })
             );

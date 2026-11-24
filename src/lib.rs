@@ -553,6 +553,8 @@ use crate::no_wallet::{
 use crate::utils::atomic_write_with;
 #[cfg(feature = "wallet")]
 use crate::utils::{atomic_tmp_path, atomic_write};
+#[cfg(all(test, feature = "_online"))]
+use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 #[cfg(test)]
 use crate::wallet::test::{
@@ -572,8 +574,6 @@ use crate::wallet::utils::INDEXER_STOP_GAP;
 use crate::wallet::utils::write_fascia;
 #[cfg(feature = "wallet")]
 use crate::wallet::utils::{check_psbt_parsable, strip_rgb_data};
-#[cfg(all(test, feature = "_online"))]
-use crate::wallet::test::mock_fail_before_completion_commit;
 #[cfg(feature = "_online")]
 use crate::{
     api::{
@@ -603,8 +603,8 @@ use crate::{
     },
     no_wallet::script_buf_from_recipient_id,
     wallet::utils::{
-        check_proxy, check_proxy_routed, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
-        proxy_retention_grace,
+        check_proxy, check_proxy_routed, detect_indexer, get_indexer_and_resolver, hash_file,
+        proxy_max_media, proxy_retention_grace,
     },
     wallet::{AssignmentsCollection, multisig::RespondToOperation},
 };
@@ -666,7 +666,7 @@ use crate::{
         get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
         setup_logger, str_to_xpub,
     },
-    wallet::{AssetFilter, Balance, KeychainLayoutOverrides, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS},
+    wallet::{AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS},
 };
 // the mock electrum server of the validation tests, shared with the wallet ones
 #[cfg(all(test, feature = "electrum"))]

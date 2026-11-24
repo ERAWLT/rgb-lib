@@ -1079,7 +1079,7 @@ mod tests {
         WalkDir::new(wallet_dir)
             .into_iter()
             .map(|e| e.unwrap())
-            .filter(|e| e.file_name() != crate::utils::LOG_FILE)
+            .filter(|e| e.file_name() != crate::wallet::utils::LOG_FILE)
             .map(|e| {
                 let path = e.path().strip_prefix(wallet_dir).unwrap();
                 let bytes = e.file_type().is_file().then(|| fs::read(e.path()).unwrap());

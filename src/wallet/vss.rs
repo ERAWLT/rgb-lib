@@ -31,10 +31,10 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
 use crate::error::Error;
-use crate::utils::LOG_FILE;
-use crate::utils::setup_logger;
 use crate::wallet::backup::stream_be32_nonce;
 use crate::wallet::core::WALLET_MANIFEST_FILE;
+use crate::wallet::utils::LOG_FILE;
+use crate::wallet::utils::setup_logger;
 
 /// Whether auto-backup uploads block the calling operation or run asynchronously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3746,7 +3746,7 @@ mod tests {
         use crate::wallet::offline::RgbWalletOpsOffline;
         use crate::wallet::test::era_fixtures::dir_listing;
         use crate::wallet::test::get_test_wallet_raw;
-        use crate::{BitcoinNetwork, utils::LOG_FILE};
+        use crate::{BitcoinNetwork, wallet::utils::LOG_FILE};
         // a watch-only wallet the host names with an upper-case master fingerprint, which rgb-lib
         // takes as given
         let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);

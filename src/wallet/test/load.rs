@@ -523,7 +523,7 @@ fn keychain_layout_roundtrip_success() {
 
     // both sides under the one account at coin type 0, the only one some signers export
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let (_, account_xpub, _) = crate::utils::get_account_data_at_coin_type(
+    let (_, account_xpub, _) = crate::wallet::utils::get_account_data_at_coin_type(
         &BitcoinNetwork::Regtest,
         &keys.mnemonic,
         0,
