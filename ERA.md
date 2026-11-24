@@ -89,8 +89,13 @@ is `rgb_lib::wallet::utils::get_account_data_at_coin_type`, `script_buf_from_rec
 `rgb_lib::no_wallet::script_buf_from_recipient_id`; the assets' `reject_list_url` is
 `reject_list: Option<RgbRejectListInfo>` (and BFA's `bridge_location`), which the bridge does not read.
 
-**Gates:** on this branch the `check` and `era-regtest` jobs run as on `era/beta8-bfa`, S2's tests
-included; the runs are recorded in the S2 section.
+**Gates** (run 45442927370 on `756a741`, 24.11.2026, from the annotations): `check` green, the unit
+step 213 passed and 0 failed (58 of `unrecorded_spends`, 8 of `evm_unavailable`); `era-regtest`
+green, 82 passed and 0 failed, the seven of `era_regtest` among them (S2's BFA transfer on anvil
+included). Locally before the push, every step of the `check` job in order (format, the three
+`cargo check` sets, both bindings, the diet, HTTP-client and proxy-client guards, the unit step, the
+pending ports, the migration crate) and clippy `-D warnings` on the library and its tests. The ERA
+app's bridge pins `756a741` (bridge API 28).
 
 ## Carried onto RGB-Tools beta.8 (`era/beta8-bfa`)
 
