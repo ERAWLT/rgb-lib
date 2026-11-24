@@ -2,8 +2,12 @@
 
 `ERAWLT/rgb-lib` carries a short series of commits for the ERA Wallet companion app, its only
 consumer, which links it through `packages/era_rgb` (flutter_rust_bridge) with
-`default-features = false`, pinned **by rev** of an `era/*` branch. Two bases:
+`default-features = false`, pinned **by rev** of an `era/*` branch. Three bases:
 
+- **`era/next-bfa`** (24.11.2026, the app's from bridge API 28): RGB-Tools/rgb-lib `next`
+  (`4d87b37`, RGB-Tools PR #124, crate version `0.3.0-beta.7`), the rgb-lib UTEXO's signet sandbox
+  supports, and the series of `era/beta8-bfa` carried onto it. See
+  [Carried onto RGB-Tools next](#carried-onto-rgb-tools-next-eranext-bfa).
 - **`era/beta8-bfa`** (23.11.2026): [RGB-Tools/rgb-lib](https://github.com/RGB-Tools/rgb-lib)
   `0.3.0-beta.8` (`ea2b745b`), UTEXO's VSS ported onto it, and the series; features `esplora`,
   `vss` and the two one-time migrations. See
@@ -29,6 +33,64 @@ Rules for the branch:
 - A new UTEXO base gets a **new branch** (see [Carrying the series](#carrying-the-series-onto-a-new-utexo-tag)),
   never a rebase of this one.
 - Commits are authored by people, with no AI co-author trailers.
+
+## Carried onto RGB-Tools next (`era/next-bfa`)
+
+**Why** (24.11.2026): UTEXO's signet sandbox, where their test USDT (BFA,
+`rgb:uVMNCuVU-…`) lives, supports only the next rgb-lib release: RGB-Tools/rgb-lib PR #124, branch
+`next`, not `0.3.0-beta.8`. `era/beta8-bfa` stays as it is for the app versions that pin it.
+
+**Base:** `next` @ `4d87b37` ("report whether an inspected operation conceals transitions"). Against
+`era/beta8-bfa`'s base `ea2b745b` it is the same history up to their merge base `6259cce`
+(16.11.2026), **without** beta.8's last five commits (the wallet-less fascia inspection
+`5420883`/`fb2da92`/`19aeb8b`, "update dependencies" `e519803`, "bump version to 0.3.0-beta.8"
+`ea2b745b`) and **with** nine newer ones: the fascia inspection again (`0ab69fc`, `bca9c9c`), the
+wallet utilities moved under the wallet module (`4392f78`: `src/utils.rs` keeps the atomic writes
+and `sync_dir`, the rest is `src/wallet/utils.rs`), the wallet-less SPV proofs fill (`ff29e7c`),
+`list_transfers` settle waits on the Settled statuses (`6918a7a`), the whole reject-list location
+(`3473871`) and the bridge location of a bridged asset reported (`a92a92c`, migration
+`m20261117_160000_asset_bridge_location`, next to `m20261117_104500_asset_reject_list`), the JSON
+column boilerplate deduplicated (`9193e77`), whether an inspected operation conceals transitions
+(`4d87b37`). `src/api/evm.rs` is identical to beta.8's: BFA mint verification does not change. The
+crate says `0.3.0-beta.7` (the version bump is not on `next`) and its lock is `next`'s (the
+dependency update is not either).
+
+**How:** a new branch from `4d87b37`, never a rebase of `era/beta8-bfa`;
+`git cherry-pick -x ea2b745b..era/beta8-bfa`, the whole series (VSS port first, then the series in
+`era/beta8-bfa`'s order, D63, S2 and their documentation included): 123 commits, 123 here, none
+dropped or folded. Each commit carries the `cherry picked from` line of its `era/beta8-bfa` commit,
+so `git log --format=%B` maps every row of the tables above to this branch. Conflicts, resolved in
+the commit that met them:
+
+| `era/beta8-bfa` | Here | Conflict and resolution |
+|---|---|---|
+| `1f9d1d2` | `97c6085` | `src/wallet/mod.rs`: `next`'s `pub mod utils` and the VSS module both kept; `Cargo.lock` kept as `next`'s and completed by `cargo tree` (VSS's crates added), bitreq held at 0.3.5 (`cargo update -p bitreq --precise 0.3.5`) |
+| `eeabdd0` | `9212e3a` | the `src/utils.rs` hunks applied to `src/wallet/utils.rs`, where the code moved; `src/lib.rs` imports on `next`'s `wallet::utils` paths plus `KeychainLayout` |
+| `04fe3d8` | `05c0751` | `Cargo.toml`: the diet's `reqwest` / `rustls` / migration lines, the migration crate at `next`'s `0.3.0-beta.5`; the three lock files kept as `next`'s and pruned by `cargo tree`; `src/utils.rs` hunks to `src/wallet/utils.rs` |
+| `4cfe70b` | `98e843f` | `src/lib.rs` imports (`check_proxy_routed` on `wallet::utils`); `src/utils.rs` hunks moved |
+| `1126f0b`, `3747ade`, `06b2516`, `85feea4`, `6649927`, `2ba768d`, `2dd5373` | (map) | their `src/utils.rs` hunks applied to `src/wallet/utils.rs`; `06b2516` and `6649927` also `src/lib.rs` / uniffi imports on `next`'s lists (`WalletDescriptors` no longer imported there) |
+| `38df2de` | `65534de` | `src/lib.rs` / `src/wallet/mod.rs`: `next`'s `wallet::utils` lines and CC-99's (`InconsistencyReason`, `UnrecordedSpendReason`, the completion mock, `mod unrecorded_spends`) both kept |
+| `3b7fb1b` | `cbe989e` | `src/database/rgb.rs` `legacy` imports and `src/lib.rs`'s `RgbStockDamage`: both sides' names, on `next`'s paths |
+
+Every other commit applied as it is (the git merge machinery, on the moved file too). After the
+series, one commit makes it build on `next`: the remaining `crate::utils::` paths of series code
+(VSS, backups, tests) point at `crate::wallet::utils::` (all but the atomic writes and `sync_dir`),
+an import `next` no longer uses dropped, `cargo fmt`, and era.yml's proxy-client guard lists the
+helpers in `src/wallet/utils.rs`.
+
+**Databases:** `next` adds two migrations after beta.8's; a wallet this branch opened is not opened
+by a build on `era/beta8-bfa` (sea-orm refuses an applied migration it has no file for), as a
+beta.8 one is not by `era/configurable-derivation`. UTEXO's two migrations
+(`m20260401_000001_create_mpc_address_table`, `m20260415_000001_create_reuse_address_index_table`)
+stay in the migrator.
+
+**What the bridge adapts:** `rgb_lib::utils` is crate-private on `next`: `get_account_data_at_coin_type`
+is `rgb_lib::wallet::utils::get_account_data_at_coin_type`, `script_buf_from_recipient_id`
+`rgb_lib::no_wallet::script_buf_from_recipient_id`; the assets' `reject_list_url` is
+`reject_list: Option<RgbRejectListInfo>` (and BFA's `bridge_location`), which the bridge does not read.
+
+**Gates:** on this branch the `check` and `era-regtest` jobs run as on `era/beta8-bfa`, S2's tests
+included; the runs are recorded in the S2 section.
 
 ## Carried onto RGB-Tools beta.8 (`era/beta8-bfa`)
 
