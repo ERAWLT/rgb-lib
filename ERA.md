@@ -344,7 +344,75 @@ disk, the legacy `rgb/` and its one-time migration (review S1/S2, `3b7fb1b`):
   elsewhere and a proxy would see. Its errors name only the endpoint's scheme and host
   (`EvmClient::endpoint`), never the path.
 - **Not verified here:** no BFA transfer, mint or claim resolution ran on this branch (the
-  regtest suite with its anvil node was not run, see below).
+  regtest suite with its anvil node was not run, see below). Since `e9eab56` the `era-regtest` job
+  runs upstream's mint tests on anvil, and since S2 (below) a transfer of a minted asset received
+  while the EVM endpoint is down.
+
+### S2: an EVM chain that does not answer (24.11.2026, `eb65faa`)
+
+**The case** (review A of the bridge, 23.11, S2). With BFA in a wallet's `supported_schemas`,
+upstream's `go_online` checks every configured EVM chain (`check_evm_chains`: the chain ID, a
+finalized block, the state as of it) and fails as a whole when one does not answer: an EVM node
+or relay that is down takes the wallet offline, its bitcoins, NIA and IFA included. The app
+points `rpc_url` at its forwarder's `evm` route, which its backend relays to an Arbitrum One
+provider: any outage of that relay would take every RGB wallet of the app offline.
+
+**The option** (`OnlineOptions::defer_unavailable_evm_chains`, off by default: upstream's
+`go_online`). With it set, a chain whose endpoint fails its check for the endpoint's reason —
+`InvalidEvmRpcUrl` (down, not an EVM JSON-RPC server, no finalized block or no state as of it),
+`EvmChainIdMismatch`, a `Network` error — is left out of the session as if it were not
+configured: not in `OnlineData::evm_chains` nor `evm_rpc_urls`, kept with the error's text in
+`OnlineData::unavailable_evm_chains`, and the wallet goes online. The host's own mistake
+(`InvalidEvmChain`, a minimum mint lock above the maximum) still fails `go_online`, checked for
+every chain before any endpoint is asked. A wallet a forwarder routes stays online where the
+fork's `ff6e73a` adaptation took it offline: the reason there was that the old URLs are routes of
+the forwarder's last session, and with the option the failing chain's old URL is not kept either
+(the set is replaced by the call's).
+
+**What a chain left out means**, from upstream's own code, all of it unchanged:
+
+| Path | Without the chain (`NoEvmRpcUrl`) |
+|---|---|
+| a received consignment with claims (`process_received_consignment`) | `Ok(None)`, "will retry": the consignment kept, nothing NACKed, the transfer `WaitingCounterparty` |
+| its saved mint locks (`waiting_for_mint_locks`) | `false`, left to the processing above |
+| a reject list kept by an EVM contract, received or sent | an `Err` for the transfer's refresh (rolled back by its savepoint, retried) or the send, before anything is written |
+| re-validation of a received consignment (`load_received_valid_transfer`) | an `Err` for the transfer's refresh, retried |
+| `mint_*`, `fail_expired_mint` | `NoEvmRpcUrl` |
+
+A network error on a chain in use is upstream's too: an `Err` for that transfer's refresh, never a
+refusal. Only an answer that the lock **expired** (`MintLockExpired`, read from the node) or an
+invalid consignment refuses; an expired invoice is the host's to fail (`fail_transfers`), as for
+any receive.
+
+**Not this case: a bridge contract that does not answer.** A chain that answers but whose bridge
+contract lacks a function beta.8 calls (`getFundsInBlock`, `circulatingSupply`, the reject-list
+reads) is upstream's `funds_in_block`: a call that reverts or returns no data is "no lock
+recorded", so each mint lock in a consignment's history is pending, then expired once the block
+it commits to is final, and the consignment is refused (`MintLockExpired`, a NACK; the sender
+keeps the asset). On 24.11.2026 UTEXO's Arbitrum One bridge `0x8ed92cd8…72495` lacked all of them
+(added to their contracts on 11.11); whether the signet USDT genesis names it is asked of UTEXO.
+The fork does not work around it: a lock this wallet cannot read is not a lock.
+
+**Checked again**: at each `refresh` that has an incoming transfer to process (before the
+transfers, so one back is used at once), by `Wallet::check_unavailable_evm_chains(online)` (for
+the host, before a send that needs a chain), and by the next `go_online`. A refresh with no
+incoming transfer asks nothing. A chain whose check passes moves into the session's chains; a
+failing one keeps the new error's text. Read with `Wallet::unavailable_evm_chains()` (sorted by
+chain ID, empty offline). The texts name the endpoint by scheme and host only (`EvmClient`).
+
+**Tests.** `src/wallet/test/evm_unavailable.rs` (unit step, scripted chain, mockito endpoints, 8):
+without the option a chain down fails `go_online`; with it the wallet goes online, the chain is
+reported without the URL's path, NIA, a blind receive and a refresh work; a non-JSON-RPC endpoint
+and one on another chain are left out; inconsistent mint lock blocks fail before any request; a
+refresh asks only with an incoming transfer and uses the chain once back, then asks no more;
+`check_unavailable_evm_chains` (and offline: `Offline`); going online again replaces both sets,
+a routed wallet stays online with the option and goes offline without it; a wallet without BFA
+asks nothing. `era_regtest::era_a_bfa_transfer_waits_for_an_evm_chain_down` (era-regtest): a BFA
+asset minted on anvil's bridge and settled, then a transfer of it to an Esplora wallet whose EVM
+endpoint (a test relay to anvil) is down: `go_online` without the option refused, with it online
+and the chain reported; three refreshes leave the receive `WaitingCounterparty` with no failure
+and the send waiting (no NACK); the relay up, the next refresh uses the chain, ACKs, and both
+settle.
 
 ### Gates (23.11.2026, macOS, rustc 1.98.1)
 
@@ -503,7 +571,10 @@ to hold one. Support asks for the wallet's state rather than wiping it.
   max_mint_lock_blocks }}` for USDT); `forwarder_url` as before; `complete_unrecorded_spends`
   was **off** until the regtest gate passed (review, level A; bridge API 25 and 26) and is
   **on** from bridge API 27 (see D63 above); with it on, a send waiting for its
-  counterparty is completed by the refresh, not by `go_online` (see above).
+  counterparty is completed by the refresh, not by `go_online` (see above);
+  `defer_unavailable_evm_chains` **on** from bridge API 28, when BFA joins the signet wallets'
+  schemas (see S2 above), with `unavailable_evm_chains` / `check_unavailable_evm_chains` read by
+  the bridge.
 - **VSS:** a chunked backup this branch uploads is not restored by a build on
   `era/configurable-derivation` (chunk sets, §5 Limits); single-piece backups are.
 - **`WalletData`:** `supported_schemas` gains `AssetSchema::Bfa`; on mainnet
