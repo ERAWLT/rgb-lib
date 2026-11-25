@@ -285,6 +285,64 @@ fn an_unconfirmed_vanilla_utxo_is_never_taken() {
 
 #[test]
 #[parallel]
+fn several_vanilla_utxos_pay_when_one_is_not_enough() {
+    let chain = ScriptedChain::start();
+    let mut party = thin_issuer(&chain, true);
+    // leave ~1700 sats of the funding on the vanilla keychain, then add a 900-sat UTXO: neither
+    // pays the witness output, the colored change output and the fee alone
+    let vanilla = party
+        .wallet
+        .get_btc_balance(None, true)
+        .unwrap()
+        .vanilla
+        .spendable;
+    let away = get_test_wallet(false, None).get_address().unwrap();
+    party
+        .wallet
+        .send_btc(party.online, away, vanilla - 2000, FEE_RATE, false)
+        .unwrap();
+    chain.fund(&party.wallet.get_address().unwrap(), 900);
+    chain.mine(1);
+    party
+        .wallet
+        .get_btc_balance(Some(party.online), false)
+        .unwrap();
+    let vanilla_before = vanilla_unspents(&party.wallet);
+    assert_eq!(vanilla_before.len(), 2);
+
+    party.wallet.set_vanilla_fee_inputs(true);
+    let begin = try_send(&chain, &mut party, false, false).unwrap();
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    assert_eq!(
+        input_keychains(&party.wallet, &psbt),
+        vec![
+            KeychainKind::External,
+            KeychainKind::Internal,
+            KeychainKind::Internal
+        ]
+    );
+    // both vanilla UTXOs are the send's until it is broadcast
+    let balance = party.wallet.get_btc_balance(None, true).unwrap();
+    assert_eq!(balance.vanilla.spendable, 0);
+    let outputs = &psbt.unsigned_tx.output;
+    assert_eq!(
+        keychain_of(&party.wallet, &outputs[2].script_pubkey),
+        Some(KeychainKind::External)
+    );
+    // what is left over the fee and the two outputs comes back, unless it is dust BDK gives to
+    // the miners (then only three outputs)
+    if outputs.len() == 4 {
+        assert_eq!(
+            keychain_of(&party.wallet, &outputs[3].script_pubkey),
+            Some(KeychainKind::Internal)
+        );
+    } else {
+        assert_eq!(outputs.len(), 3);
+    }
+}
+
+#[test]
+#[parallel]
 fn free_envelopes_pay_before_any_vanilla_utxo() {
     let chain = ScriptedChain::start();
     let mut party = issuer(&chain, vec![AMOUNT]);

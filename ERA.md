@@ -227,11 +227,11 @@ built as before (upstream's three outputs). CC-99's completion needs nothing new
 it plans from is the colored coins, the vanilla inputs are BDK's, and `record_broadcast` releases
 every input's reservation.
 
-**Tests.** `src/wallet/test/vanilla_fee_inputs.rs` (scripted chain, 5): off as upstream; a send
+**Tests.** `src/wallet/test/vanilla_fee_inputs.rs` (scripted chain, 6): off as upstream; a send
 paid from a vanilla UTXO (PSBT shape, the reservation seen by `create_utxos`, `send_btc` and the
 balance, ACK, settled, the RGB change on the new colored output, the vanilla change back, a second
-send from the change); an unconfirmed vanilla UTXO never taken; free envelopes first; a lost
-broadcast answer completed by `go_online`. Mutations, each caught: the reservation fix removed,
+send from the change); two vanilla UTXOs where one is not enough; an unconfirmed vanilla UTXO never
+taken; free envelopes first; a lost broadcast answer completed by `go_online`. Mutations, each caught: the reservation fix removed,
 the confirmation filter removed, no change split, the setting ignored.
 `era_regtest::era_a_send_without_free_envelopes_pays_its_bitcoin_part_from_vanilla`: the same send
 to a witness receive of a stock wallet of this fork on the regtest services.

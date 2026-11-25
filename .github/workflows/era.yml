@@ -270,7 +270,7 @@ jobs:
           .github/scripts/era_test_count.sh unit-tests.log unit-ack-get \
             'wallet::test::sender_ack_onchain::' 7 || status=1
           .github/scripts/era_test_count.sh unit-tests.log unit-vanilla-fee \
-            'wallet::test::vanilla_fee_inputs::' 5 || status=1
+            'wallet::test::vanilla_fee_inputs::' 6 || status=1
           exit "$status"
 
       # Carried from the previous base, not yet ported to beta.8 (RGB proxy
