@@ -195,6 +195,12 @@ on the library with the app's feature set and on the library and its tests with 
 clippy on the library and its tests with the default features and `vss`, where `era_regtest`
 compiles, no warning of this code). The regtest case ran on GitHub only (see the CI run below).
 
+**Gates** (run 45551386177 on `81be6bd`, 25.11.2026, from the annotations): `check` green, the unit
+step 220 passed and 0 failed (7 of `sender_ack_onchain`, 58 of `unrecorded_spends`, 8 of
+`evm_unavailable`); `era-regtest` green, 83 passed and 0 failed, the eight of `era_regtest` among
+them, the sandbox case included. The ERA app's bridge pins `81be6bd` (bridge API 28, unchanged:
+no binding and no contract the Dart side keys on moves).
+
 **Carried:** on `era/next-bfa` only. `era/beta8-bfa`'s `wait_ack` is the same upstream code, but no
 app version that pins it talks to a proxy with this bug; carry it there if one ever does.
 
