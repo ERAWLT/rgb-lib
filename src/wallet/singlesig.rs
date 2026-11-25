@@ -176,6 +176,10 @@ pub struct Wallet {
     /// `go_online`'s full scan sees a payment made meanwhile, and the host names the addresses
     /// it still waits for (`sync_colored_payments`).
     pub(crate) watched_colored: HashSet<ScriptBuf>,
+    /// ERA fork (spike, simple mode): whether a send may pay its bitcoin part from confirmed
+    /// vanilla UTXOs when its colored ones cannot (see
+    /// [`set_vanilla_fee_inputs`](Wallet::set_vanilla_fee_inputs)). Not persisted.
+    pub(crate) vanilla_fee_inputs: bool,
 }
 
 impl WalletCore for Wallet {
@@ -190,6 +194,10 @@ impl WalletCore for Wallet {
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn watched_colored_spks(&self) -> Vec<ScriptBuf> {
         self.colored_spks_still_watched(&self.watched_colored)
+    }
+
+    fn vanilla_fee_inputs(&self) -> bool {
+        self.vanilla_fee_inputs
     }
 }
 
@@ -395,6 +403,7 @@ impl Wallet {
             keys,
             signers,
             watched_colored: HashSet::new(),
+            vanilla_fee_inputs: false,
         })
     }
 
@@ -476,6 +485,21 @@ impl Wallet {
         self.trigger_auto_backup();
         info!(self.logger(), "Get address completed");
         Ok(address.to_string())
+    }
+
+    /// ERA fork (spike, simple mode): let a send whose colored UTXOs (the ones holding the assets
+    /// it moves, then the empty ones) cannot pay its bitcoin part (the fee and the witness
+    /// outputs) add **confirmed** vanilla UTXOs to its inputs, largest first, instead of failing
+    /// with [`Error::InsufficientAllocationSlots`].
+    ///
+    /// Such a send's change is split in two: a new colored output of 1000 sats, which receives
+    /// the RGB change (and is an envelope for the next send), and the vanilla change, back on the
+    /// vanilla keychain. Its vanilla inputs are reserved with its other inputs until it is
+    /// broadcast or failed, and the vanilla operations (`create_utxos`, `send_btc`, the vanilla
+    /// balance) leave them out meanwhile. Off by default; not persisted, so a host sets it after
+    /// every load.
+    pub fn set_vanilla_fee_inputs(&mut self, enabled: bool) {
+        self.vanilla_fee_inputs = enabled;
     }
 
     /// Return a new Bitcoin address from the colored wallet.

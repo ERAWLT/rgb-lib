@@ -204,6 +204,38 @@ no binding and no contract the Dart side keys on moves).
 **Carried:** on `era/next-bfa` only. `era/beta8-bfa`'s `wait_ack` is the same upstream code, but no
 app version that pins it talks to a proxy with this bug; carry it there if one ever does.
 
+### Spike: a send paying its bitcoin part from vanilla UTXOs (26.11.2026, branch `era/spike-simple-flow`)
+
+**Not on `era/next-bfa`, not pinned by any app build.** A prototype for the app's simple mode
+(owner's plan of 25–26.11.2026): a user with bitcoin in the wallet sends tokens without preparing
+envelopes and waiting for them to confirm. The report with the findings is in the app's docs
+(`docs/hot-wallet/session-notes/rgb-simple-mode-2026-11-26/fork-spike.md`).
+
+**The change.** `Wallet::set_vanilla_fee_inputs(bool)` (Rust API only, process-local like
+`watched_colored`, off by default). On, `try_prepare_psbt`, once no free colored UTXO is left to
+pay the bitcoin part (where upstream returns `InsufficientAllocationSlots`), adds the largest
+**confirmed** vanilla UTXO that no pending operation reserves, and repeats while BDK reports
+`InsufficientFunds`. `prepare_psbt` then splits the change: a 1000-sat colored output after the
+witness recipients (`btc_change`, so `ChangeSlots` puts the RGB change there) and the rest drained
+to a new vanilla address. `get_reserved_vanilla_outpoints` now counts the colored reservations too:
+a send reserves all its inputs with `reserved_for_colored`, and without this `create_utxos`,
+`send_btc` and the vanilla balance would take a vanilla input the send still holds (the mutation
+test shows the balance reporting it spendable).
+
+**What does not change.** Off, every path is upstream's. On, a send whose colored UTXOs pay it is
+built as before (upstream's three outputs). CC-99's completion needs nothing new: the divergence
+it plans from is the colored coins, the vanilla inputs are BDK's, and `record_broadcast` releases
+every input's reservation.
+
+**Tests.** `src/wallet/test/vanilla_fee_inputs.rs` (scripted chain, 5): off as upstream; a send
+paid from a vanilla UTXO (PSBT shape, the reservation seen by `create_utxos`, `send_btc` and the
+balance, ACK, settled, the RGB change on the new colored output, the vanilla change back, a second
+send from the change); an unconfirmed vanilla UTXO never taken; free envelopes first; a lost
+broadcast answer completed by `go_online`. Mutations, each caught: the reservation fix removed,
+the confirmation filter removed, no change split, the setting ignored.
+`era_regtest::era_a_send_without_free_envelopes_pays_its_bitcoin_part_from_vanilla`: the same send
+to a witness receive of a stock wallet of this fork on the regtest services.
+
 ## Carried onto RGB-Tools beta.8 (`era/beta8-bfa`)
 
 **Base:** [RGB-Tools/rgb-lib](https://github.com/RGB-Tools/rgb-lib) `ea2b745b` ("bump version to

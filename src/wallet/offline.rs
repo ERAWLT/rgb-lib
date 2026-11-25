@@ -2209,7 +2209,10 @@ pub trait WalletOffline: WalletBackup {
         Ok(txn
             .iter_reserved_txos()?
             .into_iter()
-            .filter(|r| r.reserved_for_vanilla.is_some())
+            // ERA fork (spike, simple mode): a send paying its bitcoin part from vanilla UTXOs
+            // reserves them with its colored inputs (`reserved_for_colored`), so the vanilla
+            // operations and the vanilla balance must leave those out too
+            .filter(|r| r.reserved_for_vanilla.is_some() || r.reserved_for_colored.is_some())
             .map(BdkOutPoint::from)
             .collect())
     }

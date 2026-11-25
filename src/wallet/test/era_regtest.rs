@@ -788,3 +788,133 @@ fn era_a_send_whose_sender_proxy_fails_ack_get_completes_once_its_tx_is_on_chain
     );
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
 }
+
+// (spike, simple mode) A witness send whose only colored UTXO cannot pay its bitcoin part takes a
+// confirmed vanilla UTXO (`Wallet::set_vanilla_fee_inputs`): the recipient, a wallet of this fork
+// with the setting off, validates the consignment, ACKs and broadcasts the TX; bitcoind accepts
+// its vanilla input; both settle; the sender's vanilla change is ordinary bitcoin again and the
+// wallet goes online with nothing to complete.
+#[test]
+#[parallel]
+fn era_a_send_without_free_envelopes_pays_its_bitcoin_part_from_vanilla() {
+    initialize();
+
+    let amount: u64 = 66;
+    let (wallet, online) = get_funded_noutxo_wallet(true, Some(ESPLORA_URL.to_string()));
+    let mut party = party!(wallet, online);
+    party.wallet.go_offline();
+    party.online = party.wallet.go_online(era_options(true)).unwrap();
+    // one envelope, too small for a witness send's 1000-sat output
+    party.create_utxos(false, Some(1), Some(600), FEE_RATE, None);
+    mine(true);
+    party
+        .wallet
+        .get_btc_balance(Some(party.online), false)
+        .unwrap();
+    let asset = party.issue_asset_nia(None);
+    let mut rcv_party = funded();
+
+    let receive_data = rcv_party.witness_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![witness_recipient(
+            &receive_data,
+            Assignment::Fungible(amount),
+            1000,
+        )],
+    )]);
+    let off = party.wallet.send_begin(
+        party.online,
+        recipient_map.clone(),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
+        true,
+    );
+    assert_matches!(off, Err(Error::InsufficientAllocationSlots));
+
+    party.wallet.set_vanilla_fee_inputs(true);
+    let begin = party
+        .wallet
+        .send_begin(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
+            false,
+        )
+        .unwrap();
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    let keychains: Vec<KeychainKind> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| {
+            party
+                .wallet
+                .bdk_wallet()
+                .get_utxo(i.previous_output)
+                .unwrap()
+                .keychain
+        })
+        .collect();
+    assert_eq!(keychains.len(), 2);
+    assert!(keychains.contains(&KeychainKind::External));
+    assert!(keychains.contains(&KeychainKind::Internal));
+    let outputs = psbt.unsigned_tx.output.clone();
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(
+        party
+            .wallet
+            .bdk_wallet()
+            .derivation_of_spk(outputs[2].script_pubkey.clone())
+            .map(|(k, _)| k),
+        Some(KeychainKind::External)
+    );
+    assert_eq!(
+        party
+            .wallet
+            .bdk_wallet()
+            .derivation_of_spk(outputs[3].script_pubkey.clone())
+            .map(|(k, _)| k),
+        Some(KeychainKind::Internal)
+    );
+    let idx = begin.batch_transfer_idx.unwrap();
+    let signed = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    assert_eq!(
+        batch_transfer_status(&party, idx),
+        TransferStatus::WaitingCounterparty
+    );
+
+    refresh_receive_until(
+        &mut rcv_party,
+        &recipient_id,
+        TransferStatus::WaitingConfirmations,
+    );
+    wait_for_esplora(&party, &txid, true);
+    mine(true);
+    rcv_party.wait_for_transfer_status_recipient(None, &recipient_id, TransferStatus::Settled);
+    party.wait_for_transfer_status_sender(Some(&asset.asset_id), &txid, TransferStatus::Settled);
+    assert_eq!(
+        party.get_asset_balance(&asset.asset_id).spendable,
+        AMOUNT - amount
+    );
+    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
+
+    let balance = party
+        .wallet
+        .get_btc_balance(Some(party.online), false)
+        .unwrap();
+    assert_eq!(balance.vanilla.settled, outputs[3].value.to_sat());
+    assert_eq!(balance.colored.settled, 1000);
+    reopen(&mut party, true).unwrap();
+    assert!(party.wallet.completed_spends().is_empty());
+}

@@ -15,6 +15,9 @@ const MIN_FEE_RATE: u64 = 1;
 
 pub(crate) const UTXO_SIZE: u32 = 1000;
 pub(crate) const UTXO_NUM: u8 = 5;
+/// ERA fork (spike, simple mode): the colored output a send paid partly from vanilla UTXOs creates
+/// for its RGB change, as large as a default envelope.
+pub(crate) const VANILLA_FUNDED_COLORED_CHANGE_SAT: u64 = UTXO_SIZE as u64;
 
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
@@ -5467,7 +5470,27 @@ pub trait WalletOnline: WalletOffline {
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
+        // ERA fork (spike, simple mode): with a vanilla input (`try_prepare_psbt` adds them only
+        // with `vanilla_fee_inputs`), the BTC change must not all land on the colored side, where
+        // the vanilla operations can no longer spend it: a fixed colored output receives the RGB
+        // change (`btc_change`, so `ChangeSlots` prefers it) and the rest drains back to the
+        // vanilla keychain
+        let vanilla_funded = input_outpoints.iter().any(|o| {
+            self.bdk_wallet()
+                .get_utxo(*o)
+                .is_some_and(|u| u.keychain == KeychainKind::Internal)
+        });
         let change_addr = self.get_new_address()?.script_pubkey();
+        let vanilla_change_addr = if vanilla_funded {
+            Some(
+                self.bdk_wallet_mut()
+                    .reveal_next_address(KeychainKind::Internal)
+                    .address
+                    .script_pubkey(),
+            )
+        } else {
+            None
+        };
         let mut builder = self.bdk_wallet_mut().build_tx();
         builder
             .add_data(&[0; 32])
@@ -5479,7 +5502,19 @@ pub trait WalletOnline: WalletOffline {
         for (script_buf, amount_sat) in witness_recipients {
             builder.add_recipient(script_buf.clone(), BdkAmount::from_sat(*amount_sat));
         }
-        builder.drain_to(change_addr.clone());
+        match &vanilla_change_addr {
+            Some(vanilla_change_addr) => {
+                // after the witness recipients, whose vouts the caller has fixed
+                builder.add_recipient(
+                    change_addr.clone(),
+                    BdkAmount::from_sat(VANILLA_FUNDED_COLORED_CHANGE_SAT),
+                );
+                builder.drain_to(vanilla_change_addr.clone());
+            }
+            None => {
+                builder.drain_to(change_addr.clone());
+            }
+        }
 
         let mut psbt = builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -5514,6 +5549,7 @@ pub trait WalletOnline: WalletOffline {
 
     fn try_prepare_psbt(
         &mut self,
+        txn: &DbTxn,
         input_unspents: &[LocalUnspent],
         all_inputs: &mut HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
@@ -5552,11 +5588,42 @@ pub trait WalletOnline: WalletOffline {
                         all_inputs.insert(a.utxo.into());
                         continue;
                     }
+                    // ERA fork (spike, simple mode): no colored UTXO left to pay the bitcoin
+                    // part, take a vanilla one if the host allows it
+                    if let Some(outpoint) = self.next_vanilla_fee_input(txn, all_inputs)? {
+                        all_inputs.insert(outpoint);
+                        continue;
+                    }
                     return Err(Error::InsufficientAllocationSlots);
                 }
                 Err(e) => return Err(e),
             };
         })
+    }
+
+    /// ERA fork (spike, simple mode): with `vanilla_fee_inputs`, the largest **confirmed**
+    /// vanilla UTXO that is not among `all_inputs` nor reserved by a pending operation (a vanilla
+    /// one, or a send that took vanilla inputs already). Unconfirmed ones are left out: a parent
+    /// replaced before it confirms (another install on the same seed, CC-115) would invalidate the
+    /// transfer's TX after its consignment went to the recipient.
+    fn next_vanilla_fee_input(
+        &self,
+        txn: &DbTxn,
+        all_inputs: &HashSet<BdkOutPoint>,
+    ) -> Result<Option<BdkOutPoint>, Error> {
+        if !self.vanilla_fee_inputs() {
+            return Ok(None);
+        }
+        let reserved: HashSet<BdkOutPoint> = self
+            .get_reserved_vanilla_outpoints(txn)?
+            .into_iter()
+            .collect();
+        Ok(self
+            .internal_unspents()
+            .filter(|u| u.chain_position.is_confirmed())
+            .filter(|u| !all_inputs.contains(&u.outpoint) && !reserved.contains(&u.outpoint))
+            .max_by_key(|u| (u.txout.value, u.outpoint))
+            .map(|u| u.outpoint))
     }
 
     fn get_beneficiary_seal(
@@ -7331,6 +7398,7 @@ pub trait WalletOnline: WalletOffline {
             })
             .collect();
         let (mut psbt, btc_change) = self.try_prepare_psbt(
+            txn,
             input_unspents,
             &mut all_inputs,
             witness_recipients,

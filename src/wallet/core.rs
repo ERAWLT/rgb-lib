@@ -891,6 +891,13 @@ pub trait WalletCore {
         Vec::new()
     }
 
+    /// ERA fork (spike, simple mode): whether a send whose colored UTXOs cannot pay its bitcoin
+    /// part (the fee and the witness outputs) may add confirmed vanilla UTXOs to its inputs. Off
+    /// unless the singlesig host turns it on (`Wallet::set_vanilla_fee_inputs`).
+    fn vanilla_fee_inputs(&self) -> bool {
+        false
+    }
+
     /// ERA fork: of `watched`, the scripts no TX has paid yet, which is all a sync asks about.
     /// A paid one is never asked about again, confirmed or not: the indexer answers a script with
     /// the TXs spending from it too, and once its UTXO is the wallet's an own spend of it (one

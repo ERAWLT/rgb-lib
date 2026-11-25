@@ -775,5 +775,9 @@ mod validate_consignment;
 // ERA fork: CC-99, CC-115 and L4b, on the scripted chain
 #[cfg(feature = "esplora")]
 mod unrecorded_spends;
+// ERA fork (spike, simple mode): a send paying its bitcoin part from vanilla UTXOs, on the
+// scripted chain
+#[cfg(feature = "esplora")]
+mod vanilla_fee_inputs;
 #[cfg(feature = "electrum")]
 mod witness_receive;

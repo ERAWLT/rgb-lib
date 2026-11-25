@@ -261,6 +261,7 @@ jobs:
             wallet::test::scripted_chain:: wallet::test::unrecorded_spends:: \
             wallet::test::get_colored_address:: wallet::test::forwarder_v1:: \
             wallet::test::evm_unavailable:: wallet::test::sender_ack_onchain:: \
+            wallet::test::vanilla_fee_inputs:: \
             database::rgb:: 2>&1 | tee unit-tests.log || status=$?
           .github/scripts/era_test_count.sh unit-tests.log unit \
             'wallet::test::unrecorded_spends::' 58 || status=1
@@ -268,6 +269,8 @@ jobs:
             'wallet::test::evm_unavailable::' 8 || status=1
           .github/scripts/era_test_count.sh unit-tests.log unit-ack-get \
             'wallet::test::sender_ack_onchain::' 7 || status=1
+          .github/scripts/era_test_count.sh unit-tests.log unit-vanilla-fee \
+            'wallet::test::vanilla_fee_inputs::' 5 || status=1
           exit "$status"
 
       # Carried from the previous base, not yet ported to beta.8 (RGB proxy
@@ -338,7 +341,7 @@ jobs:
             wallet::test::migrate:: wallet::test::era_regtest:: \
             2>&1 | tee regtest-tests.log || status=$?
           .github/scripts/era_test_count.sh regtest-tests.log era-regtest \
-            'wallet::test::era_regtest::' 8 || status=1
+            'wallet::test::era_regtest::' 9 || status=1
           exit "$status"
       - name: Stop the regtest services
         if: always()
