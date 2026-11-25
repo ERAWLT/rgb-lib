@@ -763,6 +763,10 @@ pub(crate) mod scripted_chain;
 mod send;
 #[cfg(feature = "electrum")]
 mod send_btc;
+// ERA fork: a send whose sender proxy fails ack.get, completed when its TX is on chain, on the
+// scripted chain
+#[cfg(feature = "esplora")]
+mod sender_ack_onchain;
 mod sign_psbt;
 #[cfg(feature = "electrum")]
 mod sync;

@@ -1106,8 +1106,9 @@ pub(crate) fn expires_at_proxy(expires_at: String) -> (mockito::ServerGuard, moc
 }
 
 // forward a request received by a mock proxy to the real one, returning its response body
+// (ERA fork: crate-visible, for era_regtest's sandbox-like sender proxy)
 #[cfg(feature = "electrum")]
-fn forward_to_proxy(req: &mockito::Request, body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn forward_to_proxy(req: &mockito::Request, body: Vec<u8>) -> Vec<u8> {
     let content_type = req.header(CONTENT_TYPE)[0].clone();
     // the blocking client cannot run inside mockito's async runtime
     std::thread::spawn(move || {

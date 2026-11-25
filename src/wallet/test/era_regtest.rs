@@ -2,9 +2,11 @@
 //! Esplora, the RGB proxy 0.4.0), run by era.yml's `era-regtest` job: the completion of an own
 //! spend whose record was lost (CC-99, `OnlineOptions::complete_unrecorded_spends`), the
 //! consistency check's excuse of an interrupted send (D63), a send the `proxy_v1` migration
-//! failed while its TX was on chain (review N5), a replaced payment of envelopes (CC-115), and a
+//! failed while its TX was on chain (review N5), a replaced payment of envelopes (CC-115), a
 //! received BFA transfer waiting for an EVM chain whose endpoint is down (S2,
-//! `OnlineOptions::defer_unavailable_evm_chains`).
+//! `OnlineOptions::defer_unavailable_evm_chains`), and a send whose sender proxy answers `ack.get`
+//! with an error of its own, completed once its TX is on chain (UTEXO's signet sandbox,
+//! 25.11.2026).
 //! The scripted chain (`unrecorded_spends`) tests the same verdicts without services; these run
 //! them on a real node, indexer and proxy. The wallets use Esplora, as the ERA app does, and go
 //! online with the consistency check, as the app's bridge does (upstream's tests skip it).
@@ -667,4 +669,122 @@ fn era_a_bfa_transfer_waits_for_an_evm_chain_down() {
         recipient.get_asset_balance(&asset.asset_id).settled,
         AMOUNT / 2
     );
+}
+
+/// What UTEXO's signet sandbox answered `ack.get` (25.11.2026): its own database error.
+const SANDBOX_ACK_GET_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"result":null,"error":{"code":-32603,"message":"no such column: fetched"}}"#;
+
+/// A sender proxy like UTEXO's signet sandbox (25.11.2026): a mock proxy that relays every call to
+/// the regtest RGB proxy, but answers `ack.get` with the proxy's own database error while
+/// `failing` is set, counting the `ack.get` requests.
+fn sandbox_sender_proxy(
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ack_gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (mockito::ServerGuard, mockito::Mock) {
+    use std::sync::atomic::Ordering;
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/json-rpc")
+        .with_body_from_request(move |req| {
+            let body = req.body().unwrap().clone();
+            if String::from_utf8_lossy(&body).contains("\"ack.get\"") {
+                ack_gets.fetch_add(1, Ordering::SeqCst);
+                if failing.load(Ordering::SeqCst) {
+                    return SANDBOX_ACK_GET_ERROR.as_bytes().to_vec();
+                }
+            }
+            forward_to_proxy(req, body)
+        })
+        .expect_at_least(1)
+        .create();
+    (server, mock)
+}
+
+/// The sandbox case (`WalletOnline::complete_on_chain_or`): the sender proxy answers `ack.get` with
+/// its own error. While the TX is not on chain the sender's refresh reports that error and the
+/// send waits; the recipient ACKs through the same proxy, gets the TX released and broadcasts it;
+/// the sender's next refresh, `ack.get` still failing, finds the TX and completes the send, and
+/// both settle.
+#[test]
+#[parallel]
+fn era_a_send_whose_sender_proxy_fails_ack_get_completes_once_its_tx_is_on_chain() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    initialize();
+
+    let amount: u64 = 66;
+    let failing = Arc::new(AtomicBool::new(true));
+    let ack_gets = Arc::new(AtomicUsize::new(0));
+    let (server, _mock) = sandbox_sender_proxy(failing.clone(), ack_gets.clone());
+    let sender_proxy = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    let mut party = funded();
+    let mut rcv_party = funded();
+    let asset = party.issue_asset_nia(None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let begin = party
+        .wallet
+        .send_begin(
+            party.online,
+            blind_recipient_map(&asset.asset_id, &receive_data, Assignment::Fungible(amount)),
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            Some(sender_proxy),
+            false,
+        )
+        .unwrap();
+    let idx = begin.batch_transfer_idx.unwrap();
+    let signed = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let txid = psbt_txid(&signed);
+    party.wallet.send_end(party.online, signed).unwrap();
+    assert_eq!(
+        batch_transfer_status(&party, idx),
+        TransferStatus::WaitingCounterparty
+    );
+
+    // nobody has the TX yet: the proxy's error, the send waiting
+    let result = party.refresh_result(None, &[]).unwrap();
+    assert_matches!(
+        &result[&idx].failure,
+        Some(Error::Proxy { details }) if details == "no such column: fetched"
+    );
+    assert_eq!(result[&idx].updated_status, None);
+    assert_eq!(ack_gets.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        batch_transfer_status(&party, idx),
+        TransferStatus::WaitingCounterparty
+    );
+
+    // the recipient ACKs through the sender proxy, gets the TX released and broadcasts it
+    refresh_receive_until(
+        &mut rcv_party,
+        &recipient_id,
+        TransferStatus::WaitingConfirmations,
+    );
+    wait_for_esplora(&party, &txid, true);
+
+    // ack.get still fails: the TX is found and the send completes
+    let result = party.refresh_result(None, &[]).unwrap();
+    assert!(result[&idx].failure.is_none(), "{:?}", result[&idx]);
+    assert_eq!(
+        result[&idx].updated_status,
+        Some(TransferStatus::WaitingConfirmations)
+    );
+    assert_eq!(ack_gets.load(Ordering::SeqCst), 2);
+    assert!(failing.load(Ordering::SeqCst));
+
+    mine(true);
+    rcv_party.wait_for_transfer_status_recipient(None, &recipient_id, TransferStatus::Settled);
+    party.wait_for_transfer_status_sender(Some(&asset.asset_id), &txid, TransferStatus::Settled);
+    assert_eq!(ack_gets.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        party.get_asset_balance(&asset.asset_id).spendable,
+        AMOUNT - amount
+    );
+    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
 }

@@ -85,6 +85,9 @@ struct Proxy {
     // posted transfers: transfer ID -> (invoice ID, consignment hash)
     posted: HashMap<String, (String, String)>,
     methods: Vec<String>,
+    // (method, the whole JSON-RPC answer, answers left): what the test has the proxy answer
+    // instead of serving the method (an error of the proxy's own, an answer without a result)
+    answers: Vec<(String, Json, usize)>,
 }
 
 /// ERA fork: what the scripted forwarder was given, and what it is told to refuse.
@@ -512,6 +515,15 @@ impl State {
             )
         };
         self.proxy.methods.push(method.clone());
+        if let Some(answer) = self
+            .proxy
+            .answers
+            .iter_mut()
+            .find(|(m, _, left)| *m == method && *left > 0)
+        {
+            answer.2 -= 1;
+            return Response::json(200, &answer.1);
+        }
         let ids = |key: &str| -> Vec<String> {
             params[key]
                 .as_array()
@@ -1081,6 +1093,16 @@ impl ScriptedChain {
             .recipient_keys
             .insert(recipient_id.to_string(), sk);
         pk
+    }
+
+    /// ERA fork: the RGB proxy answers the next `times` requests of `method` with `response`, a
+    /// whole JSON-RPC answer (an error of the proxy's own, or neither a result nor an error),
+    /// instead of serving them. The requests count among [`Self::proxy_methods`].
+    pub(crate) fn answer(&self, method: &str, response: Json, times: usize) {
+        self.state()
+            .proxy
+            .answers
+            .push((method.to_string(), response, times));
     }
 
     /// The RGB proxy's ACK (or NACK) for a recipient.

@@ -25,6 +25,8 @@ name: ERA fork checks
 #     fund, issue, send and settle on a scripted chain behind a local Esplora
 #     and RGB proxy, and lose a broadcast's answer, crash, or come back from an
 #     old copy on it.
+#   - a send whose sender proxy fails ack.get completes once its TX is on
+#     chain, on the same scripted chain.
 # The https job makes real TLS handshakes against UTEXO's public signet
 # services; it depends on third-party hosts, so it is kept out of check.
 # See ERA.md for what the fork changes and why.
@@ -238,10 +240,11 @@ jobs:
       # restore backups an older rev wrote (src/wallet/test/fixtures). The
       # scripted-chain ones fund, issue, send and settle on an in-memory chain
       # behind a local Esplora and RGB proxy (src/wallet/test/scripted_chain.rs),
-      # and so do the CC-99 ones (unrecorded spends) and the S2 ones (an EVM
-      # chain left out of the session, mockito endpoints). era_test_count.sh
-      # puts the counts and any failure in the run's annotations (readable
-      # without the log) and fails the step unless the CC-99 and the S2
+      # and so do the CC-99 ones (unrecorded spends), the S2 ones (an EVM
+      # chain left out of the session, mockito endpoints) and the ones of a
+      # send whose sender proxy fails ack.get. era_test_count.sh puts the
+      # counts and any failure in the run's annotations (readable without the
+      # log) and fails the step unless the CC-99, the S2 and the ack.get
       # modules ran all their tests.
       - name: Unit tests (keychain layout, REST client TLS, proxy forwarder, VSS, backups, offline wallets, scripted chain)
         env:
@@ -257,12 +260,14 @@ jobs:
             api::reject_list:: api::evm:: \
             wallet::test::scripted_chain:: wallet::test::unrecorded_spends:: \
             wallet::test::get_colored_address:: wallet::test::forwarder_v1:: \
-            wallet::test::evm_unavailable:: \
+            wallet::test::evm_unavailable:: wallet::test::sender_ack_onchain:: \
             database::rgb:: 2>&1 | tee unit-tests.log || status=$?
           .github/scripts/era_test_count.sh unit-tests.log unit \
             'wallet::test::unrecorded_spends::' 58 || status=1
           .github/scripts/era_test_count.sh unit-tests.log unit-s2 \
             'wallet::test::evm_unavailable::' 8 || status=1
+          .github/scripts/era_test_count.sh unit-tests.log unit-ack-get \
+            'wallet::test::sender_ack_onchain::' 7 || status=1
           exit "$status"
 
       # Carried from the previous base, not yet ported to beta.8 (RGB proxy
@@ -297,7 +302,9 @@ jobs:
   # and without it (D63), a send the proxy_v1 migration failed with its TX on
   # chain (N5), a replaced payment of envelopes (CC-115), and a transfer of a
   # minted BFA asset received while the EVM endpoint is down, settled once it
-  # is back (S2).
+  # is back (S2), and a send whose sender proxy answers ack.get with an error
+  # of its own (UTEXO's signet sandbox, 25.11.2026), completed once the
+  # recipient broadcast its TX.
   # era_test_count.sh puts the counts and any failure in the run's
   # annotations (the log needs admin rights) and fails the step unless every
   # era_regtest test ran and passed.
@@ -331,7 +338,7 @@ jobs:
             wallet::test::migrate:: wallet::test::era_regtest:: \
             2>&1 | tee regtest-tests.log || status=$?
           .github/scripts/era_test_count.sh regtest-tests.log era-regtest \
-            'wallet::test::era_regtest::' 7 || status=1
+            'wallet::test::era_regtest::' 8 || status=1
           exit "$status"
       - name: Stop the regtest services
         if: always()

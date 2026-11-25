@@ -4338,7 +4338,13 @@ pub trait WalletOnline: WalletOffline {
             })?;
         let sk = ed25519_from_seed(&seed);
         let proxy_client = self.proxy_client(&sender_proxy)?;
-        let ack_res = get_ack_signed(&proxy_client, &transfer_ids, &sk)?;
+        // ERA fork: a sender proxy that fails to answer with the ACKs (the request failing, an
+        // error of the proxy's own, no result) does not keep a send whose TX is on chain waiting
+        // (see complete_on_chain_or)
+        let ack_res = match get_ack_signed(&proxy_client, &transfer_ids, &sk) {
+            Ok(ack_res) => ack_res,
+            Err(e) => return self.complete_on_chain_or(txn, batch_transfer, e),
+        };
         debug!(self.logger(), "ACK get response: {:?}", ack_res);
         if let Some(err) = ack_res.error {
             // the sender proxy no longer knows the operation (e.g. it dropped its data): the ACKs
@@ -4347,7 +4353,9 @@ pub trait WalletOnline: WalletOffline {
             // broadcast deadline has passed on the proxy's clock too, past which the proxy never
             // hands out a TX even if it recovers the operation and recipients stop broadcasting
             // it (v1.0-changes-spec.md 6.2)
-            check_get_ack_error(err)?;
+            if let Err(e) = check_get_ack_error(err) {
+                return self.complete_on_chain_or(txn, batch_transfer, e);
+            }
             return self
                 .settle_untrusted_batch(
                     txn,
@@ -4357,9 +4365,12 @@ pub trait WalletOnline: WalletOffline {
                 )
                 .map(Some);
         }
-        let ack_data = ack_res.result.ok_or_else(|| Error::Proxy {
-            details: s!("missing ack.get result"),
-        })?;
+        let Some(ack_data) = ack_res.result else {
+            let e = Error::Proxy {
+                details: s!("missing ack.get result"),
+            };
+            return self.complete_on_chain_or(txn, batch_transfer, e);
+        };
 
         for asset_transfer_data in batch_transfer_data.asset_transfers_data.iter_mut() {
             for transfer in asset_transfer_data.transfers.iter_mut() {
@@ -4605,6 +4616,54 @@ pub trait WalletOnline: WalletOffline {
             "Failing a transfer past its broadcast deadline as {reason}: its TX can still be broadcast if it was released"
         );
         self.fail_batch_transfer(txn, batch_transfer)
+    }
+
+    /// ERA fork (to report upstream): the sender proxy failed to answer `ack.get` with the ACKs of
+    /// a send waiting for its counterparty: the request failed (the proxy or the forwarder down,
+    /// an answer that is not JSON-RPC, the forwarder's refusal), the proxy answered an error that
+    /// does not mean it lost the operation (on UTEXO's signet sandbox, 25.11.2026, its own
+    /// database error "no such column: fetched"), or an answer with neither a result nor an
+    /// error. Upstream returns that error and the send keeps waiting, while a recipient that
+    /// ACKed got the TX released and may have broadcast it: the sender then waits for ACKs it
+    /// cannot read until the transfer expires, and only `fail_transfers` past the expiration finds
+    /// the TX and completes it.
+    ///
+    /// So the TX is looked up first, as when the proxy lost the operation
+    /// ([`Self::settle_untrusted_batch`], `v1.0-changes-spec.md` 6.2): if the indexer knows the
+    /// transfer's own TXID (mempool included), the transfer completes through
+    /// [`Self::complete_batch_if_tx_on_chain`] (the stored signed TX is checked against that TXID
+    /// before it is broadcast again); if not, the proxy's error is returned as before and the next
+    /// refresh asks again. Nothing here fails a transfer.
+    ///
+    /// A lookup (or the repeated broadcast) the indexer or the network fails returns the proxy's
+    /// error too, the indexer's text unsaid: it can name the indexer's URL, which carries the
+    /// forwarder's session secret in the app. A completion that fails otherwise once the TX is
+    /// known (the stored signed TX refused, the RGB state) returns its own error, as for the other
+    /// callers of [`Self::complete_batch_if_tx_on_chain`].
+    fn complete_on_chain_or(
+        &mut self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+        proxy_error: Error,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        match self.complete_batch_if_tx_on_chain(txn, batch_transfer) {
+            Ok(Some(updated)) => {
+                warn!(
+                    self.logger(),
+                    "The sender proxy failed ack.get ({proxy_error}), but the TX is on-chain: completed"
+                );
+                Ok(Some(updated))
+            }
+            Ok(None) => Err(proxy_error),
+            Err(Error::Indexer { .. } | Error::Network { .. }) => {
+                info!(
+                    self.logger(),
+                    "The sender proxy failed ack.get and the indexer or the network failed the TX lookup: waiting"
+                );
+                Err(proxy_error)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Complete an outgoing batch transfer waiting for its counterparty if its TX is on-chain
