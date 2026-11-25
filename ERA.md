@@ -7,7 +7,9 @@ consumer, which links it through `packages/era_rgb` (flutter_rust_bridge) with
 - **`era/next-bfa`** (24.11.2026, the app's from bridge API 28): RGB-Tools/rgb-lib `next`
   (`4d87b37`, RGB-Tools PR #124, crate version `0.3.0-beta.7`), the rgb-lib UTEXO's signet sandbox
   supports, and the series of `era/beta8-bfa` carried onto it. See
-  [Carried onto RGB-Tools next](#carried-onto-rgb-tools-next-eranext-bfa).
+  [Carried onto RGB-Tools next](#carried-onto-rgb-tools-next-eranext-bfa), and for what came after
+  the carry, [a sender proxy that fails `ack.get`](#a-sender-proxy-that-fails-ackget-25112026-3b6a1b2)
+  (25.11.2026).
 - **`era/beta8-bfa`** (23.11.2026): [RGB-Tools/rgb-lib](https://github.com/RGB-Tools/rgb-lib)
   `0.3.0-beta.8` (`ea2b745b`), UTEXO's VSS ported onto it, and the series; features `esplora`,
   `vss` and the two one-time migrations. See
@@ -96,6 +98,105 @@ included). Locally before the push, every step of the `check` job in order (form
 `cargo check` sets, both bindings, the diet, HTTP-client and proxy-client guards, the unit step, the
 pending ports, the migration crate) and clippy `-D warnings` on the library and its tests. The ERA
 app's bridge pins `756a741` (bridge API 28).
+
+### A sender proxy that fails `ack.get` (25.11.2026, `3b6a1b2`)
+
+**The case.** Public signet, UTEXO's sandbox proxy (`sandbox.rgb-proxy.utexo.com`, protocol 1.0),
+a send of BFA USDT from the desk wallet to a phone: the recipient ACKed, got the TX released and
+broadcast it, the TX confirmed and the recipient settled; every refresh of the **sender** got
+`ack.get` answered with the proxy's own database error (`no such column: fetched`: a column its
+database lacks, UTEXO's bug, reported to them), as the transfer's `failure`
+`Proxy { "no such column: fetched" }`, and the send stayed `WaitingCounterparty`, its change
+locked. Upstream's `wait_ack` returns any `ack.get` failure but `-104` (the proxy lost the
+operation, which `settle_untrusted_batch` settles through the chain, `v1.0-changes-spec.md` 6.2) as
+the refresh's failure, so such a send waits until it expires, and only `fail_transfers` past the
+expiration finds its TX (the refresh's error, then the chain check) and completes it: 12 to 24 hours
+on the sandbox (its invoices), and only if the host calls it. An emergency patch (uncommitted, an app
+build with a local path pin) completed a stuck send on the owner's phone; this commit is that patch
+reviewed, tightened and tested.
+
+**The change** (`wait_ack`, `WalletOnline::complete_on_chain_or`, `src/wallet/online.rs`). A sender
+proxy that fails to answer with the ACKs no longer ends the refresh by itself: the request failing
+(the proxy or the forwarder down, an answer that is not JSON-RPC, the forwarder's refusal), an
+error of the proxy's own that `check_get_ack_error` does not read as the operation lost, and an
+answer with neither a result nor an error. The transfer's TX is looked up first, as
+`settle_untrusted_batch` does:
+
+| The indexer | The refresh |
+|---|---|
+| knows the transfer's own TXID (mempool or block) | completes it through `complete_batch_if_tx_on_chain` (`broadcast_batch`: the stored signed TX checked against that TXID, broadcast again harmlessly, the RGB state updated): `WaitingConfirmations`, no failure; a warning in the wallet's log names the proxy's error |
+| does not know it | the proxy's error, as before; nothing written, the next refresh asks both again |
+| fails the lookup, or the repeated broadcast (`Indexer`, `Network`) | the proxy's error, as before; the log says the indexer failed, never its text (it can name the indexer's URL, which carries the forwarder's session secret in the app, as `fail_transfers_impl` and CC-99 keep it out) |
+| knows it, and the completion fails otherwise (the stored signed TX is another TX's, the RGB state) | that error, as for the other callers of `complete_batch_if_tx_on_chain`; the refresh's savepoint rolls its writes back |
+
+The emergency patch logged the failed lookup's text and returned the proxy's error for a
+completion that failed (the guard's refusal hidden behind the proxy's message); both changed, and
+the answer with no result joined the cases.
+
+**Why it is safe.** Completing is final, so it rests on exactly what upstream's own completions
+rest on (6.2, 6.3, a released send whose invoice expired, `fail_transfers`' chain check): the
+indexer knows **this transfer's own TXID**. Nothing else is looked at: another TX spending the same
+coins (the own TX replaced, another install on the same seed, CC-27) is not found and completes
+nothing, and `broadcast_batch` refuses a stored signed TX whose TXID is not the transfer's (`27d2a5a`
+on this base). A TX with that TXID spends the transfer's inputs and carries its commitment: the
+transfer happened, whatever the proxy says. The mempool counts, as in upstream's completions: the
+proxy releases the TX only once every recipient ACKed, so a TX in the mempool was released (or
+broadcast by this wallet after every ACK), and the completion broadcasts it again, as a send whose
+ACKs came in does. That is not the NACK rule (review N1: a NACKed batch whose TX is only in the
+mempool waits for a block), where a recipient's refusal is known; here none is. No path fails
+anything: the proxy's error was and is returned only while the TX is not known, and the fail paths
+(`try_fail_batch_transfer`) meet the errors they met before. Logs: the completion's warning prints
+the proxy's error, whose text the forwarder already scrubs of its own URL (`9718cac`); the lookup's
+is not printed.
+
+**What a host sees change:** a refresh that reported the proxy's error reports `WaitingConfirmations`
+when the TX is on chain; `fail_transfers(Some(idx))` of such a send, which returned the proxy's
+error, completes it and returns `CannotFailBatchTransfer`, as for any TX the indexer knows
+(`56e6186`); a refresh whose `ack.get` fails costs one lookup of the transfer's TX, one that answers
+costs none. Unchanged: `-104` (6.2), an ACK signature the proxy forges (6.3), a NACK
+(`try_complete_batch`, N1), the receive side, `send_end`'s check of an expired operation
+(`sender_proxy_knows_operation`).
+
+**Tests.** `src/wallet/test/sender_ack_onchain.rs` (era.yml's unit step, scripted chain, 7; the
+scripted proxy gained `ScriptedChain::answer`, a whole JSON-RPC answer of the test's for a method):
+
+| Test | What it pins |
+|---|---|
+| `a_send_whose_tx_is_on_chain_completes_when_ack_get_fails` | four ways `ack.get` fails (the sandbox's error, an answer without a result, a 502 that is not JSON-RPC, the forwarder's refusal), each with the recipient's broadcast in the mempool and in a block: completed at the refresh with no failure, then settled, the change spendable |
+| `a_send_whose_tx_is_not_on_chain_keeps_waiting_with_the_proxys_error` | the same four with the TX nowhere: the proxy's error (each kind's own), nothing broadcast, still waiting; once the proxy answers, the send goes on as any send |
+| `another_tx_spending_the_coins_does_not_complete_the_send` | the own TX replaced by one spending the same coins: the proxy's error, nothing broadcast |
+| `a_completion_the_signed_tx_guard_refuses_reports_the_guard` | the TX on chain, the stored signed TX another transfer's (as in W11): the guard's `InvalidPsbt`, nothing broadcast |
+| `a_failed_lookup_keeps_the_proxys_error_and_its_text_out_of_the_log` | the lookup answered by a forwarder's error page naming a secret: the proxy's error; the next refresh completes; the log has both lines and the proxy's message, not the secret |
+| `failing_a_send_whose_tx_is_on_chain_completes_it` | `fail_transfers(Some(idx))`: `CannotFailBatchTransfer`, the send `WaitingConfirmations` |
+| `an_answering_proxy_costs_no_lookup` | `ack.get` answering (no ACK yet): no lookup of the TX |
+
+Mutations, each in a scratch copy, each caught: upstream's `wait_ack` (5 of the 7 fail; the two
+that pass, another TX and an answering proxy, are upstream's behaviour too); the lookup's text in
+the log (the log test); the lookup's error returned instead of the proxy's (the same); a
+completion's error swallowed into the proxy's, the emergency patch's shape (the guard test).
+
+`era_regtest::era_a_send_whose_sender_proxy_fails_ack_get_completes_once_its_tx_is_on_chain`
+(era-regtest, now 8 tests): the regtest RGB proxy behind a mockito proxy (upstream's
+`forward_to_proxy`, made crate-visible) that answers `ack.get` with the sandbox's error. While
+nobody has the TX the sender's refresh reports that error and the send waits; the recipient ACKs
+through the same proxy, gets the TX released and broadcasts it; the sender's next refresh, `ack.get`
+still failing, completes the send; both settle, balances as after any send.
+
+**To report upstream** (RGB-Tools, UTEXO): `wait_ack` keeps a send whose TX is on chain waiting for
+as long as `ack.get` fails, i.e. until it expires and the host fails it, while 6.2 already settles
+it through the chain when the proxy lost the operation: the same lookup on any failure of `ack.get`
+(their own code path, forwarder or not). Separately, UTEXO's sandbox answering `ack.get` with its
+own SQL error (sent to UTEXO, 25.11.2026).
+
+**Locally before the push** (macOS: the `check` job's unit step with the new module and
+`wallet::online::tests`, 224 passed and 0 failed, 58 of `unrecorded_spends` and 7 of
+`sender_ack_onchain` among them; clippy `-D warnings`
+on the library with the app's feature set and on the library and its tests with `esplora,vss`; and
+clippy on the library and its tests with the default features and `vss`, where `era_regtest`
+compiles, no warning of this code). The regtest case ran on GitHub only (see the CI run below).
+
+**Carried:** on `era/next-bfa` only. `era/beta8-bfa`'s `wait_ack` is the same upstream code, but no
+app version that pins it talks to a proxy with this bug; carry it there if one ever does.
 
 ## Carried onto RGB-Tools beta.8 (`era/beta8-bfa`)
 
@@ -755,6 +856,7 @@ to hold one. Support asks for the wallet's state rather than wiping it.
 | `112054c` | Pin the marking's way back and its copies, as the review probed | To propose to UTEXO (with `09cbbda`) |
 | `665f241` | Let the host forget a payment of envelopes it proved dropped | To propose to UTEXO (with `09cbbda`) |
 | `3b00147` | Set a forgotten payment aside until it is mined, with its rivals | To propose to UTEXO (with `665f241`) |
+| `3b6a1b2` | Complete a send whose TX is on chain when ack.get fails (`era/next-bfa` only, [above](#a-sender-proxy-that-fails-ackget-25112026-3b6a1b2)) | To propose to RGB-Tools and UTEXO (their `wait_ack`; the log line's care is the forwarder's) |
 
 Later commits that touch only this file are part of the series too. `3f0a555` to `87d5e88`,
 `fe7e1b0` to `ba77828`, `8692b69`, `56e6186`, `c88f20a` and `a140543` answer four reviews of
